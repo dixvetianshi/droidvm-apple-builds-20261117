@@ -40,7 +40,21 @@ test "$(uname -s)" = Darwin || { echo 'This pinned iPadOS build requires macOS.'
 test -n "${ARTIFACT_KEY:-}" || { echo 'ARTIFACT_KEY is required.' >&2; exit 1; }
 [[ "${UNIXNU_UNIQUE_CHIP_ID:-}" =~ ^[0-9a-fA-F]{16}$ ]] || { echo 'A 16-digit UNIXNU_UNIQUE_CHIP_ID is required.' >&2; exit 1; }
 
-mkdir -p "$task_root/sources" "$task_root/output"
+mkdir -p "$task_root/output"
+# This fresh runner's nested source namespace is created exclusively here.
+# Retain its directory identity outside it before any build takes ownership.
+python3 - "$task_root" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve(strict=True)
+sources = root / 'sources'
+sources.mkdir()
+identity = sources.lstat()
+receipt = {'kind': 'DroidVM owned build sources v1', 'task_root': str(root),
+           'sources': str(sources), 'device': identity.st_dev, 'inode': identity.st_ino}
+with (root / 'verification/ipados-diagnostics/source-owner.txt').open('x') as out:
+    out.write(json.dumps(receipt) + '\n')
+PY
 disk_summary preflight
 checkout_pin() {
   local url=$1 directory=$2 revision=$3
@@ -127,6 +141,129 @@ stage=staging
 disk_summary "$stage"
 run_logged python3 "$task_root/tools/stage_ipados_release.py" --build-root "$UNIXNU_OUT" --output "$task_root/output/ipados-stage"
 cp "$task_root/output/source-adjustments.json" "$task_root/output/ipados-stage/source-adjustments.json"
+
+# All compilation, source-state verification and staging have completed. The
+# remaining encryption uses only this complete stage and system executables.
+stage=source-cleanup
+disk_summary "$stage"
+python3 - "$task_root" "$UNIXNU_OUT" <<'PY'
+import hashlib, json, shutil, stat, sys, tempfile
+from pathlib import Path
+root = Path(sys.argv[1]).resolve(strict=True)
+sources = root / 'sources'
+stage = root / 'output/ipados-stage'
+diagnostic_directory = root / 'verification/ipados-diagnostics'
+report = {'kind': 'DroidVM source reclaim v1', 'scope': str(sources),
+          'free_bytes_before': shutil.disk_usage(root).free, 'status': 'validating',
+          'logical_file_sizes_used_as_freed_bytes': False}
+
+def require(value, message):
+    if not value:
+        raise RuntimeError(message)
+
+def regular(path, within):
+    require(not path.is_symlink() and path.is_file(), 'A retained input is not a regular file: ' + str(path))
+    require(within in path.resolve(strict=True).parents, 'A retained input resolves outside its owning directory.')
+    return path
+
+def stage_files_are_regular():
+    require(not stage.is_symlink() and stage.is_dir() and stage.resolve(strict=True).parent == root / 'output',
+            'The complete stage is not the selected local directory.')
+    pending = [stage]
+    while pending:
+        for path in pending.pop().iterdir():
+            mode = path.lstat().st_mode
+            require(stat.S_ISREG(mode) or stat.S_ISDIR(mode),
+                    'The stage contains a link or special file; preserve sources until its dependency is resolved.')
+            if stat.S_ISDIR(mode):
+                pending.append(path)
+
+try:
+    require(not sources.is_symlink() and sources.is_dir() and sources.resolve(strict=True).parent == root,
+            'The cleanup target is not the selected plain sources directory.')
+    owner = json.loads(regular(root / 'verification/ipados-diagnostics/source-owner.txt', root).read_text())
+    identity = sources.lstat()
+    require(owner == {'kind': 'DroidVM owned build sources v1', 'task_root': str(root),
+                      'sources': str(sources), 'device': identity.st_dev, 'inode': identity.st_ino},
+            'Source ownership cannot be matched to the exclusively created directory.')
+    stage_files_are_regular()
+    release = json.loads(regular(stage / 'release/release.json', stage).read_text())
+    result = json.loads(regular(stage / 'build-result.json', stage).read_text())
+    require(result.get('upstream_release') == release, 'The staged release differs from its completed staging record.')
+    expected = release.get('files')
+    require(isinstance(expected, dict) and {'droidvm-disk.img', 'os.img', 'systemos.img'} <= expected.keys(),
+            'The stage lacks its complete upstream image inventory.')
+    for name, row in expected.items():
+        require(isinstance(name, str) and Path(name).name == name and isinstance(row, dict),
+                'The upstream release file inventory is malformed.')
+        path = regular(stage / 'release' / name, stage)
+        require(type(row.get('bytes')) is int and row['bytes'] > 0 and path.stat().st_size == row['bytes'],
+                'A staged release file differs from its already verified byte count.')
+    store = regular(stage / 'release/data-store.img', stage)
+    require(type(result.get('data_store_bytes')) is int and result['data_store_bytes'] > 0 and
+            store.stat().st_size == result['data_store_bytes'], 'The staged Data store is incomplete.')
+    generation = json.loads(regular(stage / 'generation/seed.json', stage).read_text())
+    seed = generation.get('seed')
+    require(isinstance(seed, str) and Path(seed).name == seed and
+            regular(stage / 'generation' / seed, stage).stat().st_size > 0, 'The retained Data seed is incomplete.')
+    require(all(generation.get(key) is not None and generation.get(key) == release.get('seed', {}).get(key)
+                for key in ('seed', 'seed_sha256', 'volume_uuid')), 'The retained Data generation differs from the release.')
+    adjustment = regular(stage / 'source-adjustments.json', stage).read_bytes()
+    require(adjustment == regular(root / 'output/source-adjustments.json', root).read_bytes(),
+            'The final source-adjustment record is not preserved byte for byte.')
+    regular(stage / 'upstream-vm-template.json', stage)
+
+    build_root = Path(sys.argv[2]).resolve(strict=True)
+    require(sources in build_root.parents, 'Build metadata is outside the owned sources tree.')
+    work = build_root / 'droidvm/ipados-27.0.1-24A446/droidvm_ipados27'
+    tree = work / 'tree'
+    evidence = stage / 'release/build-evidence'
+    evidence.mkdir(exist_ok=True)
+    metadata = {
+        'unixnu.lock': sources / 'UniXNU-droidvm/ipados27/unixnu.lock',
+        'profile.toml': sources / 'UniXNU/profiles/os/ipados-27.0.1-24A446/profile.toml',
+        'verified-root-os.json': tree / 'build/verified-root-24A446/OS/verification.json',
+        'verified-root-systemos.json': tree / 'build/verified-root-24A446/SystemOS/verification.json',
+    }
+    plugin = tree / 'build/adreno-metal-plugin27/trust.json'
+    if plugin.exists() or plugin.is_symlink():
+        metadata['plugin-trust.json'] = plugin
+    hashes = {}
+    for name, source in metadata.items():
+        content = regular(source, sources).read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if name == 'unixnu.lock':
+            require(digest == release.get('feeds_lock_sha256'), 'The retained feed lock differs from its release digest.')
+        destination = evidence / name
+        if destination.exists() or destination.is_symlink():
+            require(regular(destination, stage).read_bytes() == content, 'Existing retained build evidence differs; it is preserved.')
+        else:
+            with destination.open('xb') as out:
+                out.write(content)
+        hashes[name] = digest
+    stage_files_are_regular()
+    report.update(status='removing', retained_build_evidence_sha256=hashes,
+                  retained_source_record_sha256=hashlib.sha256(adjustment).hexdigest(),
+                  stage_files_rehashed=False, complete_stage_verified_before_cleanup=True)
+    # This exact resolved, non-link directory still has its creation identity.
+    # Nested links are unlinked by rmtree; their external targets are not followed.
+    shutil.rmtree(sources)
+    report['status'] = 'complete'
+except Exception as error:
+    report.update(status='failed', error_type=type(error).__name__, error=str(error),
+                  ownership_receipt_retained=True)
+    raise
+finally:
+    report['free_bytes_after'] = shutil.disk_usage(root).free
+    report['filesystem_free_delta_bytes'] = report['free_bytes_after'] - report['free_bytes_before']
+    try:
+        with tempfile.NamedTemporaryFile('w', prefix='source-cleanup-', suffix='.txt',
+                                         dir=diagnostic_directory, delete=False) as out:
+            out.write(json.dumps(report, indent=2) + '\n')
+    except OSError:
+        print('Cleanup diagnostic could not be written; source ownership receipt remains retained.')
+print('Owned source tree reclaimed after complete staging; filesystem free-byte observations recorded.')
+PY
 
 stage=encryption
 disk_summary "$stage"
