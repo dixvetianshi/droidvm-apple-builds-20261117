@@ -68,7 +68,7 @@ jobs:
           df -h "$GITHUB_WORKSPACE" | tee verification/ipados-diagnostics/after-runner-cleanup.txt
       - name: Install the required tools on this disposable runner
         run: |
-          brew install llvm lld mtools dtc unifdef cmake ninja meson pkg-config openssl@3 glslang bison flex blacktop/tap/ipsw
+          brew install llvm lld mtools dtc unifdef cmake ninja meson pkg-config openssl@3 glslang bison flex gnu-sed shaderc spirv-tools blacktop/tap/ipsw
           python3 -m pip install zstandard lz4
           rustup toolchain install 1.98.0 --profile minimal --component rust-src --target aarch64-apple-ios
       - name: Verify encrypted streaming with synthetic data
