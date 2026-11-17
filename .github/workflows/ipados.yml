@@ -1,0 +1,100 @@
+name: iPadOS 27.0.1 image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipados-image-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+      UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+    steps:
+      - name: Check out the build instructions
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Check the runner and secrets
+        run: |
+          test -n "$ARTIFACT_KEY" || { echo '::error::ARTIFACT_KEY secret is required'; exit 1; }
+          [[ "$UNIXNU_UNIQUE_CHIP_ID" =~ ^[0-9a-fA-F]{16}$ ]] || { echo '::error::UNIXNU_UNIQUE_CHIP_ID must contain 16 hexadecimal digits'; exit 1; }
+          test -d "$DEVELOPER_DIR" || { echo '::error::The selected runner does not contain Xcode 27.1'; exit 1; }
+          mkdir -p verification/ipados-diagnostics
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            df -h "$GITHUB_WORKSPACE"
+          } 2>&1 | tee verification/ipados-diagnostics/runner.txt
+      - name: Install the required tools on this disposable runner
+        run: |
+          brew install llvm lld mtools dtc unifdef cmake ninja meson pkg-config openssl@3 glslang blacktop/tap/ipsw
+          python3 -m pip install zstandard lz4
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src --target aarch64-apple-ios
+      - name: Verify encrypted streaming with synthetic data
+        run: |
+          # This checks the real runner tools without reading either build secret.
+          check_root=$(mktemp -d "$RUNNER_TEMP/ipados-stream-check.XXXXXX")
+          mkdir -p "$check_root/input" "$check_root/restored" verification/ipados-diagnostics
+          export IPADOS_STREAM_TEST_KEY
+          IPADOS_STREAM_TEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+          python3 -c 'import os, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(os.urandom(64 * 1024))' "$check_root/input/sample.bin"
+          tar -czf - -C "$check_root/input" . | \
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:IPADOS_STREAM_TEST_KEY | \
+            split -b 16k -d -a 3 - "$check_root/test.enc."
+          parts=("$check_root/test.enc."[0-9][0-9][0-9])
+          test "${#parts[@]}" -gt 1
+          shasum -a 256 "${parts[@]}" > "$check_root/parts.sha256"
+          shasum -a 256 -c "$check_root/parts.sha256"
+          cat "${parts[@]}" | \
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:IPADOS_STREAM_TEST_KEY | \
+            tar -xzf - -C "$check_root/restored"
+          cmp "$check_root/input/sample.bin" "$check_root/restored/sample.bin"
+          test ! -e "$check_root/test.enc"
+          unset IPADOS_STREAM_TEST_KEY
+          printf 'synthetic_streaming_roundtrip=passed\nsynthetic_input_bytes=65536\nchunk_count=%s\n' "${#parts[@]}" | tee verification/ipados-diagnostics/stream-check.txt
+      - name: Build from the pinned public sources and Apple IPSW
+        run: bash tools/build_ipados_ci.sh
+      - name: Upload encrypted build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipados-27.0.1-${{ github.run_number }}-encrypted
+          path: output/ipados-27.0.1.tar.gz.enc.*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Record final disk availability
+        if: always()
+        run: |
+          mkdir -p verification/ipados-diagnostics
+          df -h "$GITHUB_WORKSPACE" | tee verification/ipados-diagnostics/final-disk.txt
+      - name: Upload task diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipados-27.0.1-${{ github.run_number }}-diagnostics
+          # Only controlled runner output and the redacted console; private
+          # upstream logs, environment dumps and identity records stay excluded.
+          path: verification/ipados-diagnostics/*.txt
+          if-no-files-found: warn
+          retention-days: 14

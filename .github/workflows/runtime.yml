@@ -1,0 +1,41 @@
+name: DroidVM Apple runtime components
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # A standard GitHub-hosted ARM64 runner for public repositories.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the firmware build tools on this disposable runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils acpica-tools uuid-dev python3 curl git
+      - name: Verify the public runtime and build both firmware variants
+        run: |
+          bash -n tools/build_runtime_ci.sh
+          bash tools/build_runtime_ci.sh
+      - name: Upload the runtime components and their provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidvm-apple-runtime-${{ github.run_number }}
+          path: output/runtime/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
