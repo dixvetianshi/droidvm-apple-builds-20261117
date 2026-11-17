@@ -1,0 +1,55 @@
+--- a/ipados27/scripts/build-droidvm-root-policies.py
++++ b/ipados27/scripts/build-droidvm-root-policies.py
+@@ -37,16 +37,11 @@
+     if raw.is_file() and record.is_file() and json.loads(record.read_text()).get('sha256') == pin:
+         return raw.stat().st_size
+     image = udif.Image(dmg)
+-    digest, size = hashlib.sha256(), 0
+     partial = raw.with_suffix('.partial')
+-    with partial.open('wb') as target:
+-        for block in image.blocks():
+-            digest.update(block)
+-            target.write(block)
+-            size += len(block)
+-    if size != image.size or digest.hexdigest() != pin:
++    size, image_digest = image.write_raw(partial)
++    if size != image.size or image_digest != pin:
+         partial.unlink()
+-        raise SystemExit(f'{dmg.name}: raw disk sha256 {digest.hexdigest()} ({size} bytes), the OS profile pins {pin}')
++        raise SystemExit(f'{dmg.name}: raw disk sha256 {image_digest} ({size} bytes), the OS profile pins {pin}')
+     partial.rename(raw)
+     record.write_text(json.dumps({'source': str(dmg), 'size': size, 'sha256': pin}, indent=2) + '\n')
+     return size
+--- a/ipados27/scripts/root-image-identity.py
++++ b/ipados27/scripts/root-image-identity.py
+@@ -10,7 +10,6 @@
+ application cryptex, Cryptex1,AppOS, where Safari lives) and the volumes found.
+ """
+ import argparse
+-import hashlib
+ import json
+ from pathlib import Path
+ import struct
+@@ -31,19 +30,14 @@
+         if known.get('source') == str(dmg) and known.get('size') == raw.stat().st_size:
+             return known['size'], known['sha256']
+     image = udif.Image(dmg)
+-    digest, size = hashlib.sha256(), 0
+     partial = raw.with_suffix('.partial')
+-    with partial.open('wb') as target:
+-        for block in image.blocks():
+-            digest.update(block)
+-            target.write(block)
+-            size += len(block)
++    size, image_digest = image.write_raw(partial)
+     if size != image.size:
+         partial.unlink()
+         raise SystemExit(f'{dmg.name}: decoded {size} bytes, the image says {image.size}')
+     partial.rename(raw)
+-    record.write_text(json.dumps({'source': str(dmg), 'size': size, 'sha256': digest.hexdigest()}, indent=2) + '\n')
+-    return size, digest.hexdigest()
++    record.write_text(json.dumps({'source': str(dmg), 'size': size, 'sha256': image_digest}, indent=2) + '\n')
++    return size, image_digest
+ 
+ 
+ def container_offset(f):
