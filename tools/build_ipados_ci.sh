@@ -57,12 +57,15 @@ checkout_pin https://github.com/Droid-VM/UniXNU.git "$task_root/sources/UniXNU" 
 checkout_pin https://github.com/Droid-VM/UniXNU-droidvm.git "$task_root/sources/UniXNU-droidvm" 3da41eaa0f06fd21e7bc1ef17aafe0a3e72d70ff
 git -C "$task_root/sources/UniXNU" submodule update --init --recursive
 
-# The disk writer is shared by both root-image consumers. Keep the selected
-# source commits and record these explicit representation-only adjustments.
+# The disk writer is shared by both root-image consumers, and the Data seed
+# stages its IPSW inputs on the same APFS volume. Keep the selected commits
+# and record all three explicit representation/copy adjustments.
 git -C "$task_root/sources/UniXNU" apply --check "$task_root/patches/unixnu-sparse-udif.patch"
 git -C "$task_root/sources/UniXNU-droidvm" apply --check "$task_root/patches/device-sparse-udif.patch"
+git -C "$task_root/sources/UniXNU-droidvm" apply --check "$task_root/patches/ipados-apfs-clone-staging.patch"
 git -C "$task_root/sources/UniXNU" apply "$task_root/patches/unixnu-sparse-udif.patch"
 git -C "$task_root/sources/UniXNU-droidvm" apply "$task_root/patches/device-sparse-udif.patch"
+git -C "$task_root/sources/UniXNU-droidvm" apply "$task_root/patches/ipados-apfs-clone-staging.patch"
 python3 - "$task_root" <<'PY'
 import hashlib, importlib.util, json, sys
 from pathlib import Path
@@ -78,10 +81,12 @@ for name, directory in (('unixnu', 'UniXNU'), ('device', 'UniXNU-droidvm')):
     file = f'patches/{name}-sparse-udif.patch'
     patches[name] = {'file': file, 'sha256': hashlib.sha256((root / file).read_bytes()).hexdigest()}
     states[name] = module.checkout_state(root / 'sources' / directory)
-record = {'kind': 'sparse-udif-output', 'patches': patches, 'checkout_states': states,
-          'scope': 'raw disk representation and bounded zero spans; original logical image digests remain mandatory'}
+file = 'patches/ipados-apfs-clone-staging.patch'
+patches['device_clone'] = {'file': file, 'sha256': hashlib.sha256((root / file).read_bytes()).hexdigest()}
+record = {'kind': 'sparse-udif-output-and-apfs-clone-staging', 'patches': patches, 'checkout_states': states,
+          'scope': 'raw disk representation, bounded zero spans and lossless APFS staging clones; original logical image digests and Data seed identity remain mandatory'}
 (root / 'output/source-adjustments.json').write_text(json.dumps(record, indent=2) + '\n')
-print('Recorded the two source adjustments; the release will retain its actual source-change facts.')
+print('Recorded the three source adjustments; the release will retain its actual source-change facts.')
 PY
 
 # The pinned board's tree linker derives its owning checkout from
@@ -111,7 +116,7 @@ record = json.loads(path.read_text())
 states = {name: module.checkout_state(root / 'sources' / directory)
           for name, directory in (('unixnu', 'UniXNU'), ('device', 'UniXNU-droidvm'))}
 if states != record['checkout_states']:
-    raise SystemExit('The source checkouts changed beyond the recorded sparse UDIF adjustments during the build.')
+    raise SystemExit('The source checkouts changed beyond the recorded source adjustments during the build.')
 record['final_checkout_states'] = states
 path.write_text(json.dumps(record, indent=2) + '\n')
 print('Final source states match the recorded source adjustments.')
