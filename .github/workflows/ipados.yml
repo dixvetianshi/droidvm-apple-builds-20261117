@@ -46,9 +46,29 @@ jobs:
             xcrun --sdk iphoneos --show-sdk-version
             df -h "$GITHUB_WORKSPACE"
           } 2>&1 | tee verification/ipados-diagnostics/runner.txt
+      - name: Reclaim the unused Xcode version on this disposable runner
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          selected = Path(os.environ['DEVELOPER_DIR']).resolve(strict=True).parents[1]
+          unused = Path('/Applications/Xcode_27.2.app')
+          if unused.exists():
+              resolved = unused.resolve(strict=True)
+              if resolved == selected:
+                  print('The extra Xcode path resolves to the selected build tools; keeping it.')
+              elif resolved.is_relative_to(Path('/Applications')):
+                  print(json.dumps({'disposable_runner_cleanup': str(unused), 'selected_xcode': str(selected)}))
+                  subprocess.run(['sudo', 'rm', '-rf', '--', str(unused)], check=True)
+              else:
+                  raise SystemExit('The unused Xcode path resolves outside the named Applications directory.')
+          else:
+              print('No separate Xcode 27.2 installation is present.')
+          PY
+          df -h "$GITHUB_WORKSPACE" | tee verification/ipados-diagnostics/after-runner-cleanup.txt
       - name: Install the required tools on this disposable runner
         run: |
-          brew install llvm lld mtools dtc unifdef cmake ninja meson pkg-config openssl@3 glslang blacktop/tap/ipsw
+          brew install llvm lld mtools dtc unifdef cmake ninja meson pkg-config openssl@3 glslang bison flex blacktop/tap/ipsw
           python3 -m pip install zstandard lz4
           rustup toolchain install 1.98.0 --profile minimal --component rust-src --target aarch64-apple-ios
       - name: Verify encrypted streaming with synthetic data
