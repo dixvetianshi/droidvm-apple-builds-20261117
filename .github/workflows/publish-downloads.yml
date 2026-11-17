@@ -1,0 +1,76 @@
+name: Publish completed encrypted downloads
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-apple-downloads
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  macos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Fetch the completed encrypted macOS image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-27.2-1
+          run-id: 44099443317
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/encrypted-image
+      - name: Fetch its completed public build record
+        uses: actions/download-artifact@v8
+        with:
+          name: image-27.2-1-plain
+          run-id: 44099443317
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/image-record
+      - name: Verify all encrypted parts and publish the download
+        run: |
+          cd "$RUNNER_TEMP/encrypted-image"
+          sha256sum -c "$RUNNER_TEMP/image-record/image.tar.zst.enc.sha256"
+          tag=macos-27.2-run-1
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            printf '%s\n' 'Completed macOS 27.2 build, source run 44099443317. The Apple-containing image remains AES-256-CBC/PBKDF2 encrypted. The key is kept by the owner; no key or account credentials are published. Verify image.tar.zst.enc.sha256 before local decryption. Device boot is not yet verified.' > "$RUNNER_TEMP/image-release-notes.txt"
+            gh release create "$tag" --prerelease --title 'macOS 27.2 encrypted build 1' --notes-file "$RUNNER_TEMP/image-release-notes.txt"
+          fi
+          gh release upload "$tag" --clobber image.tar.zst.enc.[0-9][0-9][0-9] "$RUNNER_TEMP/image-record/"*
+          df -h "$RUNNER_TEMP"
+
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the completed public firmware and runtime baseline
+        uses: actions/download-artifact@v8
+        with:
+          name: droidvm-apple-runtime-1
+          run-id: 44108235034
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/runtime
+      - name: Verify the files and publish the download
+        run: |
+          cd "$RUNNER_TEMP/runtime"
+          sha256sum -c SHA256SUMS
+          tar -czf "$RUNNER_TEMP/droidvm-apple-firmware-1.tar.gz" .
+          cd "$RUNNER_TEMP"
+          sha256sum droidvm-apple-firmware-1.tar.gz > droidvm-apple-firmware-1.tar.gz.sha256
+          tag=apple-firmware-run-1
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            printf '%s\n' 'Completed EDK2 builds, source run 44108235034. Includes edk2-macos.fd with Virtio GOP disabled and edk2-virtio-gpu.fd with it enabled, provenance and a verified public runtime baseline. The baseline crosvm lacks the audio/media MMIO options required by the full macOS image; use the separately built matching crosvm. Phone loading and guest boot remain unverified.' > "$RUNNER_TEMP/firmware-release-notes.txt"
+            gh release create "$tag" --prerelease --title 'DroidVM Apple firmware build 1' --notes-file "$RUNNER_TEMP/firmware-release-notes.txt"
+          fi
+          gh release upload "$tag" --clobber droidvm-apple-firmware-1.tar.gz droidvm-apple-firmware-1.tar.gz.sha256
