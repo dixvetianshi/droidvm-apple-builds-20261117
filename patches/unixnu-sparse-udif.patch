@@ -1,0 +1,53 @@
+--- a/scripts/unixnu/udif.py
++++ b/scripts/unixnu/udif.py
+@@ -8,6 +8,8 @@
+ the SystemOS cryptex of an IPSW is one.
+ """
+ import bz2
++import hashlib
++import sys
+ import plistlib
+ import struct
+ import subprocess
+@@ -70,6 +72,30 @@
+             raise Error(f'{path}: the chunks cover {position} bytes, the trailer {self.size}')
+         self.chunks = chunks
+ 
++    def write_raw(self, destination):
++        """Write the parsed raw bytes without allocating zero spans; return (size, SHA-256)."""
++        # SystemOS is often already raw. APFS cloning preserves that existing
++        # representation without allocating another complete copy on this build Mac.
++        cloned = self.chunks is None and sys.platform == 'darwin'
++        if cloned:
++            subprocess.run(['cp', '-c', str(self.path), str(destination)], check=True)
++        digest, size = hashlib.sha256(), 0
++        if cloned:
++            for block in self.blocks():
++                digest.update(block)
++                size += len(block)
++        else:
++            with open(destination, 'wb') as target:
++                for block in self.blocks():
++                    digest.update(block)
++                    if block.strip(b'\0'):
++                        target.write(block)
++                    else:
++                        target.seek(len(block), 1)
++                    size += len(block)
++                target.truncate(size)
++        return size, digest.hexdigest()
++
+     def blocks(self):
+         decoder = None
+         with open(self.path, 'rb') as image:
+@@ -79,7 +105,9 @@
+                 return
+             for start, length, kind, offset, stored in self.chunks:
+                 if kind in (ZERO_FILL, IGNORE):
+-                    data = bytes(length)
++                    for zero_offset in range(0, length, COPY):
++                        yield bytes(min(COPY, length - zero_offset))
++                    continue
+                 else:
+                     image.seek(offset)
+                     data = image.read(stored)
