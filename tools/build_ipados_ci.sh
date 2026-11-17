@@ -57,7 +57,10 @@ checkout_pin https://github.com/Droid-VM/UniXNU.git "$task_root/sources/UniXNU" 
 checkout_pin https://github.com/Droid-VM/UniXNU-droidvm.git "$task_root/sources/UniXNU-droidvm" 3da41eaa0f06fd21e7bc1ef17aafe0a3e72d70ff
 git -C "$task_root/sources/UniXNU" submodule update --init --recursive
 
-export UNIXNU_OUT="$task_root/build/ipados"
+# The pinned board's tree linker derives its owning checkout from
+# <UniXNU>/out/<kit>/<os>/<board>/tree. Keep this internal build output under
+# the already selected checkout so its pinned GPU sources resolve correctly.
+export UNIXNU_OUT="$task_root/sources/UniXNU/out"
 export LLVM_PREFIX
 export LLD_PREFIX
 LLVM_PREFIX=$(brew --prefix llvm)
