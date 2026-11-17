@@ -1,0 +1,51 @@
+name: DroidVM crosvm with Apple guest devices
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-crosvm-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # Standard GitHub-hosted x86_64 runner in this public repository.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      JOBS: '4'
+      REPO_JOBS: '4'
+      GOMEMLIMIT: 8GiB
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record the initial space and prepare this disposable runner
+        run: |
+          df -B1 / /mnt "$RUNNER_TEMP" | tee "$RUNNER_TEMP/crosvm-runner-space.log"
+          # These fixed paths contain runner-provided tools unrelated to this
+          # isolated Android build. The source workspace has not been created.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils-aarch64-linux-gnu gawk git git-lfs curl python3 rsync unzip zip flex bison zlib1g-dev libssl-dev libncurses-dev libxml2-utils time
+          df -B1 / /mnt "$RUNNER_TEMP" | tee -a "$RUNNER_TEMP/crosvm-runner-space.log"
+      - name: Build the pinned source snapshot and inspect the Android output
+        run: |
+          bash -n tools/build_crosvm_ci.sh
+          bash tools/build_crosvm_ci.sh
+      - name: Upload completed runtime components and diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidvm-crosvm-apple-${{ github.run_number }}
+          path: output/crosvm/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
