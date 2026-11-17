@@ -93,6 +93,49 @@ jobs:
           test ! -e "$check_root/test.enc"
           unset IPADOS_STREAM_TEST_KEY
           printf 'synthetic_streaming_roundtrip=passed\nsynthetic_input_bytes=65536\nchunk_count=%s\n' "${#parts[@]}" | tee verification/ipados-diagnostics/stream-check.txt
+      - name: Verify APFS clone staging with synthetic sparse data
+        run: |
+          python3 - "$GITHUB_WORKSPACE" <<'PY'
+          import hashlib, json, subprocess, sys, tempfile
+          from pathlib import Path
+          diagnostic = Path(sys.argv[1]) / 'verification/ipados-diagnostics'
+          diagnostic.mkdir(parents=True, exist_ok=True)
+          source = diagnostic / 'apfs-clone-source.bin'
+          logical_bytes = 128 * 1024**2
+          with source.open('xb') as stream:
+              stream.truncate(logical_bytes)
+              stream.write(b'synthetic-sparse-source')
+              stream.seek(logical_bytes - 1)
+              stream.write(b'Z')
+          scratch = Path(tempfile.mkdtemp(prefix='droidvm-apfs-check-', dir='/tmp'))
+          clone = scratch / 'clone.bin'
+          def digest(path):
+              sha = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1024**2), b''):
+                      sha.update(chunk)
+              return sha.hexdigest()
+          expected = digest(source)
+          subprocess.run(['cp', '-c', str(source), str(clone)], check=True)
+          source_stat, clone_stat = source.stat(), clone.stat()
+          assert source_stat.st_dev == clone_stat.st_dev
+          assert source_stat.st_ino != clone_stat.st_ino
+          assert clone_stat.st_size == logical_bytes
+          allocated = clone_stat.st_blocks * 512
+          assert allocated < 1024**2, 'The clone materialized the sparse logical extent'
+          assert digest(clone) == expected
+          with clone.open('r+b') as stream:
+              stream.seek(4096)
+              stream.write(b'clone-only-write')
+          assert digest(source) == expected, 'The staging write changed the source'
+          report = {'fixture_only': True, 'logical_bytes': logical_bytes,
+                    'clone_allocated_bytes_before_write': allocated,
+                    'workspace_and_tmp_same_volume': True,
+                    'logical_content_verified': True,
+                    'source_preserved_after_clone_write': True}
+          (diagnostic / 'apfs-clone-check.txt').write_text(json.dumps(report) + '\n')
+          print(json.dumps(report))
+          PY
       - name: Build from the pinned public sources and Apple IPSW
         run: bash tools/build_ipados_ci.sh
       - name: Upload encrypted build outputs
