@@ -1,0 +1,20 @@
+--- a/ipados27/scripts/build-droidvm-data-seed.py
++++ b/ipados27/scripts/build-droidvm-data-seed.py
+@@ -122,7 +122,7 @@
+     source = os_image(args.ipsw.resolve(), profile['root']['os_image_sha256'])
+     image = SCRATCH / source.name
+     if not image.is_file() or image.stat().st_size != source.stat().st_size:
+-        run(['cp', source, image])
++        run(['cp', '-c', source, image])
+     mount = attach(image, SCRATCH / 'os-mount')
+     root = seed_tree(tree, packer)
+     link = root / '.cache/firmware/target-volumes/os-mount'
+@@ -161,7 +161,7 @@
+                       if json.loads(p.read_text()).get('component') == 'Cryptex1,AppOS')
+         cryptex = SCRATCH / record['member']
+         if not cryptex.is_file() or cryptex.stat().st_size != record['size']:
+-            run(['cp', args.ipsw.resolve() / record['member'], cryptex])
++            run(['cp', '-c', args.ipsw.resolve() / record['member'], cryptex])
+         with_app = work / f'data-{args.gib}g-27-app.dbr'
+         run(['python3', root / 'scripts/add-app-cryptex-data.py', final, cryptex, with_app], cwd=root)
+         # The plugin is copied to the system volume as well: the staging script attaches the seed there.
