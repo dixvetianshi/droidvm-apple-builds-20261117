@@ -2,6 +2,12 @@ name: Publish completed encrypted downloads
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Completed build to publish
+        type: choice
+        options: [all, macos, firmware, crosvm]
+        default: all
 
 permissions:
   contents: write
@@ -21,6 +27,7 @@ env:
 
 jobs:
   macos:
+    if: inputs.target == 'all' || inputs.target == 'macos'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -51,6 +58,7 @@ jobs:
           df -h "$RUNNER_TEMP"
 
   firmware:
+    if: inputs.target == 'all' || inputs.target == 'firmware'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -74,3 +82,29 @@ jobs:
             gh release create "$tag" --prerelease --title 'DroidVM Apple firmware build 1' --notes-file "$RUNNER_TEMP/firmware-release-notes.txt"
           fi
           gh release upload "$tag" --clobber droidvm-apple-firmware-1.tar.gz droidvm-apple-firmware-1.tar.gz.sha256
+
+  crosvm:
+    if: inputs.target == 'all' || inputs.target == 'crosvm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the completed matching crosvm build
+        uses: actions/download-artifact@v8
+        with:
+          name: droidvm-crosvm-apple-1
+          run-id: 44109572779
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/crosvm
+      - name: Verify the complete runtime and publish the download
+        run: |
+          cd "$RUNNER_TEMP/crosvm"
+          sha256sum -c SHA256SUMS
+          tar -czf "$RUNNER_TEMP/droidvm-crosvm-apple-1.tar.gz" .
+          cd "$RUNNER_TEMP"
+          sha256sum droidvm-crosvm-apple-1.tar.gz > droidvm-crosvm-apple-1.tar.gz.sha256
+          tag=crosvm-apple-run-1
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            printf '%s\n' 'Completed matching crosvm build, source run 44109572779. Contains the Android AArch64 VMM, matching non-platform runtime libraries, retained full build and shim, source locks, checksums and static option checks for Apple guest devices. These are build and file checks; Android loading and phone guest boot have not been verified.' > "$RUNNER_TEMP/crosvm-release-notes.txt"
+            gh release create "$tag" --prerelease --title 'DroidVM Apple crosvm build 1' --notes-file "$RUNNER_TEMP/crosvm-release-notes.txt"
+          fi
+          gh release upload "$tag" --clobber droidvm-crosvm-apple-1.tar.gz droidvm-crosvm-apple-1.tar.gz.sha256
