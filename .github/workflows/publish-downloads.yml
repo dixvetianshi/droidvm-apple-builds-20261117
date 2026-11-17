@@ -6,7 +6,7 @@ on:
       target:
         description: Completed build to publish
         type: choice
-        options: [all, macos, firmware, crosvm]
+        options: [all, macos, firmware, crosvm, ipados]
         default: all
 
 permissions:
@@ -108,3 +108,31 @@ jobs:
             gh release create "$tag" --prerelease --title 'DroidVM Apple crosvm build 1' --notes-file "$RUNNER_TEMP/crosvm-release-notes.txt"
           fi
           gh release upload "$tag" --clobber droidvm-crosvm-apple-1.tar.gz droidvm-crosvm-apple-1.tar.gz.sha256
+
+  ipados:
+    if: inputs.target == 'all' || inputs.target == 'ipados'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Require the pinned iPadOS build to have succeeded
+        run: |
+          result=$(gh api "repos/$GH_REPO/actions/runs/44153495016" --jq '[.status, (.conclusion // "unknown"), .head_sha] | join(":")')
+          test "$result" = 'completed:success:b74de42417ff3e4f0576c6fef34e10c6336f03dd' || { echo '::error::The selected iPadOS build has not completed successfully at the reviewed workflow revision.'; exit 1; }
+      - name: Fetch the completed encrypted iPadOS output
+        uses: actions/download-artifact@v8
+        with:
+          name: ipados-27.0.1-4-encrypted
+          run-id: 44153495016
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/ipados-encrypted
+      - name: Verify every encrypted part and publish the download
+        run: |
+          cd "$RUNNER_TEMP/ipados-encrypted"
+          sha256sum -c ipados-27.0.1.tar.gz.enc.sha256
+          tag=ipados-27.0.1-run-4
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            printf '%s\n' 'Completed iPadOS 27.0.1 / 24A446 build, source run 44153495016. The Apple-containing release, Data generation and source-adjustment records remain AES-256-CBC/PBKDF2 encrypted. No build key or device configuration is published. Verify every numbered part against ipados-27.0.1.tar.gz.enc.sha256 before local decryption. Phone import, Android loading and Apple guest boot remain unverified.' > "$RUNNER_TEMP/ipados-release-notes.txt"
+            gh release create "$tag" --prerelease --title 'iPadOS 27.0.1 encrypted build 4' --notes-file "$RUNNER_TEMP/ipados-release-notes.txt"
+          fi
+          gh release upload "$tag" --clobber ipados-27.0.1.tar.gz.enc.[0-9][0-9][0-9] ipados-27.0.1.tar.gz.enc.sha256
+          df -h "$RUNNER_TEMP"
