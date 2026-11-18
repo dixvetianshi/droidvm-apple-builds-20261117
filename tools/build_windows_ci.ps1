@@ -164,7 +164,7 @@ function Ensure-Qemu {
         if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw "WINDOWS_QEMU_IMG is missing" }
     }
     if (-not $tool) {
-        $command = Get-Command qemu-img -CommandType Application -ErrorAction SilentlyContinue
+        $command = Get-Command qemu-img -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($command) { $tool = $command.Source }
     }
     if (-not $tool) {
@@ -173,7 +173,7 @@ function Ensure-Qemu {
     }
     $packageVersion = $null
     if (-not $tool) {
-        $choco = Get-Command choco -CommandType Application -ErrorAction SilentlyContinue
+        $choco = Get-Command choco -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $choco) { throw "Provide WINDOWS_QEMU_IMG; the hosted Chocolatey command is unavailable" }
         # Explicitly authorized tool supply on this disposable runner, never upstream auto-install.
         $arguments = @("install", "qemu", "--yes", "--no-progress", "--limit-output",
@@ -307,25 +307,61 @@ try {
     if (-not $env:WINDOWS_ISO_URL) { throw "WINDOWS_ISO_URL must supply the private Microsoft download ticket" }
     $IsoUrl = [uri]$env:WINDOWS_ISO_URL
     if ($IsoUrl.Scheme -ne "https") { throw "The ISO ticket must use HTTPS" }
+    # Keep the ticket local before any public-source or tool-supply child process.
+    $env:WINDOWS_ISO_URL = $null
     $Record.source.iso["public_download_path"] = Public-DownloadPath $IsoUrl
     $Record.source.iso["transport_credentials_and_query_removed"] = $true
-    $Iso = Join-Path $Inputs $Lock.iso_filename
-    $DriverZip = Join-Path $Inputs "gunyah-arm64-drivers.zip"
-    $Phase = "iso-download"
-    $Record.source.iso["actual_sha256"] = Download-Verified $IsoUrl.AbsoluteUri $Iso ([long]$Lock.iso_bytes) $Lock.publisher_sha256 "windows-iso"
-    # The ticket is not propagated to Git, installers or the image builder.
-    $IsoUrl = $null
-    $env:WINDOWS_ISO_URL = $null
-    $Phase = "driver-download"
-    $Record.source.driver["actual_sha256"] = Download-Verified $Lock.driver_url $DriverZip ([long]$Lock.driver_bytes) $Lock.driver_sha256 "arm64-drivers"
+
+    $Phase = "builder-source"
+    Emit $Phase
+    $Builder = Join-Path $OwnedRoot "builder"
+    [IO.Directory]::CreateDirectory($Builder) | Out-Null
+    # actions/checkout on this Windows runner used this existing Git application.
+    # Resolve exactly one absolute tool, rather than passing a .Source array to Native.
+    $gitCommands = @(Get-Command -Name "C:\Program Files\Git\bin\git.exe" -CommandType Application -ErrorAction Stop)
+    if ($gitCommands.Count -ne 1) { throw "The existing checkout Git path must identify exactly one application" }
+    $git = Full-LocalPath $gitCommands[0].Source
+    $gitVersion = Native $git @("--version") -Capture
+    $Record.source.builder["git_tool"] = [ordered]@{path=$git; version=$gitVersion.Trim()}
+    Emit "git-tool" @{path=$git; version=$gitVersion.Trim()}
+    Native $git @("-C", $Builder, "init", "-q")
+    Native $git @("-C", $Builder, "remote", "add", "origin", $Lock.builder_repository)
+    Native $git @("-C", $Builder, "fetch", "--depth", "1", "origin", $Lock.builder_commit)
+    Native $git @("-C", $Builder, "checkout", "--detach", "FETCH_HEAD")
+    $head = Native $git @("-C", $Builder, "rev-parse", "HEAD") -Capture
+    if ($head.Trim() -ne $Lock.builder_commit) { throw "Builder source pin mismatch" }
+    Native $git @("-C", $Builder, "apply", "--check", $PatchPath)
+    Native $git @("-C", $Builder, "apply", $PatchPath)
+    $Record.source.builder["actual_base_commit"] = $head.Trim()
+    $Record.source.builder["applied_patch"] = "windows-safe-provisioning.patch"
+    Json-File $RecordPath $Record
+    Emit "builder-source-verified" @{actual_base_commit=$head.Trim(); patch_sha256=$Record.source.builder.patch_sha256}
 
     $Phase = "tool-supply"
     $Qemu = Ensure-Qemu
     $Record["qemu"] = $Qemu
+    $Phase = "image-command-preflight"
+    $imageCommands = @("Get-WindowsImage", "Get-WindowsDriver", "Get-DiskImage", "Mount-DiskImage", "Dismount-DiskImage", "Get-Volume")
+    foreach ($imageCommand in $imageCommands) {
+        $null = Get-Command -Name $imageCommand -CommandType Cmdlet,Function -ErrorAction Stop | Select-Object -First 1
+    }
+    Emit "image-commands-ready" @{commands=$imageCommands}
+
+    $Iso = Join-Path $Inputs $Lock.iso_filename
+    $DriverZip = Join-Path $Inputs "gunyah-arm64-drivers.zip"
+    $Phase = "iso-download"
+    $Record.source.iso["actual_sha256"] = Download-Verified $IsoUrl.AbsoluteUri $Iso ([long]$Lock.iso_bytes) $Lock.publisher_sha256 "windows-iso"
+    # Release the local ticket after its only use.
+    $IsoUrl = $null
+    $Phase = "driver-download"
+    $Record.source.driver["actual_sha256"] = Download-Verified $Lock.driver_url $DriverZip ([long]$Lock.driver_bytes) $Lock.driver_sha256 "arm64-drivers"
+
     $Phase = "image-enumeration"
     $ImageInfo = Select-Professional $Iso
     Json-File (Join-Path $Stage "windows-image-info.json") $ImageInfo
     $Record["windows"] = $ImageInfo.windows
+    Emit "selected-image" @{image_index=$ImageInfo.windows.image_index; edition_id=$ImageInfo.windows.edition_id
+        architecture=$ImageInfo.windows.architecture; version=$ImageInfo.windows.version; image_size_bytes=$ImageInfo.windows.image_size_bytes}
     $freeBeforeBuild = Free-Bytes $OwnedRoot
     # Both VHDX and output QCOW2 coexist. This is a conservative working estimate,
     # based on actual DISM ImageSize, not on the thin disk's 64 GiB logical maximum.
@@ -339,21 +375,6 @@ try {
     if ($freeBeforeBuild -lt $neededAdditional) {
         throw "The selected temp volume lacks the image working budget; use an explicit larger WINDOWS_TEMP_PARENT. No unrelated software is cleared"
     }
-    $Phase = "builder-source"
-    $Builder = Join-Path $OwnedRoot "builder"
-    [IO.Directory]::CreateDirectory($Builder) | Out-Null
-    $git = (Get-Command git -CommandType Application -ErrorAction Stop).Source
-    Native $git @("-C", $Builder, "init", "-q")
-    Native $git @("-C", $Builder, "remote", "add", "origin", $Lock.builder_repository)
-    Native $git @("-C", $Builder, "fetch", "--depth", "1", "origin", $Lock.builder_commit)
-    Native $git @("-C", $Builder, "checkout", "--detach", "FETCH_HEAD")
-    $head = Native $git @("-C", $Builder, "rev-parse", "HEAD") -Capture
-    if ($head.Trim() -ne $Lock.builder_commit) { throw "Builder source pin mismatch" }
-    Native $git @("-C", $Builder, "apply", "--check", $PatchPath)
-    Native $git @("-C", $Builder, "apply", $PatchPath)
-    $Record.source.builder["actual_base_commit"] = $head.Trim()
-    $Record.source.builder["applied_patch"] = "windows-safe-provisioning.patch"
-
     $Phase = "credential-provisioning"
     $random = [byte[]]::new(32)
     $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -439,9 +460,20 @@ catch {
     $Record.status = "failed"
     $Record["failure_phase"] = $Phase
     $Record["failure_type"] = $_.Exception.GetType().FullName
-    # Do not serialize the exception or invocation: either could retain a ticket.
+    # Only these controlled preflight commands can expose safe command/file/line facts.
+    # Never serialize exception text, invocation arguments or the command line.
+    $failureFacts = @{failure_phase=$Phase; error_type=$Record.failure_type; owned_root=$OwnedRoot}
+    if ($Phase -in @("builder-source", "image-command-preflight") -and
+        $_.Exception -is [System.Management.Automation.CommandNotFoundException]) {
+        $Record["failure_command_name"] = Get-Field $_.Exception "CommandName"
+        $Record["failure_source_file"] = Get-Field $_.InvocationInfo "ScriptName"
+        $Record["failure_source_line"] = Get-Field $_.InvocationInfo "ScriptLineNumber"
+        $failureFacts["command_name"] = $Record.failure_command_name
+        $failureFacts["source_file"] = $Record.failure_source_file
+        $failureFacts["source_line"] = $Record.failure_source_line
+    }
     Json-File $RecordPath $Record
-    Emit "failed" @{failure_phase=$Phase; error_type=$Record.failure_type; owned_root=$OwnedRoot}
+    Emit "failed" $failureFacts
     throw ("Windows image construction failed at " + $Phase + "; the owned files are preserved")
 }
 finally {
