@@ -1,0 +1,105 @@
+{
+  "format": "droidvm-windows-arm64-profile-v1",
+  "source_template": {
+    "repository": "https://github.com/Droid-VM/win11-arm64-image-builder",
+    "commit": "cb6469058514401f16dd4b3142fde027f5b3c94a",
+    "path": "vms.json",
+    "sha256": "ff1fa21283017208ce7420bedd7e965c43a048c56dbb704b1380138f0ea6b8c0"
+  },
+  "target_application": {
+    "source_commit": "33488301c902124d9ddb09fa04b8126443d83230",
+    "version": "0.0.6.r242.g3348830",
+    "version_code": 2720,
+    "build_type": "release"
+  },
+  "target_os": {
+    "name": "Windows 11",
+    "marketing_version": "26H2",
+    "architecture": "arm64",
+    "language": "zh-CN",
+    "source_lock": "profiles/windows-source-lock.json",
+    "actual_image_metadata_owner": "The received build-record.json windows object; WIM ImageId and version are not fabricated by this profile"
+  },
+  "image": {
+    "name": "Windows11.qcow2",
+    "format": "qcow2",
+    "virtual_size": 68719476736
+  },
+  "firmware": {
+    "name": "edk2-windows.fd",
+    "vars_name": "edk2-windows.vars.fd"
+  },
+  "phone_import_target_dir": "/storage/emulated/0/DroidVMWindows/Win11ARM64",
+  "network_mode": "unbound_nic",
+  "vm": {
+    "name": "Windows 11 26H2 ARM64 (DroidVM NX736J)",
+    "backend": "crosvm",
+    "hypervisor": "gunyah",
+    "protected_vm": "protected_without_firmware",
+    "memory_mb": 6144,
+    "cpu_count": 4,
+    "cpu_topology_auto": true,
+    "swiotlb_mb": 256,
+    "smt": true,
+    "pmu": true,
+    "hugepages": true,
+    "prepare_lend_mthp": "chunked",
+    "balloon": false,
+    "rng": true,
+    "sandbox": false,
+    "strace": false,
+    "auto_up": false,
+    "disks": [],
+    "networks": [{}],
+    "shared_dirs": [],
+    "environment_variables": [],
+    "extra_options": [],
+    "peripherals": [],
+    "screens": {
+      "simplefb": {
+        "enabled": true,
+        "exporter": "native",
+        "input_enabled": true,
+        "transport_cap": "cpu",
+        "width": 1280,
+        "height": 720,
+        "poll_hz": 60
+      },
+      "gpu-0": {
+        "enabled": false,
+        "exporter": "native",
+        "input_enabled": true,
+        "width": 1280,
+        "height": 720,
+        "refresh_rate": 60,
+        "dpi_h": 160,
+        "dpi_v": 160
+      }
+    },
+    "serial_ports": [
+      {"hardware": "sbsa", "num": 1, "backend": "app_console", "console": true, "usb_slot": 0},
+      {"hardware": "serial", "num": 1, "backend": "app_console", "console": false, "fixed": true},
+      {"hardware": "serial", "num": 2, "backend": "sink", "console": false, "fixed": true},
+      {"hardware": "serial", "num": 3, "backend": "sink", "console": false, "fixed": true},
+      {"hardware": "serial", "num": 4, "backend": "sink", "console": false, "fixed": true}
+    ],
+    "boot": {"protocol": "uefi", "uefi": {"firmware": "", "vars_enabled": false, "vars": ""}}
+  },
+  "r242_source_observations": {
+    "sbsa": "SerialHardware.SBSA and CrosvmBackendInstance.buildSerialCommand consume serial_ports hardware=sbsa",
+    "screens": "VMScreenConfig and CrosvmBackendInstance consume canonical screens; no legacy display dimensions are required",
+    "mthp": "LendMthpMode.KEY=prepare_lend_mthp; CHUNKED emits --prepare-lend-mthp-mode chunked",
+    "omitted_template_fields": ["gunyah_dynamic_share", "display_enabled", "native_display_enabled", "display_backend", "gpu_enabled", "vnc_enabled", "display_blit_provider"],
+    "field_omission_reasons": {
+      "gunyah_dynamic_share": "No r242 config consumer found for this key",
+      "legacy_display_flags": "Canonical screens owns the current display configuration",
+      "display_blit_provider": "SimpleFB uses CPU copy and does not use the virtio-GPU blit provider"
+    },
+    "usb": "Canonical empty peripherals disables xHCI rather than carrying the legacy usb key"
+  },
+  "limitations": [
+    "The NIC is intentionally unbound. Join an actual existing network in the native VM editor after import; a bridge name is not a network identity.",
+    "Initial vars are disabled. Bind the packaged private vars from a genuine completed import event and current vm_get result before starting Windows.",
+    "Static config/source observations do not establish phone loading, Windows boot, display, input, drivers or data persistence."
+  ]
+}
