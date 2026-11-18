@@ -18,9 +18,11 @@
   "driver_repository": "https://github.com/Droid-VM/gunyah-guest-drivers-windows",
   "driver_commit": "9922545ee7c65927e720c3c12b39cd8ae144e90b",
   "driver_url": "https://github.com/Droid-VM/gunyah-guest-drivers-windows/releases/download/dev/gunyah-arm64-drivers.zip",
-  "driver_bytes": 776748,
-  "driver_sha256": "bb37006cf4f3790b3abe5abc913ce0dafcf076b2fe9118530bdc7f01c5b7727a",
+  "driver_bytes": 776774,
+  "driver_sha256": "207d566ca39894eee7a811a1ff92e6e8826260a810e337c3bb88b1bec908d716",
   "driver_certificate_sha256": "da88f450dbd881c91511c5b801295cd9cc0d3ca84ea9d3dc08eff9481eed64b3",
-  "actual_iso_downloaded": false,
-  "actual_windows_build_complete": false
+  "driver_release_id": 387510879,
+  "driver_asset_id": 558946077,
+  "driver_metadata_observed_at_utc": "2026-11-18T14:51:32.127193+00:00",
+  "capture_scope": "Input metadata lock. Actual download/build status and digest checks belong to the completed build and receiving records."
 }
