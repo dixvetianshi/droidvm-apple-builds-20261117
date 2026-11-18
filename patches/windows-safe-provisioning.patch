@@ -1,0 +1,1131 @@
+diff --git a/windows/build.ps1 b/windows/build.ps1
+index e1d05cd..ce792c2 100644
+--- a/windows/build.ps1
++++ b/windows/build.ps1
+@@ -1,7 +1,7 @@
+ <#
+   build.ps1 - Offline build of a bootable, driver-included qcow2 from a Win11 ARM64 ISO + drivers.
+   No Setup, no qemu boot: DISM apply-image + offline driver injection (no signature prompt) + bcdboot + bcdedit.
+-  First boot runs OOBE via unattend to create USER/autologon (non-interactive).
++  First boot keeps the normal OOBE/EULA UI; no remote server or automatic login is provisioned.
+ 
+   Requirements: x64 Windows (Administrator); built-in dism/bcdboot/diskpart; qemu-img (QEMU for Windows, on PATH).
+   Entry point: ..\windows_build.ps1 sets $env:SRC_ISO / $DRIVERS_DIR / ... then calls this. To run build.ps1 directly,
+@@ -11,8 +11,6 @@
+ [CmdletBinding()]
+ param()
+ $ErrorActionPreference = 'Stop'
+-# This process only (see ..\windows_build.ps1): scripts called from here (pack-vmpkg.ps1) don't prompt again.
+-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+ 
+ # --- Command echo helpers: print the command before executing it ---
+ function Format-CommandArg([AllowNull()][object]$Arg) {
+@@ -34,98 +32,91 @@ function Show-CommandLine([string]$Command, [object[]]$Arguments = @()) {
+ }
+ 
+ 
+-# --- Requires Administrator (diskpart/dism/bcdboot/mount all need it) ---
++# This cloud build must already be elevated; never relaunch or install host software.
+ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+-    Write-Host "Administrator required, relaunching elevated..." -ForegroundColor Yellow
+-    # UAC starts the child in System32 whatever the caller's directory was: hand the current directory over
+-    # on the command line and cd back to it before the script runs.
+-    $cwd = (Get-Location).ProviderPath.Replace("'", "''")
+-    $me = $PSCommandPath.Replace("'", "''")
+-    $elevArgs = "-ExecutionPolicy Bypass -Command `"Set-Location -LiteralPath '$cwd'; & '$me'`""
+-    Show-CommandLine "Start-Process" @("powershell", $elevArgs, "-Verb", "RunAs")
+-    Start-Process powershell $elevArgs -Verb RunAs
+-    exit
++    throw "An already-elevated Windows runner is required; automatic elevation is disabled"
+ }
+ 
+ $HERE = $PSScriptRoot
+-$ROOT = Split-Path $HERE -Parent
++$SOURCE_ROOT = Split-Path $HERE -Parent
+ 
+-# --- File-type input resolution: URL -> download into files\ then use; local path -> use directly; zip -> extract into files\ (goes through the file handling flow) ---
+-function Resolve-InputFile([string]$Src, [string]$SaveAs = "") {
+-    if ($Src -match '^https?://') {
+-        $files = Join-Path $HERE "files"
+-        New-Item -ItemType Directory -Force $files | Out-Null
+-        if (-not $SaveAs) { $SaveAs = Split-Path ($Src -replace '\?.*$', '') -Leaf }
+-        $dst = Join-Path $files $SaveAs
+-        if (Test-Path $dst) { Write-Host "[files] already exists, skip download: $dst" }
+-        else {
+-            Write-Host "[files] download $Src -> $dst"
+-            Invoke-WebRequest -Uri $Src -OutFile "$dst.part" -UseBasicParsing
+-            Move-Item "$dst.part" $dst -Force
++# Only the caller-selected child of RUNNER_TEMP owns mutable build files.
++function Get-BoundedPath([string]$Path, [string]$Boundary, [switch]$MustExist, [switch]$AllowRoot) {
++    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Boundary)) {
++        throw "An explicit filesystem path and boundary are required"
++    }
++    if ($Path -notmatch '^[A-Za-z]:[\\/]' -or $Boundary -notmatch '^[A-Za-z]:[\\/]') {
++        throw "Only absolute local drive paths are accepted"
++    }
++    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
++    $base = [IO.Path]::GetFullPath($Boundary).TrimEnd('\', '/')
++    $same = $full.Equals($base, [StringComparison]::OrdinalIgnoreCase)
++    if (($same -and -not $AllowRoot) -or (-not $same -and
++        -not $full.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase))) {
++        throw "Path is outside its explicitly owned boundary"
++    }
++    $probe = $full
++    while ($probe) {
++        if (Test-Path -LiteralPath $probe) {
++            if ((Get-Item -LiteralPath $probe -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
++                throw "Reparse paths are not accepted inside the owned build tree"
++            }
+         }
+-        return $dst
++        if ($probe.Equals($base, [StringComparison]::OrdinalIgnoreCase)) { break }
++        $probe = Split-Path $probe -Parent
+     }
+-    # %VAR% is expanded (PowerShell itself never does), relative paths count from the repo root (where
+-    # windows_build.ps1 lives), and the result is always a full path: CIM cmdlets such as Mount-DiskImage
+-    # ignore PowerShell's current location and fail on a relative one.
+-    $Src = [Environment]::ExpandEnvironmentVariables($Src)
+-    if (-not [IO.Path]::IsPathRooted($Src)) { $Src = Join-Path $ROOT $Src }
+-    if (-not (Test-Path -LiteralPath $Src)) { throw "file not found: $Src" }
+-    return (Resolve-Path -LiteralPath $Src).ProviderPath
++    if ($MustExist -and -not (Test-Path -LiteralPath $full)) { throw "Required local path does not exist: $full" }
++    return $full
++}
++
++if (-not $env:RUNNER_TEMP -or -not $env:DVM_OWNED_ROOT) {
++    throw "RUNNER_TEMP and DVM_OWNED_ROOT must be provided explicitly"
++}
++# An alternate local parent is accepted only when the cloud wrapper selected it explicitly.
++$tempParent = if ($env:DVM_TEMP_PARENT) { $env:DVM_TEMP_PARENT } else { $env:RUNNER_TEMP }
++if ($tempParent -notmatch '^[A-Za-z]:[\\/]') { throw "The selected temp parent must be an absolute local path" }
++$RUNNER_BOUNDARY = [IO.Path]::GetFullPath($tempParent).TrimEnd('\', '/')
++if (-not (Test-Path -LiteralPath $RUNNER_BOUNDARY -PathType Container)) { throw "The selected temp parent must already exist" }
++$ROOT = Get-BoundedPath $env:DVM_OWNED_ROOT $RUNNER_BOUNDARY
++if (-not (Test-Path -LiteralPath $ROOT)) { New-Item -ItemType Directory -Path $ROOT | Out-Null }
++if (-not (Test-Path -LiteralPath $ROOT -PathType Container)) { throw "DVM_OWNED_ROOT must be a directory" }
++
++function Resolve-InputFile([string]$Src, [string]$SaveAs = "") {
++    # The wrapper owns downloads and their digest verification. This layer never fetches a URL.
++    $path = Get-BoundedPath $Src $ROOT -MustExist
++    return $path
+ }
+ 
+-# Driver zip/folder source -> the "root directory" after extraction. DRIVER_DIR / DRIVER_CERT reference this root via the ZIP/ prefix (mirrors macOS).
+ function Resolve-ZipRoot([string]$Src) {
+-    $p = Resolve-InputFile $Src "gunyah-arm64-drivers.zip"
+-    if (Test-Path $p -PathType Container) { return $p }
+-    if ($p -like "*.zip") {
+-        $dir = Join-Path (Join-Path $HERE "files") ([IO.Path]::GetFileNameWithoutExtension($p))
+-        if (Test-Path $dir) { Write-Host "[files] already extracted: $dir" }
+-        else { Write-Host "[files] extract $p -> $dir"; Expand-Archive $p -DestinationPath $dir -Force }
+-        return $dir
+-    }
+-    throw "driver source is neither a folder nor a zip: $p"
++    $p = Resolve-InputFile $Src
++    if (Test-Path -LiteralPath $p -PathType Container) { return $p }
++    if ([IO.Path]::GetExtension($p) -ine '.zip') { throw "Driver source must be a local ZIP or directory" }
++    $dir = Get-BoundedPath (Join-Path $ROOT "drivers-extracted") $ROOT
++    if (Test-Path -LiteralPath $dir) { throw "Preserve an existing driver extraction; use a fresh owned root" }
++    Expand-Archive -LiteralPath $p -DestinationPath $dir
++    return $dir
+ }
+ 
+-# Expand a leading ZIP prefix in DRIVER_DIR / DRIVER_CERT -> the zip extraction root (mirrors macOS's ${VAR/#ZIP/$ZIP}).
+-# e.g.: ZIP/drivers -> <root>\drivers; ZIP/DroidVM_Test.cer -> <root>\DroidVM_Test.cer; non-ZIP prefix -> unchanged.
+ function Expand-ZipToken([string]$Path, [string]$ZipRoot) {
+-    if (-not $Path) { return $Path }
+-    if ($Path -eq 'ZIP') { return $ZipRoot }
+-    # String concatenation (not Join-Path, to avoid 'C:' being resolved as a PSDrive); normalize slashes after ZIP to backslashes.
+-    if ($Path -match '^ZIP[\\/](.*)$') { return ($ZipRoot.TrimEnd('\', '/') + '\' + ($Matches[1] -replace '/', '\')) }
+-    if (-not [IO.Path]::IsPathRooted($Path)) { return (Join-Path $ROOT $Path) }   # plain relative: from the repo root
+-    return $Path
++    if ($Path -eq 'ZIP') { return (Get-BoundedPath $ZipRoot $ROOT -MustExist) }
++    if ($Path -match '^ZIP[\\/](.*)$') {
++        return (Get-BoundedPath (Join-Path $ZipRoot $Matches[1]) $ZipRoot -MustExist)
++    }
++    return (Resolve-InputFile $Path)
+ }
+ 
+-# qemu-img: QEMU for Windows installs to %ProgramFiles%\qemu without touching PATH, so look there before giving
+-# up. When it is missing, offer 'winget install SoftwareFreedomConservancy.QEMU' (a current qemu-img with zstd;
+-# the 'cloudbase.qemu-img' package on winget is 2.3.0 and cannot write compression_type=zstd). QEMU_IMG_INSTALL=1
+-# skips the question; 0/false/no/off or unset asks.
+-function Ensure-QemuImg([string]$AutoInstall) {
+-    $qemuDir = Join-Path $env:ProgramFiles "qemu"
+-    if (-not (Get-Command qemu-img -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $qemuDir "qemu-img.exe"))) {
+-        $env:PATH = "$qemuDir;" + $env:PATH
+-    }
+-    if (Get-Command qemu-img -ErrorAction SilentlyContinue) { return }
+-    $pkg = "SoftwareFreedomConservancy.QEMU"
+-    if ($AutoInstall) {
+-        Write-Host "[qemu-img] not found; QEMU_IMG_INSTALL is set -> winget install $pkg" -ForegroundColor Yellow
+-    } else {
+-        $ans = Read-Host "[qemu-img] not found. Install QEMU for Windows now (winget install $pkg)? [y/N]"
+-        if ($ans -notmatch '^\s*y(es)?\s*$') {
+-            throw "qemu-img not found: install QEMU for Windows (winget install $pkg) or set QEMU_IMG_INSTALL=1 to let the build install it"
+-        }
++function Ensure-QemuImg {
++    if ($env:DVM_QEMU_IMG) {
++        $path = [IO.Path]::GetFullPath($env:DVM_QEMU_IMG)
++        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "DVM_QEMU_IMG is not a local executable" }
++        return $path
+     }
+-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw "winget not found; install QEMU for Windows by hand: https://www.qemu.org/download/#windows" }
+-    $wargs = @("install", "--id", $pkg, "-e", "--accept-source-agreements", "--accept-package-agreements")
+-    Show-CommandLine "winget" $wargs
+-    & winget @wargs
+-    # Not gated on winget's exit code ("already installed" is non-zero too): what matters is the binary.
+-    $env:PATH = "$qemuDir;" + $env:PATH
+-    if (-not (Get-Command qemu-img -ErrorAction SilentlyContinue)) { throw "qemu-img still not found after winget (expected $qemuDir\qemu-img.exe; winget exit code $LASTEXITCODE)" }
+-    Write-Host "[qemu-img] $((Get-Command qemu-img).Source)" -ForegroundColor Green
++    $command = Get-Command qemu-img -CommandType Application -ErrorAction SilentlyContinue
++    if ($command) { return $command.Source }
++    $path = Join-Path $env:ProgramFiles "qemu\qemu-img.exe"
++    if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
++    throw "qemu-img is required; this builder never prompts for or installs QEMU"
+ }
+ 
+ # --- Helpers ---
+@@ -144,6 +135,10 @@ function Invoke-ExternalCommand {
+         [string]$What = ''
+     )
+ 
++    if ($FilePath -eq "qemu-img") { $FilePath = $script:QEMU_IMG }
++    elseif ($FilePath -in @("dism", "bcdboot", "bcdedit", "reg", "mountvol")) {
++        $FilePath = Join-Path $env:WINDIR ("System32\" + $FilePath + ".exe")
++    }
+     Show-CommandLine $FilePath $ArgumentList
+     if ($OutNull) {
+         & $FilePath @ArgumentList | Out-Null
+@@ -164,14 +159,15 @@ function Invoke-DiskPartScript {
+ 
+     Show-CommandLine "diskpart" @("/s", $Path)
+     Write-Host "> diskpart script:" -ForegroundColor DarkCyan
+-    Get-Content $Path | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkCyan }
++    Get-Content -LiteralPath $Path | ForEach-Object { Write-Host ("    " + $_) -ForegroundColor DarkCyan }
+ 
+     if ($OutNull) {
+-        & diskpart /s $Path | Out-Null
++        & (Join-Path $env:WINDIR "System32\diskpart.exe") @("/s", $Path) | Out-Null
+     }
+     else {
+-        & diskpart /s $Path
++        & (Join-Path $env:WINDIR "System32\diskpart.exe") @("/s", $Path)
+     }
++    Assert-Exit "diskpart"
+ }
+ 
+ 
+@@ -194,146 +190,152 @@ function Get-FreeDriveLetter([string[]]$Exclude = @()) {
+     throw "no free drive letter available"
+ }
+ 
+-# Resolve the install.wim image index. IMAGE_INDEX <= 0 -> list editions and let the user pick.
+-# Uses Get-WindowsImage (native objects: ImageIndex/ImageName/ImageSize) - no text parsing.
++# A cloud build requires an explicitly selected edition; no interactive fallback.
+ function Resolve-ImageIndex([string]$wim, [int]$wanted) {
+-    Show-CommandLine "Get-WindowsImage" @("-ImagePath", $wim)
++    if ($wanted -le 0) { throw "IMAGE_INDEX must explicitly select the Windows edition" }
+     $images = @(Get-WindowsImage -ImagePath $wim)
+-    $valid = @($images | ForEach-Object { [int]$_.ImageIndex })
+-    if ($wanted -gt 0) {
+-        if ($valid -notcontains $wanted) {
+-            throw ("IMAGE_INDEX=$wanted not in this ISO. Available: " +
+-                (($images | ForEach-Object { "$($_.ImageIndex)=$($_.ImageName)" }) -join ', '))
+-        }
+-        return $wanted
+-    }
+-    if ($images.Count -eq 1) {
+-        Write-Host "[image] one edition only -> index $($valid[0]) ($($images[0].ImageName))"
+-        return $valid[0]
+-    }
+-    Write-Host "`nEditions in install.wim:" -ForegroundColor Cyan
+-    foreach ($im in $images) {
+-        Write-Host ("  [{0}] {1}  ({2:N1} GB)" -f $im.ImageIndex, $im.ImageName, ($im.ImageSize / 1GB))
++    if (@($images | ForEach-Object { [int]$_.ImageIndex }) -notcontains $wanted) {
++        throw "IMAGE_INDEX is not present in the selected install.wim"
+     }
+-    if ([Console]::IsInputRedirected) {
+-        throw ("IMAGE_INDEX not set and no interactive console. Set IMAGE_INDEX to one of: " + ($valid -join ', '))
++    $detail = Get-WindowsImage -ImagePath $wim -Index $wanted
++    if ([string]$detail.Architecture -notin @("arm64", "ARM64", "12")) {
++        throw "The selected Windows image must be ARM64"
+     }
+-    do {
+-        $sel = (Read-Host "`nSelect image index").Trim()
+-        $n = 0
+-        $ok = [int]::TryParse($sel, [ref]$n) -and ($valid -contains $n)
+-        if (-not $ok) { Write-Host ("  invalid, choose from: " + ($valid -join ', ')) -ForegroundColor DarkYellow }
+-    } while (-not $ok)
+-    return $n
++    return $wanted
+ }
+ 
+-# --- Resolve config: environment variable (set by windows_build.ps1) > built-in default ---
+-$SRC_ISO     = if ($env:SRC_ISO)     { $env:SRC_ISO }          else { $null }
+-$DRIVERS_DIR = if ($env:DRIVERS_DIR) { $env:DRIVERS_DIR }      else { "https://github.com/Droid-VM/gunyah-guest-drivers-windows/releases/download/dev/gunyah-arm64-drivers.zip" }
+-$IMAGE_INDEX = if ($env:IMAGE_INDEX) { [int]$env:IMAGE_INDEX } else { 0 }       # 0 = list editions and prompt
+-$DISK_MB     = if ($env:DISK_SIZE_MB){ [int]$env:DISK_SIZE_MB }else { 40960 }
+-$OUT_QCOW    = if ($env:OUT_QCOW)    { $env:OUT_QCOW }         else { Join-Path $ROOT "win11-droidvm-final.qcow2" }
+-# Optional: also pack a ready-to-import .vmpkg (qcow2 + local VM config baked in) with pack-vmpkg.ps1
+-# (pure PowerShell + the built-in tar.exe). See repo README.
+-$OUT_VMPKG   = if ($env:OUT_VMPKG)   { $env:OUT_VMPKG }        else { "" }
+-$VMS_JSON    = if ($env:VMS_JSON)    { $env:VMS_JSON }         else { Join-Path $ROOT "vms.json" }
+-# %VAR% in output/config paths is expanded (PowerShell itself never does); relative ones resolve against the
+-# repo root, not the elevated shell's CWD (system32).
+-$OUT_QCOW  = [Environment]::ExpandEnvironmentVariables($OUT_QCOW)
+-$OUT_VMPKG = [Environment]::ExpandEnvironmentVariables($OUT_VMPKG)
+-$VMS_JSON  = [Environment]::ExpandEnvironmentVariables($VMS_JSON)
+-if (-not [IO.Path]::IsPathRooted($OUT_QCOW))                  { $OUT_QCOW  = Join-Path $ROOT $OUT_QCOW }
+-if ($OUT_VMPKG -and -not [IO.Path]::IsPathRooted($OUT_VMPKG)) { $OUT_VMPKG = Join-Path $ROOT $OUT_VMPKG }
+-if (-not [IO.Path]::IsPathRooted($VMS_JSON))                  { $VMS_JSON  = Join-Path $ROOT $VMS_JSON }
+-$VMPKG_COMPRESSION = if ($env:VMPKG_COMPRESSION) { $env:VMPKG_COMPRESSION } else { "auto" }   # auto = zstd on all cores when tar.exe has libzstd (Win11), else gzip
+-$VMPKG_THREADS = if ($env:VMPKG_THREADS) { [int]$env:VMPKG_THREADS } else { 0 }               # zstd threads, 0 = all
+-$COMPRESS    = if ($env:COMPRESS -and $env:COMPRESS -notmatch '^(0|false|no|off)$') { $env:COMPRESS } else { "" }   # 1 = zstd-compress the qcow2 clusters (step 9); 0/false/no/off/unset = off
+-$QEMU_IMG_INSTALL = if ($env:QEMU_IMG_INSTALL -and $env:QEMU_IMG_INSTALL -notmatch '^(0|false|no|off)$') { $env:QEMU_IMG_INSTALL } else { "" }   # 1 = winget-install QEMU without asking when qemu-img is missing
+-$LETTER_ESP  = if ($env:LETTER_ESP)  { $env:LETTER_ESP }       else { Get-FreeDriveLetter }
+-$LETTER_WIN  = if ($env:LETTER_WIN)  { $env:LETTER_WIN }       else { Get-FreeDriveLetter @($LETTER_ESP) }
+-# Driver install list/cert (mirrors macOS): DRIVER_DIR=directory containing the per-driver subfolders (ZIP/ = driver zip extraction root);
+-# DRIVER_INSTALL=offline-inject only these subfolders (empty=all); DRIVER_CERT=specify the signing cert (empty=auto-extract from .cat).
+-$DRIVER_DIR     = if ($env:DRIVER_DIR)     { $env:DRIVER_DIR }     else { "ZIP/drivers" }
+-$DRIVER_INSTALL = if ($env:DRIVER_INSTALL) { $env:DRIVER_INSTALL } else { "" }
+-$DRIVER_CERT    = if ($env:DRIVER_CERT)    { $env:DRIVER_CERT }    else { "" }
+-# EMS/SAC (Emergency Management Services): the interactive SAC> console needs the "EMS and SAC Toolset"
+-# Feature-on-Demand (sacdrv.sys/sacsess.exe/sacsvr) which the LTSC/Pro ARM64 image does NOT ship.
+-# EMS_SAC_SOURCE says where it comes from:
+-#   skip     (default) boot-EMS only: BCD EMS is always armed (boot-time serial text works), no interactive SAC>
+-#   online   a first-boot script pulls the FoD from Windows Update on the TARGET (network + one reboot)
+-#   <path>   the matching-build ARM64 FoD ISO mount or its extracted folder -> injected OFFLINE in
+-#            step 5c (deterministic, zero network, recommended)
+-$EMS_SAC_SOURCE  = if ($env:EMS_SAC_SOURCE)  { $env:EMS_SAC_SOURCE }  else { "skip" }
+-if (-not $env:EMS_SAC_SOURCE -and ($env:FOD_SOURCE -or $env:EMS_SAC_ONLINE)) {   # names before the merge
+-    $EMS_SAC_SOURCE = if ($env:FOD_SOURCE) { $env:FOD_SOURCE } else { "online" }
+-    Write-Host "[ems-sac] FOD_SOURCE / EMS_SAC_ONLINE were merged into EMS_SAC_SOURCE (skip | online | <FoD path>); using '$EMS_SAC_SOURCE'" -ForegroundColor DarkYellow
++# All mutable paths are inside the explicitly selected RUNNER_TEMP child.
++$SRC_ISO = Resolve-InputFile $env:SRC_ISO
++if (-not (Test-Path -LiteralPath $SRC_ISO -PathType Leaf)) { throw "SRC_ISO must be a local file" }
++$DRIVERS_DIR = Resolve-InputFile $env:DRIVERS_DIR
++$IMAGE_INDEX = if ($env:IMAGE_INDEX) { [int]$env:IMAGE_INDEX } else { 0 }
++$DISK_MB = if ($env:DISK_SIZE_MB) { [int]$env:DISK_SIZE_MB } else { 65536 }
++if ($DISK_MB -lt 65536) { throw "The normal Windows 11 image requires a virtual disk of at least 64 GiB" }
++$OUT_QCOW = if ($env:OUT_QCOW) { Get-BoundedPath $env:OUT_QCOW $ROOT } else { Join-Path $ROOT "win11-droidvm-final.qcow2" }
++if ($env:OUT_VMPKG) {
++    throw "Packaging is a separate verified phase; this builder only creates OUT_QCOW"
+ }
+-$emsSacOnline    = ($EMS_SAC_SOURCE -eq "online")
+-$EMS_SAC_CAP     = 'Windows.Desktop.EMS-SAC.Tools~~~~0.0.1.0'
+-# Account name. Use $env:DVM_USERNAME (not the built-in Windows $env:USERNAME = the current logged-in user). Unset -> USER.
+-$USERNAME     = if ($env:DVM_USERNAME) { $env:DVM_USERNAME } else { "USER" }
+-# Account password: network logon for RDP/SSH does not accept a blank password (Windows default LimitBlankPasswordUse=1). Use $env:DVM_PASSWORD
+-# (the @@PASSWORD@@ token is injected into unattend.xml, see step 8; the old $env:SSH_PASSWORD still works).
+-$PASSWORD     = if ($env:DVM_PASSWORD) { $env:DVM_PASSWORD } elseif ($env:SSH_PASSWORD) { $env:SSH_PASSWORD } else { "DroidVM" }
+-# SSH public key(s) (multiple allowed, newline-separated); empty = password login only. Passed via environment variable, not written to inputs\.
+-$SSH_PUBKEY   = if ($env:SSH_PUBKEY)   { $env:SSH_PUBKEY }      else { "" }
+-# OpenSSH installer source: URL (downloaded at build time) or local path (copied). Defaults to the arm64 .msi. Empty string = do not install SSH (RDP only).
+-$OPENSSH_SRC  = if ($env:OPENSSH_SRC)  { $env:OPENSSH_SRC }     else { "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi" }
++foreach ($output in @($OUT_QCOW)) {
++    if (-not $output) { continue }
++    if (Test-Path -LiteralPath $output) { throw "Preserve an existing output: $output" }
++    $parent = Get-BoundedPath (Split-Path $output -Parent) $ROOT -AllowRoot
++    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
++}
++$COMPRESS = if ($env:COMPRESS -and $env:COMPRESS -notmatch '^(0|false|no|off)$') { $env:COMPRESS } else { "" }
++$LETTER_ESP = if ($env:LETTER_ESP) { $env:LETTER_ESP } else { Get-FreeDriveLetter }
++$LETTER_WIN = if ($env:LETTER_WIN) { $env:LETTER_WIN } else { Get-FreeDriveLetter @($LETTER_ESP) }
++if ($LETTER_ESP -notmatch '^[A-Z]$' -or $LETTER_WIN -notmatch '^[A-Z]$' -or $LETTER_ESP -eq $LETTER_WIN) {
++    throw "Two distinct drive letters are required"
++}
++if ((Test-Path -LiteralPath ($LETTER_ESP + ':\')) -or (Test-Path -LiteralPath ($LETTER_WIN + ':\'))) {
++    throw "A requested drive letter is already in use"
++}
++$DRIVER_DIR = if ($env:DRIVER_DIR) { $env:DRIVER_DIR } else { "ZIP/drivers" }
++$DRIVER_INSTALL = @("NetKVM", "rdmapool", "pvmpower", "vioinput", "viostor", "viosnd")
++$DRIVER_CERT = if ($env:DRIVER_CERT) { $env:DRIVER_CERT } else { throw "An explicit DRIVER_CERT is required" }
++$EMS_SAC_SOURCE = if ($env:EMS_SAC_SOURCE) { $env:EMS_SAC_SOURCE } else { "skip" }
++if ($EMS_SAC_SOURCE -eq "online") { throw "Online first-boot EMS installation is disabled" }
++$EMS_SAC_CAP = 'Windows.Desktop.EMS-SAC.Tools~~~~0.0.1.0'
++if ($EMS_SAC_SOURCE -ne "skip") { $EMS_SAC_SOURCE = Resolve-InputFile $EMS_SAC_SOURCE }
++$USERNAME = if ($env:DVM_USERNAME) { $env:DVM_USERNAME } else { "DroidVM" }
++if ($USERNAME -cne "DroidVM") { throw "This profile provisions the local DroidVM account" }
++$PASSWORD = [string]$env:DVM_PASSWORD
++if ($PASSWORD.Length -lt 32) { throw "The wrapper must supply a strong random DVM_PASSWORD of at least 32 characters" }
+ Write-Host "[disk] drive letters: ESP=$LETTER_ESP Windows=$LETTER_WIN"
+ 
+-foreach ($t in @("dism", "bcdboot", "diskpart")) {
+-    if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t not found" }
++foreach ($tool in @("dism", "bcdboot", "bcdedit", "diskpart", "mountvol", "reg")) {
++    if (-not (Test-Path -LiteralPath (Join-Path $env:WINDIR ("System32\" + $tool + ".exe")) -PathType Leaf)) {
++        throw "Required Windows tool is missing: $tool"
++    }
+ }
+-Ensure-QemuImg $QEMU_IMG_INSTALL
+-if (-not $SRC_ISO) { throw "Invalid SRC_ISO: set the Win11 ARM64 ISO (URL or local path) in windows_build.ps1" }
+-$SRC_ISO = Resolve-InputFile $SRC_ISO "win11-arm64.iso"
++if (-not (Get-Command Get-WindowsImage -ErrorAction SilentlyContinue)) { throw "The Windows DISM PowerShell cmdlets are required" }
++$QEMU_IMG = Ensure-QemuImg
+ 
+-$WORK = Join-Path $env:TEMP ("droidvm-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+-Show-CommandLine "New-Item" @("-ItemType", "Directory", "-Force", $WORK)
+-New-Item -ItemType Directory -Force $WORK | Out-Null
++$WORK = Get-BoundedPath (Join-Path $ROOT ("work-" + [guid]::NewGuid().ToString("N"))) $ROOT
++New-Item -ItemType Directory -Path $WORK | Out-Null
+ $VHDX = Join-Path $WORK "w11.vhdx"
+-$isoMounted = $false; $vhdAttached = $false
++$isoMounted = $false
++$vhdAttached = $false
++$offlineHiveLoaded = $false
++$offlineHiveName = "DVMOFF_" + [guid]::NewGuid().ToString("N")
++
++function Get-OwnedVhdDisk {
++    $image = Get-DiskImage -ImagePath $script:VHDX -ErrorAction Stop
++    if (-not $image.Attached) { throw "The owned VHDX is not attached" }
++    $disks = @($image | Get-Disk -ErrorAction Stop)
++    if ($disks.Count -ne 1) { throw "The owned VHDX did not resolve to one disk" }
++    return $disks[0]
++}
+ 
+ function Cleanup {
++    if ($script:offlineHiveLoaded) {
++        [gc]::Collect()
++        [gc]::WaitForPendingFinalizers()
++        Invoke-ExternalCommand -FilePath "reg" -ArgumentList @("unload", ("HKLM\" + $script:offlineHiveName)) -OutNull -What "reg unload owned offline hive"
++        $script:offlineHiveLoaded = $false
++    }
+     if ($script:vhdAttached) {
+-        # Release the drive letters first so they don't linger as stale MountedDevices reservations
+-        # that would make a later run's diskpart 'assign' fail. Best-effort.
+-        foreach ($L in @($script:LETTER_ESP, $script:LETTER_WIN)) {
+-            if ($L) {
+-                Show-CommandLine "cmd" @("/c", "mountvol ${L}: /D")
+-                & cmd /c "mountvol ${L}: /D" 2>$null | Out-Null
++        if (Test-Path -LiteralPath $script:VHDX -PathType Leaf) {
++            $image = Get-DiskImage -ImagePath $script:VHDX -ErrorAction Stop
++            if ($image.Attached) {
++                # Release only letters obtained from this exact VHDX.
++                $disk = Get-OwnedVhdDisk
++                foreach ($partition in @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)) {
++                    $letter = [string]$partition.DriveLetter
++                    if ($letter -match '^[A-Z]$') {
++                        Invoke-ExternalCommand -FilePath "mountvol" -ArgumentList @(($letter + ":"), "/D") -OutNull -What "mountvol owned VHDX partition"
++                    }
++                }
++                Dismount-DiskImage -ImagePath $script:VHDX -ErrorAction Stop | Out-Null
++                if ((Get-DiskImage -ImagePath $script:VHDX -ErrorAction Stop).Attached) { throw "Owned VHDX remains attached" }
+             }
+         }
+-        $s = "select vdisk file=`"$VHDX`"`r`ndetach vdisk`r`nexit"
+-        $f = Join-Path $WORK "detach.txt"
+-        $s | Out-File -Encoding ascii $f
+-        Invoke-DiskPartScript -Path $f -OutNull
++        $script:vhdAttached = $false
+     }
+     if ($script:isoMounted) {
+-        Show-CommandLine "Dismount-DiskImage" @("-ImagePath", $SRC_ISO)
+-        Dismount-DiskImage -ImagePath $SRC_ISO | Out-Null
++        if ((Get-DiskImage -ImagePath $script:SRC_ISO -ErrorAction Stop).Attached) {
++            Dismount-DiskImage -ImagePath $script:SRC_ISO -ErrorAction Stop | Out-Null
++        }
++        $script:isoMounted = $false
+     }
+ }
+ 
++$buildError = $null
+ try {
+-    # === 1) Resolve driver source (URL -> download to files\; local zip/folder -> use directly; zip -> extract to files\) ===
++    # === 1) Admit the caller's local, verified driver source ===
+     # Driver zip -> extraction root (ZIP); the ZIP/ prefix in DRIVER_DIR/DRIVER_CERT expands to that root directory.
+     $zipRoot     = Resolve-ZipRoot $DRIVERS_DIR
+     $DRIVER_DIR  = Expand-ZipToken $DRIVER_DIR  $zipRoot
+     $DRIVER_CERT = Expand-ZipToken $DRIVER_CERT $zipRoot
+-    if (-not (Test-Path $DRIVER_DIR -PathType Container)) { throw "driver folder DRIVER_DIR not found: $DRIVER_DIR" }
+-    if ($DRIVER_CERT -and -not (Test-Path $DRIVER_CERT)) { throw "DRIVER_CERT not found: $DRIVER_CERT" }
++    if (-not (Test-Path -LiteralPath $DRIVER_DIR -PathType Container)) { throw "The selected driver directory is missing" }
++    if (-not (Test-Path -LiteralPath $DRIVER_CERT -PathType Leaf)) { throw "The selected driver certificate is missing" }
++    if ((Get-FileHash -LiteralPath $DRIVER_CERT -Algorithm SHA256).Hash.ToLowerInvariant() -ne
++        "da88f450dbd881c91511c5b801295cd9cc0d3ca84ea9d3dc08eff9481eed64b3") {
++        throw "DRIVER_CERT differs from the pinned DroidVM Test release certificate"
++    }
+     $drvDir = $DRIVER_DIR
+-    $instShow = if ($DRIVER_INSTALL) { $DRIVER_INSTALL } else { "(all)" }
+-    $certShow = if ($DRIVER_CERT) { Split-Path $DRIVER_CERT -Leaf } else { "(auto from .cat)" }
+-    Write-Host "[drivers] dir=$drvDir  install=$instShow  cert=$certShow"
++    foreach ($driver in $DRIVER_INSTALL) {
++        $sub = Get-BoundedPath (Join-Path $drvDir $driver) $drvDir -MustExist
++        if (-not (Test-Path -LiteralPath $sub -PathType Container) -or
++            @(Get-ChildItem -LiteralPath $sub -Filter *.inf -File -Recurse).Count -eq 0) {
++            throw "A required driver folder/INF is missing: $driver"
++        }
++    }
++    $pvmDevnode = Get-BoundedPath (Join-Path $zipRoot "pvmpower-devnode.ps1") $zipRoot -MustExist
++    Write-Host "[drivers] six explicit ARM64 driver folders admitted"
+ 
+     # === 2) Mount ISO, get install.wim, resolve image index ===
+     Show-CommandLine "Mount-DiskImage" @("-ImagePath", $SRC_ISO, "-PassThru")
+-    $mr = Mount-DiskImage -ImagePath $SRC_ISO -PassThru; $isoMounted = $true
+-    $isoLetter = ($mr | Get-Volume).DriveLetter
++    if ((Get-DiskImage -ImagePath $SRC_ISO -ErrorAction Stop).Attached) {
++        throw "The input ISO is already mounted; preserve the caller's mount"
++    }
++    $isoMounted = $true
++    $mr = Mount-DiskImage -ImagePath $SRC_ISO -PassThru
++    $isoVolumes = @($mr | Get-Volume)
++    if ($isoVolumes.Count -ne 1 -or -not $isoVolumes[0].DriveLetter) { throw "The mounted ISO has no unique volume" }
++    $isoLetter = $isoVolumes[0].DriveLetter
+     $wim = "${isoLetter}:\sources\install.wim"
+-    if (-not (Test-Path $wim)) { throw "$wim not found in ISO" }
++    if (-not (Test-Path -LiteralPath $wim -PathType Leaf)) { throw "$wim not found in ISO" }
+     Write-Host "[iso] $SRC_ISO"
+     $IMAGE_INDEX = Resolve-ImageIndex $wim $IMAGE_INDEX
+     Write-Host "[image] using index $IMAGE_INDEX"
+@@ -357,64 +359,68 @@ exit
+     $dpFile = Join-Path $WORK "part.txt"
+     $dp | Out-File -Encoding ascii $dpFile
+     # diskpart exits 0 even when an 'assign letter' fails, so verify the volumes actually mounted.
+-    $dpOut = Invoke-DiskPartScript -Path $dpFile; $vhdAttached = $true
++    # Mark the attempt before diskpart: cleanup must also handle a partial attach.
++    $vhdAttached = $true
++    $dpOut = Invoke-DiskPartScript -Path $dpFile
+     $W = "${LETTER_WIN}:"; $S = "${LETTER_ESP}:"
+-    if (-not (Test-Path "$S\") -or -not (Test-Path "$W\")) {
+-        throw "diskpart did not mount $S and/or $W (likely a stale drive-letter reservation; set LETTER_ESP/LETTER_WIN to other letters). diskpart output:`n$(( $dpOut | Out-String ).Trim())"
++    $ownedDisk = Get-OwnedVhdDisk
++    $partitions = @(Get-Partition -DiskNumber $ownedDisk.Number -ErrorAction Stop)
++    $esp = @($partitions | Where-Object { [string]$_.DriveLetter -eq $LETTER_ESP -and [guid]$_.GptType -eq [guid]'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' })
++    $windows = @($partitions | Where-Object { [string]$_.DriveLetter -eq $LETTER_WIN -and [guid]$_.GptType -eq [guid]'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7' })
++    if ($esp.Count -ne 1 -or $windows.Count -ne 1) {
++        throw "The requested ESP/Windows letters are not bound to the owned VHDX"
+     }
+ 
+     # === 4) Apply image ===
+     Write-Host "[dism] applying install.wim -> $W\ ..."
+     Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Apply-Image", "/ImageFile:$wim", "/Index:$IMAGE_INDEX", "/ApplyDir:$W\") -OutNull -What "dism /Apply-Image"
+ 
+-    # === 5) Offline driver injection (no signature prompt) ===
+-    # Offline-inject only the driver subfolders listed in DRIVER_INSTALL (empty=the whole $drvDir /Recurse). /ForceUnsigned skips the signature prompt.
+-    # Note: boot-critical drivers (viostor/vioscsi) must be included in DRIVER_INSTALL, otherwise the image will not boot.
+-    if ($DRIVER_INSTALL) {
+-        foreach ($d in ($DRIVER_INSTALL -split '\s+' | Where-Object { $_ })) {
+-            $sub = Join-Path $drvDir $d
+-            if (Test-Path $sub -PathType Container) {
+-                Write-Host "[dism] inject driver: $d"
+-                Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$sub", "/Recurse", "/ForceUnsigned") -OutNull -What "dism /Add-Driver $d"
+-            } else { Write-Host "  [warn] driver $d to install does not exist in $drvDir" -ForegroundColor DarkYellow }
+-        }
+-    } else {
+-        Write-Host "[dism] injecting all drivers offline ..."
+-        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$drvDir", "/Recurse", "/ForceUnsigned") -OutNull -What "dism /Add-Driver"
++    # === 5) Offline injection of the six explicitly selected test-signed ARM64 drivers ===
++    foreach ($driver in $DRIVER_INSTALL) {
++        $sub = Get-BoundedPath (Join-Path $drvDir $driver) $drvDir -MustExist
++        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$sub", "/Recurse", "/ForceUnsigned") -OutNull -What ("dism /Add-Driver " + $driver)
+     }
+ 
+-    # === 5b) Extract driver signer certs (offline) -> stage for first-boot trust ===
+-    # Offline injection (/ForceUnsigned) needs no cert, but that only lets "this batch" of drivers install. Later "interactive" driver updates
+-    # (Device Manager / pnputil / vendor installer) check TrustedPublisher; if the cert is absent -> the "cannot verify
+-    # publisher" prompt appears. Here we extract each distinct signer from the .cat, staging them to C:\DroidVM\certs, and unattend specialize then
+-    # imports them into Root+TrustedPublisher (mirrors macos/autounattend.xml). Note: this only removes the "install prompt"; self-signed drivers
+-    # still rely on BCD testsigning (step 7) to load at boot, so do not turn testsigning off because of this.
+-    Write-Host "[certs] staging driver signer cert(s) offline ..."
+-    $certDir = "$W\DroidVM\certs"
+-    New-Item -ItemType Directory -Force $certDir | Out-Null
+-    if ($DRIVER_CERT) {
+-        # Specified cert: just place it, and unattend specialize imports it into Root+TrustedPublisher (mirrors macOS's DRIVER_CERT).
+-        Copy-Item $DRIVER_CERT (Join-Path $certDir (Split-Path $DRIVER_CERT -Leaf)) -Force
+-        Write-Host "[certs] using the specified DRIVER_CERT: $(Split-Path $DRIVER_CERT -Leaf)"
+-    } else {
+-        # Not specified -> auto-extract every unique signer from the driver .cat/.sys
+-        # (.cat is most reliable: for catalog-signed drivers the .sys shows as unsigned when the catalog is not registered on the host, but the .cat itself reveals the signer)
+-        $seenThumb = @{}
+-        Get-ChildItem $drvDir -Recurse -Include *.cat, *.sys, *.dll, *.exe -ErrorAction SilentlyContinue | ForEach-Object {
+-            try {
+-                $cert = (Get-AuthenticodeSignature $_.FullName).SignerCertificate
+-                if ($cert -and -not $seenThumb.ContainsKey($cert.Thumbprint)) {
+-                    $seenThumb[$cert.Thumbprint] = $true
+-                    Export-Certificate -Cert $cert -FilePath (Join-Path $certDir "$($cert.Thumbprint).cer") | Out-Null
+-                }
+-            } catch {}
++    # Capture actual offline DISM facts while the owned Windows volume is still mounted.
++    if ($env:DVM_RECORD_DIR) {
++        $observationDir = Get-BoundedPath $env:DVM_RECORD_DIR $ROOT -MustExist
++        if (-not (Test-Path -LiteralPath $observationDir -PathType Container)) { throw "DVM_RECORD_DIR must be a directory" }
++        $allDrivers = @(Get-WindowsDriver -Path "$W\" -ErrorAction Stop)
++        $driverFacts = @()
++        foreach ($driver in $DRIVER_INSTALL) {
++            $infName = $driver.ToLowerInvariant() + ".inf"
++            $observedPackages = @($allDrivers | Where-Object {
++                [IO.Path]::GetFileName([string]$_.OriginalFileName).ToLowerInvariant() -eq $infName
++            })
++            if ($observedPackages.Count -ne 1) { throw "Offline DISM did not report one installed package for $driver" }
++            $installed = $observedPackages[0]
++            $driverFacts += [ordered]@{
++                name = $driver
++                published_inf = [string]$installed.Driver
++                original_inf = [string]$installed.OriginalFileName
++                provider = [string]$installed.ProviderName
++                class_name = [string]$installed.ClassName
++                version = [string]$installed.Version
++                boot_critical = [bool]$installed.BootCritical
++                inbox = [bool]$installed.Inbox
++            }
++        }
++        $observation = [ordered]@{
++            format = "droidvm-windows-installed-drivers-v1"
++            evidence_mode = "actual_offline_dism"
++            observed_at_utc = [DateTime]::UtcNow.ToString("o")
++            command = "Get-WindowsDriver -Path <owned Windows volume>"
++            drivers = $driverFacts
+         }
+-        # Also collect any *.cer bundled directly in the driver package (e.g. DroidVM_Test.cer)
+-        Get-ChildItem $drvDir -Recurse -Filter *.cer -ErrorAction SilentlyContinue |
+-            ForEach-Object { Copy-Item $_.FullName (Join-Path $certDir $_.Name) -Force }
+-        Write-Host "[certs] auto-extracted $($seenThumb.Count) cert(s) from driver .cat -> $certDir"
++        [IO.File]::WriteAllText((Join-Path $observationDir "installed-drivers.json"),
++            ($observation | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+     }
+ 
++    # Only the pinned public certificate is staged; trust changes happen in the guest.
++    $certDir = "$W\DroidVM\certs"
++    New-Item -ItemType Directory -Path $certDir -Force | Out-Null
++    Copy-Item -LiteralPath $DRIVER_CERT -Destination (Join-Path $certDir "DroidVM_Test.cer")
++
+     # === 5c) EMS-SAC Feature-on-Demand (offline, for the interactive SAC> console) ===
+     # The ARM64 LTSC/Pro image ships no SAC runtime; the "EMS and SAC Toolset" FoD provides
+     # sacdrv.sys + sacsess.exe + the sacsvr service. Inject it offline from EMS_SAC_SOURCE (the
+@@ -424,96 +430,39 @@ exit
+     # (staged below, step 8d) pulls it from Windows Update when EMS_SAC_SOURCE=online.
+     switch ($EMS_SAC_SOURCE) {
+         "skip"   { Write-Host "[ems-sac] EMS_SAC_SOURCE=skip: shipping boot-EMS only (no interactive SAC runtime)." -ForegroundColor DarkYellow }
+-        "online" { Write-Host "[ems-sac] EMS_SAC_SOURCE=online: the target's first boot will pull the FoD from Windows Update (needs network)." -ForegroundColor DarkYellow }
+         default {
+             $fodSrc = Resolve-InputFile $EMS_SAC_SOURCE
+             Write-Host "[ems-sac] injecting FoD offline from $fodSrc ..."
+-            try {
+-                Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Capability", "/CapabilityName:$EMS_SAC_CAP", "/Source:$fodSrc", "/LimitAccess") -OutNull -What "dism /Add-Capability EMS-SAC"
+-                Write-Host "[ems-sac] FoD injected offline (SAC runtime present in image)" -ForegroundColor Green
+-            } catch {
+-                Write-Host "  [warn] offline FoD injection failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+-                Write-Host "  [warn] check EMS_SAC_SOURCE points at the ARM64 FoD ISO/folder matching the image build" -ForegroundColor DarkYellow
+-            }
++            Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Capability", "/CapabilityName:$EMS_SAC_CAP", "/Source:$fodSrc", "/LimitAccess") -OutNull -What "dism /Add-Capability EMS-SAC"
++            Write-Host "[ems-sac] local FoD injected offline"
+         }
+     }
+ 
+-    # === 6) Debloat (offline removal of provisioned Appx) ===
+-    Write-Host "[debloat] removing extra provisioned Appx offline ..."
+-    $keep = 'VCLibs|NET\.Native|UI\.Xaml|Store|SecHealth|Photos|Notepad|Terminal|WindowsTerminal'
+-    try {
+-        Get-AppxProvisionedPackage -Path "$W\" | Where-Object { $_.DisplayName -notmatch $keep } | ForEach-Object {
+-            try {
+-                Show-CommandLine "Remove-AppxProvisionedPackage" @("-Path", "$W\", "-PackageName", $_.PackageName)
+-                Remove-AppxProvisionedPackage -Path "$W\" -PackageName $_.PackageName | Out-Null
+-            } catch {}
+-        }
+-    } catch { Write-Host "  (skipping debloat: $($_.Exception.Message))" -ForegroundColor DarkYellow }
+-
+-    # === 6b) Offline shrink: WinSxS ResetBase + disable hibernate ===
+-    # Mirrors the macOS debloat's WinSxS compaction and hibernate disable, here using the offline version (no boot needed).
+-    # Purely to shrink the image; failure does not affect usability, so everything is set as non-fatal.
+-    Write-Host "[debloat] WinSxS component cleanup (ResetBase, offline) ..."
+-    try {
+-        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Cleanup-Image", "/StartComponentCleanup", "/ResetBase") -OutNull -What "dism /Cleanup-Image /ResetBase"
+-    } catch {
+-        Write-Host "  (skipping ResetBase: $($_.Exception.Message))" -ForegroundColor DarkYellow
+-    }
+-
+-    Write-Host "[debloat] disabling hibernate offline (no hiberfil.sys) ..."
+-    # Offline edit of the SYSTEM hive: HibernateEnabled=0 -> first boot will not create hiberfil.sys.
++    # === 6) Preserve normal Windows servicing/security; deny remote desktop offline ===
+     $sysHive = "$W\Windows\System32\config\SYSTEM"
+-    $hiveLoaded = $false
++    Invoke-ExternalCommand -FilePath "reg" -ArgumentList @("load", ("HKLM\" + $offlineHiveName), $sysHive) -OutNull -What "reg load owned offline SYSTEM hive"
++    $offlineHiveLoaded = $true
+     try {
+-        Invoke-ExternalCommand -FilePath "reg" -ArgumentList @("load", "HKLM\DVMOFF", $sysHive) -OutNull -What "reg load SYSTEM hive"
+-        $hiveLoaded = $true
+-        foreach ($cs in @("ControlSet001", "ControlSet002")) {
+-            $pk = "HKLM\DVMOFF\$cs\Control\Power"
+-            reg query $pk *> $null
+-            if ($LASTEXITCODE -eq 0) {
+-                Show-CommandLine "reg add" @($pk, "/v", "HibernateEnabled", "/t", "REG_DWORD", "/d", "0", "/f")
+-                reg add $pk /v HibernateEnabled        /t REG_DWORD /d 0 /f *> $null
+-                reg add $pk /v HibernateEnabledDefault /t REG_DWORD /d 0 /f *> $null
+-            }
+-            # Enable RDP (offline): fDenyTSConnections=0. The firewall rule is opened separately at first boot by setup-ssh.ps1.
+-            $tk = "HKLM\DVMOFF\$cs\Control\Terminal Server"
+-            reg query $tk *> $null
+-            if ($LASTEXITCODE -eq 0) {
+-                Show-CommandLine "reg add" @($tk, "/v", "fDenyTSConnections", "/t", "REG_DWORD", "/d", "0", "/f")
+-                reg add $tk /v fDenyTSConnections /t REG_DWORD /d 0 /f *> $null
++        $hive = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($offlineHiveName, $true)
++        if (-not $hive) { throw "The owned offline SYSTEM hive could not be opened" }
++        try {
++            $controlSets = @($hive.GetSubKeyNames() | Where-Object { $_ -match '^ControlSet[0-9]{3}$' })
++            if ($controlSets.Count -eq 0) { throw "The offline SYSTEM hive has no control sets" }
++            foreach ($controlSet in $controlSets) {
++                $terminalServer = $hive.OpenSubKey($controlSet + "\Control\Terminal Server", $true)
++                if ($terminalServer) {
++                    try { $terminalServer.SetValue("fDenyTSConnections", 1, [Microsoft.Win32.RegistryValueKind]::DWord) }
++                    finally { $terminalServer.Dispose() }
++                }
+             }
+         }
+-    } catch {
+-        Write-Host "  (skipping hibernate-off: $($_.Exception.Message))" -ForegroundColor DarkYellow
+-    } finally {
+-        # The hive must be unloaded, otherwise step 9 dismount VHDX will fail.
+-        if ($hiveLoaded) {
+-            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+-            reg unload HKLM\DVMOFF *> $null
+-        }
++        finally { $hive.Dispose() }
+     }
+-
+-    # === 6c) Disable Reserved Storage (offline) ===
+-    # Win11 images ship with ~7GB Reserved Storage that the reserve manager allocates on first boot. Setting
+-    # ShippedWithReserves=0 in the offline SOFTWARE hive (before the image ever boots) makes it treat the image as
+-    # shipped without reserves -> it never allocates them. Purely to save space; failure is non-fatal.
+-    # (sleep/display = Never is set on first boot via unattend.xml, since powercfg needs a running system.)
+-    Write-Host "[debloat] disabling Reserved Storage offline (ShippedWithReserves=0) ..."
+-    $softHive = "$W\Windows\System32\config\SOFTWARE"
+-    $softLoaded = $false
+-    try {
+-        Invoke-ExternalCommand -FilePath "reg" -ArgumentList @("load", "HKLM\DVMSOFT", $softHive) -OutNull -What "reg load SOFTWARE hive"
+-        $softLoaded = $true
+-        $rk = "HKLM\DVMSOFT\Microsoft\Windows\CurrentVersion\ReserveManager"
+-        Show-CommandLine "reg add" @($rk, "/v", "ShippedWithReserves", "/t", "REG_DWORD", "/d", "0", "/f")
+-        reg add $rk /v ShippedWithReserves /t REG_DWORD /d 0 /f *> $null
+-    } catch {
+-        Write-Host "  (skipping Reserved Storage disable: $($_.Exception.Message))" -ForegroundColor DarkYellow
+-    } finally {
+-        if ($softLoaded) {
+-            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+-            reg unload HKLM\DVMSOFT *> $null
+-        }
++    finally {
++        [gc]::Collect()
++        [gc]::WaitForPendingFinalizers()
++        Invoke-ExternalCommand -FilePath "reg" -ArgumentList @("unload", ("HKLM\" + $offlineHiveName)) -OutNull -What "reg unload owned offline SYSTEM hive"
++        $offlineHiveLoaded = $false
+     }
+ 
+     # === 7) Boot files + BCD (bcdboot uses the ARM64 bootmgr from the image) ===
+@@ -521,7 +470,6 @@ exit
+     Invoke-ExternalCommand -FilePath "bcdboot" -ArgumentList @("$W\Windows", "/s", $S, "/f", "UEFI") -OutNull -What "bcdboot"
+     $BCD = "$S\EFI\Microsoft\Boot\BCD"
+     Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/set", "{default}", "testsigning", "on") -OutNull -What "bcdedit testsigning"
+-    Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/set", "{default}", "nointegritychecks", "on") -OutNull -What "bcdedit nointegritychecks"
+ 
+     # === 7b) Emergency Management Services (EMS/SAC over the SBSA UART) ===
+     # Turns the guest into an out-of-band serial console (SAC> prompt) on the app's SBSA
+@@ -535,67 +483,25 @@ exit
+     Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/ems", "{default}", "on") -OutNull -What "bcdedit ems {default} on"
+     Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/bootems", "{bootmgr}", "on") -OutNull -What "bcdedit bootems {bootmgr} on"
+ 
+-    # === 8) OOBE unattend (create USER / autologon) ===
++    # === 8) Keep OOBE/EULA visible; create the caller-provisioned local account ===
+     Show-CommandLine "New-Item" @("-ItemType", "Directory", "-Force", "$W\Windows\Panther")
+     New-Item -ItemType Directory -Force "$W\Windows\Panther" | Out-Null
+     $unattendSrc = Join-Path $HERE "unattend.xml"
+     # Inject account/password (@@USERNAME@@ / @@PASSWORD@@ tokens). XML-escape keeps the XML valid when the credentials contain &<>"
+     # (mirrors the macOS perl version). Write UTF-8 without BOM via .NET, matching the original file.
+     $esc = { param($s) $s.Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;') }
+-    $unattendXml = (Get-Content $unattendSrc -Raw).Replace('@@USERNAME@@', (& $esc $USERNAME)).Replace('@@PASSWORD@@', (& $esc $PASSWORD))
++    $unattendXml = (Get-Content -LiteralPath $unattendSrc -Raw).Replace('@@USERNAME@@', (& $esc $USERNAME)).Replace('@@PASSWORD@@', (& $esc $PASSWORD))
+     Show-CommandLine "Set-Content" @("$W\Windows\Panther\unattend.xml", "(unattend.xml + password)")
+     [System.IO.File]::WriteAllText("$W\Windows\Panther\unattend.xml", $unattendXml, (New-Object System.Text.UTF8Encoding($false)))
+-    Write-Host "[oobe] unattend.xml placed (first boot creates USER, autologon, imports certs)"
++    Write-Host "[oobe] unattend.xml placed; OOBE/EULA remains interactive and automatic login is disabled"
+ 
+-    # === 8c) Stage SSH payload into image (offline) ===
+-    # setup-ssh.ps1 is run by unattend FirstLogonCommands at first boot (installing the sshd service requires online registration).
++    # === 8c) Stage only necessary local first-boot initialization ===
+     $stage = "$W\DroidVM"
+-    New-Item -ItemType Directory -Force $stage | Out-Null
+-    Copy-Item (Join-Path $HERE "setup-ssh.ps1") "$stage\setup-ssh.ps1" -Force
+-    # First-logon half of the debloat (telemetry / services / tasks / Windows Update off + desktop
+-    # enable_windows_update.bat); the offline half ran in step 6. Mirrors macos/debloat.ps1.
+-    Copy-Item (Join-Path $HERE "debloat.ps1") "$stage\debloat.ps1" -Force
+-    Write-Host "[debloat] staged debloat.ps1 (first logon: telemetry / services / tasks / Windows Update off)"
+-    # pvmpower devnode: pvmpower.sys binds to the root-enumerated ROOT\PVMPOWER, so the devnode must be created at first boot via SetupAPI
+-    # (INF/DISM injection does not create a devnode). Stage it if the driver zip has it, skip if not (older drivers lack pvmpower, which is normal).
+-    $pvmDevnode = Join-Path $zipRoot "pvmpower-devnode.ps1"
+-    if (Test-Path $pvmDevnode) { Copy-Item $pvmDevnode "$stage\pvmpower-devnode.ps1" -Force; Write-Host "[pvmpower] staged pvmpower-devnode.ps1" }
+-    # OpenSSH installer: $OPENSSH_SRC can be a URL (downloaded to files\) or a local path; empty = do not install SSH. After resolving, copy it into the image.
+-    # An arm64 .msi is recommended (sets up service/host key/firewall in one step); .zip is also accepted. Non-fatal: if it cannot be obtained, only RDP is set up.
+-    if ($OPENSSH_SRC) {
+-        try {
+-            $sshLocal = Resolve-InputFile $OPENSSH_SRC
+-            Copy-Item $sshLocal (Join-Path $stage (Split-Path $sshLocal -Leaf)) -Force
+-            Write-Host "[ssh] staged $(Split-Path $sshLocal -Leaf)"
+-        } catch {
+-            Write-Host "[ssh] OpenSSH staging failed -> RDP only: $($_.Exception.Message)" -ForegroundColor DarkYellow
+-        }
+-    } else {
+-        Write-Host "[ssh] `$OPENSSH_SRC empty -> do not install SSH (RDP only)" -ForegroundColor DarkYellow
+-    }
+-    # authorized_keys is provided by the $SSH_PUBKEY environment variable (multiple keys newline-separated), UTF-8 without BOM + LF.
+-    if ($SSH_PUBKEY) {
+-        $akText = ($SSH_PUBKEY -replace "`r`n", "`n" -replace "`r", "`n").TrimEnd("`n") + "`n"
+-        [System.IO.File]::WriteAllText("$stage\authorized_keys", $akText, (New-Object System.Text.UTF8Encoding($false)))
+-        Write-Host "[ssh] staged authorized_keys from `$SSH_PUBKEY (key login)"
+-    } else {
+-        Write-Host "[ssh] `$SSH_PUBKEY not set -> password login only" -ForegroundColor DarkYellow
+-    }
+-
+-    # === 8d) Stage EMS-SAC first-boot fallback (online FoD install) ===
+-    # setup-ems-sac.ps1 self-gates: it exits immediately if the FoD is already Installed (the
+-    # offline path in 5c succeeded). It only tries an online Windows-Update install when the
+-    # marker file ems-sac-online.flag is present, which we write only for EMS_SAC_SOURCE=online.
+-    # This keeps offline/air-gapped builds fully deterministic while still offering a one-touch
+-    # online path for users without a FoD ISO.
+-    Copy-Item (Join-Path $HERE "setup-ems-sac.ps1") "$stage\setup-ems-sac.ps1" -Force
+-    Write-Host "[ems-sac] staged setup-ems-sac.ps1 (first-boot FoD ensure)"
+-    if ($emsSacOnline) {
+-        [System.IO.File]::WriteAllText("$stage\ems-sac-online.flag", $EMS_SAC_CAP, (New-Object System.Text.UTF8Encoding($false)))
+-        Write-Host "[ems-sac] armed online first-boot FoD install (EMS_SAC_SOURCE=online)" -ForegroundColor Yellow
+-    }
++    New-Item -ItemType Directory -Path $stage -Force | Out-Null
++    Copy-Item -LiteralPath (Join-Path $HERE "setup-firstboot.ps1") -Destination (Join-Path $stage "setup-firstboot.ps1")
++    Copy-Item -LiteralPath $pvmDevnode -Destination (Join-Path $stage "pvmpower-devnode.ps1")
+ 
+-    # === 8b) ReTrim so debloat/cleanup actually shrinks the image ===
++    # === 8b) ReTrim unused clusters before conversion ===
+     # Mirrors macOS's Optimize-Volume -ReTrim: unmaps the clusters freed above by debloat/ResetBase.
+     # Otherwise, although that space is marked free in NTFS, the VHDX still holds the old data (non-zero),
+     # and step 9 qemu-img convert would copy it into the qcow2 too -> no shrink.
+@@ -608,11 +514,11 @@ exit
+     }
+ 
+     # === 9) Detach VHDX -> convert to qcow2 ===
+-    Cleanup; $vhdAttached = $false; $isoMounted = $false
++    Cleanup
+     Write-Host "[qcow2] converting -> $OUT_QCOW ..."
+     # $COMPRESS adds -c with compression_type=zstd (zstd-compressed clusters, roughly half the size). DroidVM's
+     # crosvm reads zstd clusters directly (its qcow2 backend gained zstd read support), so the image boots as-is;
+-    # plain -c (zlib) it can NOT read, so that form is never emitted. Still bootable in plain qemu. Default off.
++    # Compression is explicit; the pinned runtime has qcow2 zstd support. Default off.
+     $convArgs = @("convert", "-p")
+     if ($COMPRESS) { $convArgs += @("-c", "-o", "compression_type=zstd") }
+     $convArgs += @("-O", "qcow2", $VHDX, $OUT_QCOW)
+@@ -620,23 +526,22 @@ exit
+     $sz = "{0:N1} GB" -f ((Get-Item $OUT_QCOW).Length / 1GB)
+     Write-Host "Done  -> $OUT_QCOW ($sz)" -ForegroundColor Green
+ 
+-    # === 10) Optional: pack a ready-to-import .vmpkg (qcow2 + local VM config incl. SBSA console) ===
+-    if ($OUT_VMPKG) {
+-        Write-Host "[vmpkg] packing $OUT_VMPKG ..."
+-        $vmpkgComp = $VMPKG_COMPRESSION
+-        if ($COMPRESS) {
+-            Write-Host "[vmpkg] note: zstd-compressed qcow2 inside -> needs the crosvm with qcow2 zstd read support" -ForegroundColor DarkYellow
+-            # Compressing zstd clusters again buys ~1.7% (measured); auto picks none so an import is a plain copy.
+-            if ($vmpkgComp -eq "auto") { $vmpkgComp = "none" }
+-        }
+-        # Pure PowerShell + the built-in tar.exe (Windows 10 1803+): no python needed.
+-        & (Join-Path $ROOT "pack-vmpkg.ps1") -Qcow2 $OUT_QCOW -Config $VMS_JSON `
+-            -Out $OUT_VMPKG -Compression $vmpkgComp -Threads $VMPKG_THREADS
+-        Write-Host "[vmpkg] Done  -> $OUT_VMPKG" -ForegroundColor Green
+-    }
++
++}
++catch {
++    $buildError = $_
++    throw
+ }
+ finally {
+-    Cleanup
+-    Show-CommandLine "Remove-Item" @("-Recurse", "-Force", $WORK, "-ErrorAction", "SilentlyContinue")
+-    Remove-Item -Recurse -Force $WORK -ErrorAction SilentlyContinue
++    try {
++        Cleanup
++        $removePath = Get-BoundedPath $WORK $ROOT -MustExist
++        $null = Get-BoundedPath $removePath $RUNNER_BOUNDARY -MustExist
++        if ($removePath -ne $WORK) { throw "Work cleanup path changed" }
++        Remove-Item -LiteralPath $removePath -Recurse -Force
++    }
++    catch {
++        Write-Warning ("Owned work retained after cleanup failure: " + $WORK)
++        if (-not $buildError) { throw }
++    }
+ }
+diff --git a/windows/setup-firstboot.ps1 b/windows/setup-firstboot.ps1
+new file mode 100644
+index 0000000..ba8af63
+--- /dev/null
++++ b/windows/setup-firstboot.ps1
+@@ -0,0 +1,49 @@
++<# Local guest initialization only: no installer, remote server, update/security or IPv6 changes. #>
++[CmdletBinding()]
++param([Parameter(Mandatory=$true)][ValidateSet("Machine", "User")][string]$Phase)
++$ErrorActionPreference = "Stop"
++# The builder only stages this file. It is never run on the x64 build host.
++if ($env:PROCESSOR_ARCHITECTURE -ine "ARM64" -or
++    -not ([IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\').Equals("C:\DroidVM", [StringComparison]::OrdinalIgnoreCase))) {
++    throw "This initializer is only for the installed ARM64 guest"
++}
++function Invoke-GuestCommand([string]$Name, [string[]]$Arguments) {
++    & (Join-Path $env:SystemRoot ("System32\" + $Name + ".exe")) @Arguments
++    if ($LASTEXITCODE -ne 0) { throw "Guest initialization command failed: $Name" }
++}
++if ($Phase -eq "Machine") {
++    $certs = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot "certs") -File -Filter "*.cer")
++    if ($certs.Count -ne 1) { throw "The pinned guest driver certificate is missing or ambiguous" }
++    foreach ($cert in $certs) {
++        Invoke-GuestCommand "certutil" @("-addstore", "-f", "Root", $cert.FullName)
++        Invoke-GuestCommand "certutil" @("-addstore", "-f", "TrustedPublisher", $cert.FullName)
++    }
++    $winlogon = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
++    Set-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon -Value "0"
++    Remove-ItemProperty -LiteralPath $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue
++    Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 1
++    foreach ($rule in @(Get-NetFirewallRule -Name "RemoteDesktop-*" -ErrorAction SilentlyContinue)) {
++        Disable-NetFirewallRule -InputObject $rule
++    }
++    # The stock image has no SSH server; keep an already-present service closed as well.
++    foreach ($name in @("sshd")) {
++        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
++        if ($service) {
++            if ($service.Status -ne "Stopped") { Stop-Service -Name $name -ErrorAction Stop }
++            Set-Service -Name $name -StartupType Disabled
++        }
++    }
++    foreach ($rule in @(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP", "DroidVM-sshd" -ErrorAction SilentlyContinue)) {
++        Disable-NetFirewallRule -InputObject $rule
++    }
++    return
++}
++# Preserve the required root-enumerated power device without invoking an installer wrapper.
++$pvm = Join-Path $PSScriptRoot "pvmpower-devnode.ps1"
++if (-not (Test-Path -LiteralPath $pvm -PathType Leaf)) { throw "pvmpower devnode initialization is missing" }
++& $pvm
++if (-not $?) { throw "pvmpower devnode initialization failed" }
++Invoke-GuestCommand "powercfg" @("/change", "standby-timeout-ac", "0")
++Invoke-GuestCommand "powercfg" @("/change", "standby-timeout-dc", "0")
++Invoke-GuestCommand "powercfg" @("/change", "monitor-timeout-ac", "0")
++Invoke-GuestCommand "powercfg" @("/change", "monitor-timeout-dc", "0")
+diff --git a/windows/unattend.xml b/windows/unattend.xml
+index 7193f6f..cd03aff 100644
+--- a/windows/unattend.xml
++++ b/windows/unattend.xml
+@@ -1,155 +1,49 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<!--
+-  DroidVM Win11 ARM64 — DISM 離線部署用 unattend（首次開機跑 OOBE）。
+-  只含 specialize + oobeSystem：驅動已離線注入、debloat 已離線做、testsigning 已在 BCD 設好，
+-  所以這裡不需 windowsPE、不需匯入憑證、不需 pnputil。只負責建 USER + 自動登入。
+-  注意：所有 component 的 processorArchitecture 必須是 arm64。
+--->
++<!-- ARM64 offline deployment: normal first-user OOBE/EULA, no remote server or automatic login. -->
+ <unattend xmlns="urn:schemas-microsoft-com:unattend">
+-
+   <settings pass="specialize">
+     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64"
+-               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+-               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
++               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+       <ComputerName>DROIDVM</ComputerName>
+     </component>
+     <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64"
+                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+       <RunSynchronous>
++        <!-- Permit the normal offline OOBE option; no pages or licence terms are hidden. -->
+         <RunSynchronousCommand wcm:action="add">
+           <Order>1</Order>
+           <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+         </RunSynchronousCommand>
+-        <!-- 以 SYSTEM 把驅動簽章者憑證匯入機器 Root + TrustedPublisher，日後互動式更新驅動
+-             不再跳「無法驗證發行者」。憑證由 build.ps1 第 5b 步從 .cat 萃取並 staging 到 certs\。 -->
+         <RunSynchronousCommand wcm:action="add">
+           <Order>2</Order>
+-          <Path>cmd /c for %i in (C:\DroidVM\certs\*.cer) do certutil -addstore -f Root "%i"</Path>
+-        </RunSynchronousCommand>
+-        <RunSynchronousCommand wcm:action="add">
+-          <Order>3</Order>
+-          <Path>cmd /c for %i in (C:\DroidVM\certs\*.cer) do certutil -addstore -f TrustedPublisher "%i"</Path>
+-        </RunSynchronousCommand>
+-        <!-- IPv6 介面識別碼用 EUI-64（從 MAC 推導）：Win10/11 預設是 RFC 7217 隨機 IID + RFC 4941
+-             臨時位址，SLAAC 位址每台/每次都不同，沒法從 MAC 推地址。兩個都關掉：
+-               randomizeidentifiers=disabled -> 穩定 IID 改回 EUI-64
+-               privacy state=disabled        -> 不再產生 temporary 位址（否則對外連線會優先用它）
+-             放在 specialize（比 FirstLogon 早很多）盡量趕在第一個 RA 之前；FirstLogon 還會再補一次
+-             並重啟網卡，確保這次開機就拿到 EUI-64 位址。結尾 exit /b 0：specialize 的
+-             RunSynchronousCommand 傳回非 0 會中止 Setup，不讓網路設定失敗連累裝機。 -->
+-        <RunSynchronousCommand wcm:action="add">
+-          <Order>4</Order>
+-          <Path>cmd /c netsh interface ipv6 set global randomizeidentifiers=disabled &amp; netsh interface ipv6 set privacy state=disabled &amp; exit /b 0</Path>
++          <Path>powershell -NoProfile -ExecutionPolicy Bypass -File C:\DroidVM\setup-firstboot.ps1 -Phase Machine</Path>
+         </RunSynchronousCommand>
+       </RunSynchronous>
+     </component>
+   </settings>
+-
+   <settings pass="oobeSystem">
+     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64"
+                publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+-
+-      <OOBE>
+-        <HideEULAPage>true</HideEULAPage>
+-        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+-        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+-        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+-        <ProtectYourPC>3</ProtectYourPC>
+-        <SkipMachineOOBE>true</SkipMachineOOBE>
+-        <SkipUserOOBE>true</SkipUserOOBE>
+-      </OOBE>
+-
+       <UserAccounts>
+         <LocalAccounts>
+           <LocalAccount wcm:action="add">
+             <Name>@@USERNAME@@</Name>
+             <Group>Administrators</Group>
+             <DisplayName>@@USERNAME@@</DisplayName>
++            <!-- This is the encrypted artifact's account-creation input, not a Winlogon password. -->
+             <Password><Value>@@PASSWORD@@</Value><PlainText>true</PlainText></Password>
+           </LocalAccount>
+         </LocalAccounts>
+       </UserAccounts>
+-
+-      <AutoLogon>
+-        <Username>@@USERNAME@@</Username>
+-        <Enabled>true</Enabled>
+-        <LogonCount>999</LogonCount>
+-        <Password><Value>@@PASSWORD@@</Value><PlainText>true</PlainText></Password>
+-      </AutoLogon>
+-
+       <FirstLogonCommands>
+         <SynchronousCommand wcm:action="add">
+-          <Order>1</Order><Description>persistent autologon</Description>
+-          <CommandLine>reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f</CommandLine>
+-        </SynchronousCommand>
+-        <SynchronousCommand wcm:action="add">
+-          <Order>2</Order><Description>persistent autologon user</Description>
+-          <CommandLine>reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d @@USERNAME@@ /f</CommandLine>
+-        </SynchronousCommand>
+-        <!-- 有密碼後，autologon 要能撐過 unattend AutoLogon 的 LogonCount 才需 DefaultPassword。
+-             注意：這是「明文」存進登錄檔（Winlogon 的已知取捨）。不想要就刪掉這條，改吃 999 次上限。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>3</Order><Description>persistent autologon password</Description>
+-          <CommandLine>reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "@@PASSWORD@@" /f</CommandLine>
+-        </SynchronousCommand>
+-        <!-- 裝 OpenSSH Server + 開 SSH/RDP 防火牆 + 佈署 authorized_keys（檔案由 build.ps1 8c staging）。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>4</Order><Description>setup OpenSSH + RDP firewall</Description>
+-          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -File C:\DroidVM\setup-ssh.ps1</CommandLine>
+-        </SynchronousCommand>
+-        <!-- pvmpower 綁 root-enumerated ROOT\PVMPOWER：devnode 要在首次開機用 SetupAPI 建立（INF 注入
+-             不會產生 devnode）。腳本由驅動 zip 根目錄提供；沒有就跳過（if exist 防呆）。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>5</Order><Description>pvmpower devnode</Description>
+-          <CommandLine>cmd /c if exist C:\DroidVM\pvmpower-devnode.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File C:\DroidVM\pvmpower-devnode.ps1</CommandLine>
+-        </SynchronousCommand>
+-        <!-- 電源：永不睡眠、永不關螢幕（AC+DC 都設 Never）。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>6</Order><Description>power: never sleep / never turn off display</Description>
+-          <CommandLine>cmd /c powercfg /change standby-timeout-ac 0 &amp; powercfg /change standby-timeout-dc 0 &amp; powercfg /change monitor-timeout-ac 0 &amp; powercfg /change monitor-timeout-dc 0</CommandLine>
+-        </SynchronousCommand>
+-        <!-- 密碼永不過期：本機預設 MaxPasswordAge=42 天，到期後登入會被要求改密碼、
+-             RDP/SSH 也會被擋。兩層都關掉：機器層的密碼原則（涵蓋日後新建的帳號）+ 帳號層的
+-             PasswordNeverExpires 旗標（涵蓋這顆映像的 USER）。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>7</Order><Description>password policy: never expire</Description>
+-          <CommandLine>cmd /c net accounts /maxpwage:unlimited</CommandLine>
+-        </SynchronousCommand>
+-        <SynchronousCommand wcm:action="add">
+-          <Order>8</Order><Description>account flag: password never expires</Description>
+-          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-LocalUser -Name '@@USERNAME@@' -PasswordNeverExpires $true"</CommandLine>
+-        </SynchronousCommand>
+-        <!-- 補設一次並重啟已連線的網卡：specialize 時若已收到 RA，隨機 IID 的位址會留著，
+-             flap 一下讓 SLAAC 重跑，這次開機就是 EUI-64 位址（不用等下次重開機）。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>9</Order><Description>IPv6 SLAAC: EUI-64 interface identifier</Description>
+-          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "netsh interface ipv6 set global randomizeidentifiers=disabled; netsh interface ipv6 set privacy state=disabled; Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Restart-NetAdapter -Confirm:$false"</CommandLine>
+-        </SynchronousCommand>
+-        <!-- debloat 的首次登入半段（離線半段在 build.ps1 第 6 步）：關遙測 / 非必要服務 / 遙測排程 / Windows Update，
+-             並把 enable_windows_update.bat 放到此帳號桌面（一次性）。必須排在 EMS-SAC 之前：它把 WU 關掉當基準，
+-             setup-ems-sac.ps1 線上拉 FoD 時暫開，拉完照基準關回。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>10</Order><Description>debloat: telemetry / services / tasks / Windows Update off</Description>
+-          <CommandLine>cmd /c if exist C:\DroidVM\debloat.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File C:\DroidVM\debloat.ps1</CommandLine>
+-        </SynchronousCommand>
+-        <!-- EMS-SAC 工具集（互動式 SAC> 主控台的執行期）確保步驟。腳本會自我判斷：離線已注入就 no-op、
+-             未武裝線上安裝就 no-op；只有 build.ps1 8d 放了 ems-sac-online.flag 時才以 SYSTEM 從 WU 拉取。 -->
+-        <SynchronousCommand wcm:action="add">
+-          <Order>11</Order><Description>ensure EMS-SAC toolset (FoD)</Description>
+-          <CommandLine>cmd /c if exist C:\DroidVM\setup-ems-sac.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File C:\DroidVM\setup-ems-sac.ps1</CommandLine>
++          <Order>1</Order>
++          <Description>local driver and power initialization</Description>
++          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -File C:\DroidVM\setup-firstboot.ps1 -Phase User</CommandLine>
+         </SynchronousCommand>
+       </FirstLogonCommands>
+     </component>
+-
+-    <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64"
+-               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"
+-               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+-      <InputLocale>0409:00000409</InputLocale>
+-      <SystemLocale>en-US</SystemLocale>
+-      <UILanguage>en-US</UILanguage>
+-      <UserLocale>en-US</UserLocale>
+-    </component>
+   </settings>
+ </unattend>
+diff --git a/windows_build.ps1 b/windows_build.ps1
+index 29a3ab8..9594627 100644
+--- a/windows_build.ps1
++++ b/windows_build.ps1
+@@ -1,47 +1,4 @@
+-# =====================================================================
+-# windows_build.ps1 — entry point for Route A (x64 Windows). Edit the variables below to your own, then right-click "Run as administrator",
+-#   Requirements: x64 Windows (administrator), built-in dism/bcdboot/diskpart, qemu-img (QEMU for Windows; when it is
+-#   missing the build offers to install it with winget -- set QEMU_IMG_INSTALL=1 to skip the question).
+-#   Usage:  powershell -ExecutionPolicy Bypass -File windows_build.ps1
+-# =====================================================================
+-$ErrorActionPreference = 'Stop'
+-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+-        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+-    # Relaunch elevated. UAC starts the child in System32 whatever the caller's directory was, so hand the
+-    # current directory over on the command line and cd back to it before the script runs.
+-    $cwd = (Get-Location).ProviderPath.Replace("'", "''")
+-    $me = $PSCommandPath.Replace("'", "''")
+-    Start-Process powershell "-NoExit -ExecutionPolicy Bypass -Command `"Set-Location -LiteralPath '$cwd'; & '$me'`"" -Verb RunAs
+-    exit
+-}
+-
+-
+-
+-$env:SRC_ISO       = "%USERPROFILE%\Downloads\SW_DVD9_Win_Pro_11_25H2_Arm64_English_Pro_Ent_EDU_N_MLF_X24-13111.ISO"
+-# $env:IMAGE_INDEX = "1"
+-$env:OUT_QCOW      = "win11-droidvm-final.qcow2"
+-$env:OUT_VMPKG     = "win11-droidvm-final.vmpkg"
+-$env:DRIVERS_DIR   = "https://github.com/HuJK/gunyah-guest-drivers-windows/releases/download/dev/gunyah-arm64-drivers.zip"
+-$env:OPENSSH_SRC   = "https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi"
+-
+-$env:DVM_USERNAME      = "USER"
+-$env:DVM_PASSWORD      = "DroidVM"
+-$env:SSH_PUBKEY        = "ssh-ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA root@ReplaceMe"
+-
+-$env:DISK_SIZE_MB      = "40960" # 40GB
+-$env:VMPKG_COMPRESSION = "auto"
+-$env:EMS_SAC_SOURCE    = "online"
+-
+-$env:DRIVER_DIR     = "ZIP/drivers"
+-$env:DRIVER_INSTALL = "NetKVM rdmapool pvmpower vioinput viostor vioscsi viosnd viofs"
+-$env:DRIVER_CERT    = "ZIP/DroidVM_Test.cer"
+-
+-$env:PATH        = "C:\Program Files\qemu;" + $env:PATH
+-$env:QEMU_IMG_INSTALL = "1"
+-
+-
+-
+-
+-Write-Host "==== DroidVM Windows builder (DISM offline driver injection) ====" -ForegroundColor Cyan
+-& "$PSScriptRoot\windows\build.ps1"
++<# Controlled cloud entry: no baked credentials, downloads, installers or elevation. #>
++[CmdletBinding()]
++param()
++& (Join-Path $PSScriptRoot "windows/build.ps1")
