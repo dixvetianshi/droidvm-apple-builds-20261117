@@ -6,8 +6,14 @@
 param()
 $ErrorActionPreference = "Stop"
 
+Write-Host (([ordered]@{
+    github_actions=$env:GITHUB_ACTIONS
+    runner_environment=$env:RUNNER_ENVIRONMENT
+    runner_os=$env:RUNNER_OS
+    image_os=$env:ImageOS
+}) | ConvertTo-Json -Compress)
 if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_OS -ne "Windows" -or
-    $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or $env:ImageOS -ne "win25") {
+    $env:RUNNER_ENVIRONMENT -ne "github-hosted") {
     throw "This entry is only for GitHub-hosted Windows-2025; do not run it locally"
 }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -15,6 +21,17 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw "The hosted runner must already be elevated; this entry never opens UAC"
 }
 if ($PSVersionTable.PSVersion.Major -lt 7) { throw "The hosted PowerShell 7 runtime is required" }
+# The fixed windows-2025 workflow can resolve to a VS image variant. ImageOS is
+# diagnostic metadata, not proof of the actual operating system.
+$operatingSystems = @(Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop)
+if ($operatingSystems.Count -ne 1) { throw "The hosted Windows product could not be identified" }
+$hostOperatingSystem = $operatingSystems[0]
+$hostVersion = [Version]$hostOperatingSystem.Version
+if ($hostOperatingSystem.Caption -notmatch '\bWindows Server 2025\b' -or
+    $hostVersion.Major -ne 10 -or $hostVersion.Minor -ne 0 -or $hostVersion.Build -ne 26100 -or
+    [int]$hostOperatingSystem.ProductType -ne 3) {
+    throw "The actual hosted product must be Windows Server 2025 / 10.0.26100"
+}
 
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
 $LockPath = Join-Path $ProjectRoot "profiles/windows-source-lock.json"
@@ -268,6 +285,8 @@ $Record = [ordered]@{
     github=[ordered]@{repository=$env:GITHUB_REPOSITORY; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT
         job=$env:GITHUB_JOB; workflow=$env:GITHUB_WORKFLOW; source_commit=$env:GITHUB_SHA
         runner_environment=$env:RUNNER_ENVIRONMENT; runner_os=$env:RUNNER_OS; image_os=$env:ImageOS; image_version=$env:ImageVersion}
+    host_os_observation=[ordered]@{caption=[string]$hostOperatingSystem.Caption; version=[string]$hostOperatingSystem.Version
+        build_number=[string]$hostOperatingSystem.BuildNumber; product_type=[int]$hostOperatingSystem.ProductType}
     scope="Offline Windows image construction and disk checks; cloud stage has no firmware/vars or phone execution"
     phone_boot_verified=$false; android_runtime_loaded=$false; guest_first_boot_executed=$false
 }
