@@ -45,8 +45,8 @@ if ($Lock.format -ne "droidvm-windows-source-lock-v1" -or $Lock.architecture -ne
     $Lock.iso_filename -ne "Windows11_Client_arm64_zh-cn_26300_9457.iso" -or
     [long]$Lock.iso_bytes -ne 8852006912 -or
     $Lock.publisher_sha256 -ne "cd573df724862300895d0f5d0836e663756d22cc4e964c752efdc05b4fc09e8b" -or
-    [long]$Lock.driver_bytes -ne 776748 -or
-    $Lock.driver_sha256 -ne "bb37006cf4f3790b3abe5abc913ce0dafcf076b2fe9118530bdc7f01c5b7727a" -or
+    [long]$Lock.driver_bytes -ne 776774 -or
+    $Lock.driver_sha256 -ne "207d566ca39894eee7a811a1ff92e6e8826260a810e337c3bb88b1bec908d716" -or
     $Lock.driver_certificate_sha256 -ne "da88f450dbd881c91511c5b801295cd9cc0d3ca84ea9d3dc08eff9481eed64b3") {
     throw "The reviewed source lock differs; preserve it and update the build deliberately"
 }
@@ -144,7 +144,10 @@ function Download-Verified([string]$Url, [string]$Path, [long]$Bytes, [string]$S
     }
     finally { $ProgressPreference = $oldProgress }
     $file = Get-Item -LiteralPath $partial
-    if ($file.Length -ne $Bytes) { throw "Downloaded file length differs from the source lock: $Kind" }
+    if ($file.Length -ne $Bytes) {
+        Emit "download-length-mismatch" @{kind=$Kind; expected_bytes=$Bytes; actual_bytes=$file.Length}
+        throw "Downloaded file length differs from the source lock: $Kind"
+    }
     Emit "download-hash" @{kind=$Kind; bytes=$file.Length}
     $actual = (Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $Sha.ToLowerInvariant()) { throw "Downloaded file SHA256 differs from the source lock: $Kind" }
