@@ -472,6 +472,20 @@ catch {
         $failureFacts["source_file"] = $Record.failure_source_file
         $failureFacts["source_line"] = $Record.failure_source_line
     }
+    # Retain only source locations from known owned scripts, never stack text or arguments.
+    $sourceFrames = @()
+    foreach ($traceLine in ([string]$_.ScriptStackTrace -split "`n")) {
+        if ($traceLine.Trim() -match '^at [^,]+, ([A-Za-z]:[\\/].*\.ps1): line ([0-9]+)$') {
+            $sourceFile = [IO.Path]::GetFullPath($Matches[1])
+            $sourceLine = [int]$Matches[2]
+            if ($sourceFile.StartsWith($OwnedRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                $sourceFile.Equals((Join-Path $PSScriptRoot 'build_windows_ci.ps1'), [StringComparison]::OrdinalIgnoreCase)) {
+                $sourceFrames += [ordered]@{file=$sourceFile; line=$sourceLine}
+            }
+        }
+    }
+    $Record["failure_source_frames"] = $sourceFrames
+    $failureFacts["source_frames"] = $sourceFrames
     Json-File $RecordPath $Record
     Emit "failed" $failureFacts
     throw ("Windows image construction failed at " + $Phase + "; the owned files are preserved")
