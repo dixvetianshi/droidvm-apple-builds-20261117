@@ -1,5 +1,5 @@
 diff --git a/windows/build.ps1 b/windows/build.ps1
-index e1d05cd..6968169 100644
+index e1d05cd..39e79e7 100644
 --- a/windows/build.ps1
 +++ b/windows/build.ps1
 @@ -1,7 +1,7 @@
@@ -79,9 +79,7 @@ index e1d05cd..6968169 100644
 +            }
          }
 -        return $dst
-+        if ($probe.Equals($base, [StringComparison]::OrdinalIgnoreCase)) { break }
-+        $probe = Split-Path $probe -Parent
-     }
+-    }
 -    # %VAR% is expanded (PowerShell itself never does), relative paths count from the repo root (where
 -    # windows_build.ps1 lives), and the result is always a full path: CIM cmdlets such as Mount-DiskImage
 -    # ignore PowerShell's current location and fail on a relative one.
@@ -89,6 +87,9 @@ index e1d05cd..6968169 100644
 -    if (-not [IO.Path]::IsPathRooted($Src)) { $Src = Join-Path $ROOT $Src }
 -    if (-not (Test-Path -LiteralPath $Src)) { throw "file not found: $Src" }
 -    return (Resolve-Path -LiteralPath $Src).ProviderPath
++        if ($probe.Equals($base, [StringComparison]::OrdinalIgnoreCase)) { break }
++        $probe = Split-Path $probe -Parent
++    }
 +    if ($MustExist -and -not (Test-Path -LiteralPath $full)) { throw "Required local path does not exist: $full" }
 +    return $full
 +}
@@ -217,7 +218,7 @@ index e1d05cd..6968169 100644
  }
  
  
-@@ -179,165 +175,173 @@ function Invoke-DiskPartScript {
+@@ -179,166 +175,192 @@ function Invoke-DiskPartScript {
  # RESERVED in MountedDevices (left behind by a previously detached VHDX) - diskpart refuses to
  # 'assign' those with "The specified drive letter is not free to be assigned", even though no
  # volume currently shows them.
@@ -270,15 +271,10 @@ index e1d05cd..6968169 100644
 -    Write-Host "`nEditions in install.wim:" -ForegroundColor Cyan
 -    foreach ($im in $images) {
 -        Write-Host ("  [{0}] {1}  ({2:N1} GB)" -f $im.ImageIndex, $im.ImageName, ($im.ImageSize / 1GB))
-+    if (@($images | ForEach-Object { [int]$_.ImageIndex }) -notcontains $wanted) {
-+        throw "IMAGE_INDEX is not present in the selected install.wim"
-     }
+-    }
 -    if ([Console]::IsInputRedirected) {
 -        throw ("IMAGE_INDEX not set and no interactive console. Set IMAGE_INDEX to one of: " + ($valid -join ', '))
-+    $detail = Get-WindowsImage -ImagePath $wim -Index $wanted
-+    if ([string]$detail.Architecture -notin @("arm64", "ARM64", "12")) {
-+        throw "The selected Windows image must be ARM64"
-     }
+-    }
 -    do {
 -        $sel = (Read-Host "`nSelect image index").Trim()
 -        $n = 0
@@ -286,6 +282,13 @@ index e1d05cd..6968169 100644
 -        if (-not $ok) { Write-Host ("  invalid, choose from: " + ($valid -join ', ')) -ForegroundColor DarkYellow }
 -    } while (-not $ok)
 -    return $n
++    if (@($images | ForEach-Object { [int]$_.ImageIndex }) -notcontains $wanted) {
++        throw "IMAGE_INDEX is not present in the selected install.wim"
++    }
++    $detail = Get-WindowsImage -ImagePath $wim -Index $wanted
++    if ([string]$detail.Architecture -notin @("arm64", "ARM64", "12")) {
++        throw "The selected Windows image must be ARM64"
++    }
 +    return $wanted
  }
  
@@ -339,6 +342,12 @@ index e1d05cd..6968169 100644
 +$OUT_QCOW = if ($env:OUT_QCOW) { Get-BoundedPath $env:OUT_QCOW $ROOT } else { Join-Path $ROOT "win11-droidvm-final.qcow2" }
 +if ($env:OUT_VMPKG) {
 +    throw "Packaging is a separate verified phase; this builder only creates OUT_QCOW"
++}
++foreach ($output in @($OUT_QCOW)) {
++    if (-not $output) { continue }
++    if (Test-Path -LiteralPath $output) { throw "Preserve an existing output: $output" }
++    $parent = Get-BoundedPath (Split-Path $output -Parent) $ROOT -AllowRoot
++    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
  }
 -$emsSacOnline    = ($EMS_SAC_SOURCE -eq "online")
 -$EMS_SAC_CAP     = 'Windows.Desktop.EMS-SAC.Tools~~~~0.0.1.0'
@@ -355,12 +364,6 @@ index e1d05cd..6968169 100644
 -
 -foreach ($t in @("dism", "bcdboot", "diskpart")) {
 -    if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { throw "$t not found" }
-+foreach ($output in @($OUT_QCOW)) {
-+    if (-not $output) { continue }
-+    if (Test-Path -LiteralPath $output) { throw "Preserve an existing output: $output" }
-+    $parent = Get-BoundedPath (Split-Path $output -Parent) $ROOT -AllowRoot
-+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-+}
 +$COMPRESS = if ($env:COMPRESS -and $env:COMPRESS -notmatch '^(0|false|no|off)$') { $env:COMPRESS } else { "" }
 +$DRIVER_DIR = if ($env:DRIVER_DIR) { $env:DRIVER_DIR } else { "ZIP/drivers" }
 +$DRIVER_INSTALL = @("NetKVM", "rdmapool", "pvmpower", "vioinput", "viostor", "viosnd")
@@ -401,8 +404,26 @@ index e1d05cd..6968169 100644
 +    $image = Get-DiskImage -ImagePath $script:VHDX -ErrorAction Stop
 +    if (-not $image.Attached) { throw "The owned VHDX is not attached" }
 +    $disks = @($image | Get-Disk -ErrorAction Stop)
-+    if ($disks.Count -ne 1) { throw "The owned VHDX did not resolve to one disk" }
++    if ($disks.Count -ne 1 -or $null -eq $disks[0].Number) { throw "The owned VHDX did not resolve to one identified disk" }
 +    return $disks[0]
++}
++
++function Get-OwnedMountBinding([string]$Root, [uint32]$DiskNumber, [guid]$GptType, [string]$Role) {
++    $failure = "The requested ESP/Windows letters are not bound to the owned VHDX: $Role root $Root"
++    # Resolve the actual mount root, then use the native Volume CIM association.
++    # DriveLetter, Path and AccessPaths display fields do not establish ownership.
++    $volumes = @(Get-Volume -FilePath $Root -ErrorAction Stop)
++    if ($volumes.Count -ne 1) { throw ("$failure; expected 1 volume, observed " + $volumes.Count) }
++    $mapped = @(Get-Partition -Volume $volumes[0] -ErrorAction Stop)
++    if ($mapped.Count -ne 1) { throw ("$failure; expected 1 associated partition, observed " + $mapped.Count) }
++    $partition = $mapped[0]
++    if ($null -eq $partition.DiskNumber -or $null -eq $partition.PartitionNumber -or $partition.DiskNumber -ne $DiskNumber) {
++        throw "$failure; the associated partition is not identified on the owned disk"
++    }
++    if ([string]::IsNullOrWhiteSpace([string]$partition.GptType) -or [guid]$partition.GptType -ne $GptType) {
++        throw "$failure; the associated partition does not have the required GPT type"
++    }
++    return [pscustomobject]@{root=$Root; role=$Role; volume=$volumes[0]; partition=$partition}
 +}
  
  function Cleanup {
@@ -499,16 +520,26 @@ index e1d05cd..6968169 100644
      $IMAGE_INDEX = Resolve-ImageIndex $wim $IMAGE_INDEX
      Write-Host "[image] using index $IMAGE_INDEX"
  
+-    # === 3) Create + attach VHDX, GPT partition: ESP(FAT32) + MSR + Windows(NTFS) ===
 +    # Allocate after the ISO is mounted; caller-selected letters use the same live
 +    # volume, PSDrive and MountedDevices checks as automatic selections.
 +    $LETTER_ESP = Get-FreeDriveLetter -Exclude @($isoLetter, $env:LETTER_WIN) -Requested $env:LETTER_ESP
 +    $LETTER_WIN = Get-FreeDriveLetter -Exclude @($isoLetter, $LETTER_ESP) -Requested $env:LETTER_WIN
 +    Write-Host "[disk] drive letters: ISO=$isoLetter ESP=$LETTER_ESP Windows=$LETTER_WIN"
 +
-     # === 3) Create + attach VHDX, GPT partition: ESP(FAT32) + MSR + Windows(NTFS) ===
++    # === 3) Create + attach VHDX, GPT: automatic MSR + ESP(FAT32) + Windows(NTFS) ===
      Write-Host "[disk] creating and partitioning VHDX ..."
      $dp = @"
-@@ -357,64 +361,82 @@ exit
+ create vdisk file="$VHDX" maximum=$DISK_MB type=expandable
+@@ -348,7 +370,6 @@ convert gpt
+ create partition efi size=260
+ format fs=fat32 quick label=System
+ assign letter=$LETTER_ESP
+-create partition msr size=16
+ create partition primary
+ format fs=ntfs quick label=Windows
+ assign letter=$LETTER_WIN
+@@ -357,64 +378,104 @@ exit
      $dpFile = Join-Path $WORK "part.txt"
      $dp | Out-File -Encoding ascii $dpFile
      # diskpart exits 0 even when an 'assign letter' fails, so verify the volumes actually mounted.
@@ -523,7 +554,15 @@ index e1d05cd..6968169 100644
 +    $partitions = @(Get-Partition -DiskNumber $ownedDisk.Number -ErrorAction Stop)
 +    $partitionFactLimit = 8
 +    $partitionFacts = @($partitions | Select-Object -First $partitionFactLimit | ForEach-Object {
-+        [ordered]@{number=$_.PartitionNumber; drive_letter=[string]$_.DriveLetter; gpt_type=[string]$_.GptType}
++        $accessPathCount = $null
++        $accessPathFacts = $null
++        if ($null -ne $_.AccessPaths) {
++            $accessPathCount = @($_.AccessPaths).Count
++            $accessPathFacts = @($_.AccessPaths | Select-Object -First 4)
++        }
++        [ordered]@{number=$_.PartitionNumber; drive_letter=[string]$_.DriveLetter; gpt_type=[string]$_.GptType
++            access_path_count=$accessPathCount; access_paths=$accessPathFacts
++            access_paths_truncated=if ($null -eq $accessPathCount) { $null } else { $accessPathCount -gt 4 }}
 +    })
 +    Write-Host (([ordered]@{
 +        phase="owned-partition-check"; at_utc=[DateTime]::UtcNow.ToString("o")
@@ -532,14 +571,28 @@ index e1d05cd..6968169 100644
 +        shown_partition_count=$partitionFacts.Count; partition_facts_limit=$partitionFactLimit
 +        partitions_truncated=($partitions.Count -gt $partitionFacts.Count); partitions=$partitionFacts
 +    }) | ConvertTo-Json -Depth 4 -Compress)
-+    $esp = @($partitions | Where-Object { [string]$_.DriveLetter -eq $LETTER_ESP -and [guid]$_.GptType -eq [guid]'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' })
-+    $windows = @($partitions | Where-Object { [string]$_.DriveLetter -eq $LETTER_WIN -and [guid]$_.GptType -eq [guid]'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7' })
-+    $bindingFailures = @()
-+    if ($esp.Count -ne 1) { $bindingFailures += "ESP requested ${LETTER_ESP}: expected 1 EFI binding, observed $($esp.Count)" }
-+    if ($windows.Count -ne 1) { $bindingFailures += "Windows requested ${LETTER_WIN}: expected 1 basic-data binding, observed $($windows.Count)" }
-+    if ($bindingFailures.Count -gt 0) {
-+        throw ("The requested ESP/Windows letters are not bound to the owned VHDX; " + ($bindingFailures -join "; "))
++    # Windows Server 2025 convert gpt creates the MSR; do not create a second one.
++    $msr = @($partitions | Where-Object { [guid]$_.GptType -eq [guid]'e3c9e316-0b5c-4db8-817d-f92df00215ae' })
++    if ($msr.Count -ne 1) { throw ("The owned VHDX must contain exactly one Microsoft Reserved partition; observed " + $msr.Count) }
++    $espBinding = Get-OwnedMountBinding -Root ($S + '\') -DiskNumber $ownedDisk.Number -GptType ([guid]'c12a7328-f81f-11d2-ba4b-00a0c93ec93b') -Role "ESP"
++    $windowsBinding = Get-OwnedMountBinding -Root ($W + '\') -DiskNumber $ownedDisk.Number -GptType ([guid]'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7') -Role "Windows"
++    if ($espBinding.partition.PartitionNumber -eq $windowsBinding.partition.PartitionNumber) {
++        throw "The requested ESP/Windows letters are not bound to the owned VHDX: the two roots must map to different partitions"
      }
++    $bindingFacts = @(@($espBinding, $windowsBinding) | ForEach-Object {
++        $accessPathCount = $null
++        $accessPathFacts = $null
++        if ($null -ne $_.partition.AccessPaths) {
++            $accessPathCount = @($_.partition.AccessPaths).Count
++            $accessPathFacts = @($_.partition.AccessPaths | Select-Object -First 4)
++        }
++        [ordered]@{role=$_.role; root=$_.root; partition_number=$_.partition.PartitionNumber
++            gpt_type=[string]$_.partition.GptType; volume_path=$_.volume.Path; volume_unique_id=$_.volume.UniqueId
++            access_path_count=$accessPathCount; access_paths=$accessPathFacts
++            access_paths_truncated=if ($null -eq $accessPathCount) { $null } else { $accessPathCount -gt 4 }}
++    })
++    Write-Host (([ordered]@{phase="owned-volume-bindings"; at_utc=[DateTime]::UtcNow.ToString("o")
++        owned_disk_number=$ownedDisk.Number; bindings=$bindingFacts}) | ConvertTo-Json -Depth 4 -Compress)
  
      # === 4) Apply image ===
      Write-Host "[dism] applying install.wim -> $W\ ..."
@@ -555,16 +608,41 @@ index e1d05cd..6968169 100644
 -                Write-Host "[dism] inject driver: $d"
 -                Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$sub", "/Recurse", "/ForceUnsigned") -OutNull -What "dism /Add-Driver $d"
 -            } else { Write-Host "  [warn] driver $d to install does not exist in $drvDir" -ForegroundColor DarkYellow }
--        }
--    } else {
--        Write-Host "[dism] injecting all drivers offline ..."
--        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$drvDir", "/Recurse", "/ForceUnsigned") -OutNull -What "dism /Add-Driver"
 +    # === 5) Offline injection of the six explicitly selected test-signed ARM64 drivers ===
 +    foreach ($driver in $DRIVER_INSTALL) {
 +        $sub = Get-BoundedPath (Join-Path $drvDir $driver) $drvDir -MustExist
 +        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$sub", "/Recurse", "/ForceUnsigned") -OutNull -What ("dism /Add-Driver " + $driver)
-     }
- 
++    }
++
++    # Capture actual offline DISM facts while the owned Windows volume is still mounted.
++    if ($env:DVM_RECORD_DIR) {
++        $observationDir = Get-BoundedPath $env:DVM_RECORD_DIR $ROOT -MustExist
++        if (-not (Test-Path -LiteralPath $observationDir -PathType Container)) { throw "DVM_RECORD_DIR must be a directory" }
++        $allDrivers = @(Get-WindowsDriver -Path "$W\" -ErrorAction Stop)
++        $driverFacts = @()
++        foreach ($driver in $DRIVER_INSTALL) {
++            $infName = $driver.ToLowerInvariant() + ".inf"
++            $observedPackages = @($allDrivers | Where-Object {
++                [IO.Path]::GetFileName([string]$_.OriginalFileName).ToLowerInvariant() -eq $infName
++            })
++            if ($observedPackages.Count -ne 1) { throw "Offline DISM did not report one installed package for $driver" }
++            $installed = $observedPackages[0]
++            $driverFacts += [ordered]@{
++                name = $driver
++                published_inf = [string]$installed.Driver
++                original_inf = [string]$installed.OriginalFileName
++                provider = [string]$installed.ProviderName
++                class_name = [string]$installed.ClassName
++                version = [string]$installed.Version
++                boot_critical = [bool]$installed.BootCritical
++                inbox = [bool]$installed.Inbox
++            }
+         }
+-    } else {
+-        Write-Host "[dism] injecting all drivers offline ..."
+-        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Driver", "/Driver:$drvDir", "/Recurse", "/ForceUnsigned") -OutNull -What "dism /Add-Driver"
+-    }
+-
 -    # === 5b) Extract driver signer certs (offline) -> stage for first-boot trust ===
 -    # Offline injection (/ForceUnsigned) needs no cert, but that only lets "this batch" of drivers install. Later "interactive" driver updates
 -    # (Device Manager / pnputil / vendor installer) check TrustedPublisher; if the cert is absent -> the "cannot verify
@@ -590,30 +668,6 @@ index e1d05cd..6968169 100644
 -                    Export-Certificate -Cert $cert -FilePath (Join-Path $certDir "$($cert.Thumbprint).cer") | Out-Null
 -                }
 -            } catch {}
-+    # Capture actual offline DISM facts while the owned Windows volume is still mounted.
-+    if ($env:DVM_RECORD_DIR) {
-+        $observationDir = Get-BoundedPath $env:DVM_RECORD_DIR $ROOT -MustExist
-+        if (-not (Test-Path -LiteralPath $observationDir -PathType Container)) { throw "DVM_RECORD_DIR must be a directory" }
-+        $allDrivers = @(Get-WindowsDriver -Path "$W\" -ErrorAction Stop)
-+        $driverFacts = @()
-+        foreach ($driver in $DRIVER_INSTALL) {
-+            $infName = $driver.ToLowerInvariant() + ".inf"
-+            $observedPackages = @($allDrivers | Where-Object {
-+                [IO.Path]::GetFileName([string]$_.OriginalFileName).ToLowerInvariant() -eq $infName
-+            })
-+            if ($observedPackages.Count -ne 1) { throw "Offline DISM did not report one installed package for $driver" }
-+            $installed = $observedPackages[0]
-+            $driverFacts += [ordered]@{
-+                name = $driver
-+                published_inf = [string]$installed.Driver
-+                original_inf = [string]$installed.OriginalFileName
-+                provider = [string]$installed.ProviderName
-+                class_name = [string]$installed.ClassName
-+                version = [string]$installed.Version
-+                boot_critical = [bool]$installed.BootCritical
-+                inbox = [bool]$installed.Inbox
-+            }
-+        }
 +        $observation = [ordered]@{
 +            format = "droidvm-windows-installed-drivers-v1"
 +            evidence_mode = "actual_offline_dism"
@@ -637,7 +691,7 @@ index e1d05cd..6968169 100644
      # === 5c) EMS-SAC Feature-on-Demand (offline, for the interactive SAC> console) ===
      # The ARM64 LTSC/Pro image ships no SAC runtime; the "EMS and SAC Toolset" FoD provides
      # sacdrv.sys + sacsess.exe + the sacsvr service. Inject it offline from EMS_SAC_SOURCE (the
-@@ -424,96 +446,39 @@ exit
+@@ -424,96 +485,39 @@ exit
      # (staged below, step 8d) pulls it from Windows Update when EMS_SAC_SOURCE=online.
      switch ($EMS_SAC_SOURCE) {
          "skip"   { Write-Host "[ems-sac] EMS_SAC_SOURCE=skip: shipping boot-EMS only (no interactive SAC runtime)." -ForegroundColor DarkYellow }
@@ -652,9 +706,11 @@ index e1d05cd..6968169 100644
 -                Write-Host "  [warn] offline FoD injection failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
 -                Write-Host "  [warn] check EMS_SAC_SOURCE points at the ARM64 FoD ISO/folder matching the image build" -ForegroundColor DarkYellow
 -            }
--        }
--    }
--
++            Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Capability", "/CapabilityName:$EMS_SAC_CAP", "/Source:$fodSrc", "/LimitAccess") -OutNull -What "dism /Add-Capability EMS-SAC"
++            Write-Host "[ems-sac] local FoD injected offline"
+         }
+     }
+ 
 -    # === 6) Debloat (offline removal of provisioned Appx) ===
 -    Write-Host "[debloat] removing extra provisioned Appx offline ..."
 -    $keep = 'VCLibs|NET\.Native|UI\.Xaml|Store|SecHealth|Photos|Notepad|Terminal|WindowsTerminal'
@@ -664,9 +720,7 @@ index e1d05cd..6968169 100644
 -                Show-CommandLine "Remove-AppxProvisionedPackage" @("-Path", "$W\", "-PackageName", $_.PackageName)
 -                Remove-AppxProvisionedPackage -Path "$W\" -PackageName $_.PackageName | Out-Null
 -            } catch {}
-+            Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Add-Capability", "/CapabilityName:$EMS_SAC_CAP", "/Source:$fodSrc", "/LimitAccess") -OutNull -What "dism /Add-Capability EMS-SAC"
-+            Write-Host "[ems-sac] local FoD injected offline"
-         }
+-        }
 -    } catch { Write-Host "  (skipping debloat: $($_.Exception.Message))" -ForegroundColor DarkYellow }
 -
 -    # === 6b) Offline shrink: WinSxS ResetBase + disable hibernate ===
@@ -677,8 +731,8 @@ index e1d05cd..6968169 100644
 -        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Image:$W\", "/Cleanup-Image", "/StartComponentCleanup", "/ResetBase") -OutNull -What "dism /Cleanup-Image /ResetBase"
 -    } catch {
 -        Write-Host "  (skipping ResetBase: $($_.Exception.Message))" -ForegroundColor DarkYellow
-     }
- 
+-    }
+-
 -    Write-Host "[debloat] disabling hibernate offline (no hiberfil.sys) ..."
 -    # Offline edit of the SYSTEM hive: HibernateEnabled=0 -> first boot will not create hiberfil.sys.
 +    # === 6) Preserve normal Windows servicing/security; deny remote desktop offline ===
@@ -756,7 +810,7 @@ index e1d05cd..6968169 100644
      }
  
      # === 7) Boot files + BCD (bcdboot uses the ARM64 bootmgr from the image) ===
-@@ -521,7 +486,6 @@ exit
+@@ -521,7 +525,6 @@ exit
      Invoke-ExternalCommand -FilePath "bcdboot" -ArgumentList @("$W\Windows", "/s", $S, "/f", "UEFI") -OutNull -What "bcdboot"
      $BCD = "$S\EFI\Microsoft\Boot\BCD"
      Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/set", "{default}", "testsigning", "on") -OutNull -What "bcdedit testsigning"
@@ -764,7 +818,7 @@ index e1d05cd..6968169 100644
  
      # === 7b) Emergency Management Services (EMS/SAC over the SBSA UART) ===
      # Turns the guest into an out-of-band serial console (SAC> prompt) on the app's SBSA
-@@ -535,67 +499,25 @@ exit
+@@ -535,67 +538,25 @@ exit
      Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/ems", "{default}", "on") -OutNull -What "bcdedit ems {default} on"
      Invoke-ExternalCommand -FilePath "bcdedit" -ArgumentList @("/store", $BCD, "/bootems", "{bootmgr}", "on") -OutNull -What "bcdedit bootems {bootmgr} on"
  
@@ -818,10 +872,7 @@ index e1d05cd..6968169 100644
 -    } else {
 -        Write-Host "[ssh] `$SSH_PUBKEY not set -> password login only" -ForegroundColor DarkYellow
 -    }
-+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
-+    Copy-Item -LiteralPath (Join-Path $HERE "setup-firstboot.ps1") -Destination (Join-Path $stage "setup-firstboot.ps1")
-+    Copy-Item -LiteralPath $pvmDevnode -Destination (Join-Path $stage "pvmpower-devnode.ps1")
- 
+-
 -    # === 8d) Stage EMS-SAC first-boot fallback (online FoD install) ===
 -    # setup-ems-sac.ps1 self-gates: it exits immediately if the FoD is already Installed (the
 -    # offline path in 5c succeeded). It only tries an online Windows-Update install when the
@@ -836,11 +887,15 @@ index e1d05cd..6968169 100644
 -    }
 -
 -    # === 8b) ReTrim so debloat/cleanup actually shrinks the image ===
++    New-Item -ItemType Directory -Path $stage -Force | Out-Null
++    Copy-Item -LiteralPath (Join-Path $HERE "setup-firstboot.ps1") -Destination (Join-Path $stage "setup-firstboot.ps1")
++    Copy-Item -LiteralPath $pvmDevnode -Destination (Join-Path $stage "pvmpower-devnode.ps1")
++
 +    # === 8b) ReTrim unused clusters before conversion ===
      # Mirrors macOS's Optimize-Volume -ReTrim: unmaps the clusters freed above by debloat/ResetBase.
      # Otherwise, although that space is marked free in NTFS, the VHDX still holds the old data (non-zero),
      # and step 9 qemu-img convert would copy it into the qcow2 too -> no shrink.
-@@ -608,11 +530,11 @@ exit
+@@ -608,11 +569,11 @@ exit
      }
  
      # === 9) Detach VHDX -> convert to qcow2 ===
@@ -854,7 +909,7 @@ index e1d05cd..6968169 100644
      $convArgs = @("convert", "-p")
      if ($COMPRESS) { $convArgs += @("-c", "-o", "compression_type=zstd") }
      $convArgs += @("-O", "qcow2", $VHDX, $OUT_QCOW)
-@@ -620,23 +542,27 @@ exit
+@@ -620,23 +581,27 @@ exit
      $sz = "{0:N1} GB" -f ((Get-Item $OUT_QCOW).Length / 1GB)
      Write-Host "Done  -> $OUT_QCOW ($sz)" -ForegroundColor Green
  
