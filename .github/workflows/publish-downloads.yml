@@ -116,23 +116,23 @@ jobs:
     steps:
       - name: Require the pinned iPadOS build to have succeeded
         run: |
-          result=$(gh api "repos/$GH_REPO/actions/runs/44205388372" --jq '[.status, (.conclusion // "unknown"), .head_sha] | join(":")')
-          test "$result" = 'completed:success:57268b955cf21b7ca12ff522c68310a44d8bd8ee' || { echo '::error::The selected iPadOS build has not completed successfully at the reviewed workflow revision.'; exit 1; }
+          result=$(gh api "repos/$GH_REPO/actions/runs/44214942792" --jq '[.status, (.conclusion // "unknown"), .head_sha] | join(":")')
+          test "$result" = 'completed:success:771c4864faf8a416be66cd73886b99951aacde71' || { echo '::error::The selected iPadOS build has not completed successfully at the reviewed workflow revision.'; exit 1; }
       - name: Fetch the completed encrypted iPadOS output
         uses: actions/download-artifact@v8
         with:
-          name: ipados-27.0.1-6-encrypted
-          run-id: 44205388372
+          name: ipados-27.0.1-7-encrypted
+          run-id: 44214942792
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/ipados-encrypted
       - name: Verify every encrypted part and publish the download
         run: |
           cd "$RUNNER_TEMP/ipados-encrypted"
           sha256sum -c ipados-27.0.1.tar.gz.enc.sha256
-          tag=ipados-27.0.1-run-6
+          tag=ipados-27.0.1-run-7
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            printf '%s\n' 'Completed iPadOS 27.0.1 / 24A446 build, source run 44205388372. The Apple-containing release, Data generation and source-adjustment records remain AES-256-CBC/PBKDF2 encrypted. No build key or device configuration is published. Verify every numbered part against ipados-27.0.1.tar.gz.enc.sha256 before local decryption. Phone import, Android loading and Apple guest boot remain unverified.' > "$RUNNER_TEMP/ipados-release-notes.txt"
-            gh release create "$tag" --prerelease --title 'iPadOS 27.0.1 encrypted build 6' --notes-file "$RUNNER_TEMP/ipados-release-notes.txt"
+            printf '%s\n' 'Completed iPadOS 27.0.1 / 24A446 build, source run 44214942792. The Apple-containing release, Data generation and source-adjustment records remain AES-256-CBC/PBKDF2 encrypted. No build key or device configuration is published. Verify every numbered part against ipados-27.0.1.tar.gz.enc.sha256 before local decryption. Phone import, Android loading and Apple guest boot remain unverified.' > "$RUNNER_TEMP/ipados-release-notes.txt"
+            gh release create "$tag" --prerelease --title 'iPadOS 27.0.1 encrypted build 7' --notes-file "$RUNNER_TEMP/ipados-release-notes.txt"
           fi
           gh release upload "$tag" --clobber ipados-27.0.1.tar.gz.enc.[0-9][0-9][0-9] ipados-27.0.1.tar.gz.enc.sha256
           df -h "$RUNNER_TEMP"
