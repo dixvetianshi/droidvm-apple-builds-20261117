@@ -23,6 +23,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
       HOMEBREW_NO_ENV_HINTS: '1'
+      GH_TOKEN: ${{ github.token }}
       ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
       UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
     steps:
