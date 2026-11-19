@@ -1,0 +1,133 @@
+{
+  "format": "droidvm-windows-archived-delivery-v1",
+  "recorded_at_utc": "2026-11-19T15:59:05.721717+00:00",
+  "windows": {
+    "edition": "Professional",
+    "architecture": "ARM64",
+    "language": "zh-CN",
+    "version": "10.0.26300.9457",
+    "release": "26H2",
+    "wim_index": 3
+  },
+  "target": {
+    "model": "Nubia Z70 Ultra / NX736J",
+    "soc": "Snapdragon 8 Elite / SM8750",
+    "phone_memory_gib": 16,
+    "android": 16,
+    "droidvm": "0.0.6.r242.g3348830",
+    "app_code": 2720
+  },
+  "vm": {
+    "vcpu": 4,
+    "memory_mib": 6144,
+    "virtual_disk_gib": 64,
+    "hypervisor": "Gunyah",
+    "backend": "crosvm",
+    "protected_vm": "protected_without_firmware",
+    "simplefb": "1280x720",
+    "gpu_enabled": false,
+    "testsigning": "on",
+    "nointegritychecks": "not enabled"
+  },
+  "original_build": {
+    "run_id": 44351863741,
+    "source_commit": "334ce911c3fc06d668f04c4bca716e6d4943999a",
+    "url": "https://github.com/dixvetianshi/droidvm-apple-builds-20261117/actions/runs/44351863741"
+  },
+  "package": {
+    "name": "Windows11-26H2-ARM64-DroidVM-NX736J.vmpkg",
+    "bytes": 8561582080,
+    "sha256": "b370096917d231d1e9da793f91042cf93ee49f129981b4fd0a5e9b2aac00783a",
+    "compression": "none",
+    "manifest": {
+      "path": "output/windows-package/manifest.json",
+      "bytes": 3402,
+      "sha256": "87da988b5983395e7b1c9f5409c7d01df939b29e32f64b1f00e2e3f32b0e5046"
+    }
+  },
+  "owner_feedback": {
+    "reported_date": "2026-11-19",
+    "first_boot_completed": true,
+    "basically_usable": true,
+    "initial_update_check_stall": "Completed setup after disconnecting the network",
+    "evidence_type": "human user report in chat"
+  },
+  "independent_phone_verification": {
+    "boot": false,
+    "all_driver_functions": false,
+    "audio": false,
+    "usb": false,
+    "gpu_acceleration": false,
+    "performance_or_long_term_stability": false
+  },
+  "archive_verification": {
+    "existing_cloud_source_parts": [
+      {
+        "name": "Windows11-26H2-ARM64.source.tar.gz.enc.000",
+        "bytes": 1887436800,
+        "sha256": "bd854299c0bed547f200838ac7394cd52138f4569bf42de048ce7e18908d7171",
+        "asset_id": 764305730,
+        "cloud_uploaded_digest_matches": true
+      },
+      {
+        "name": "Windows11-26H2-ARM64.source.tar.gz.enc.001",
+        "bytes": 1887436800,
+        "sha256": "403627db8a0554598de12cdeb3b784c6a7f1008c692f490dfd1d238770412136",
+        "asset_id": 764305738,
+        "cloud_uploaded_digest_matches": true
+      },
+      {
+        "name": "Windows11-26H2-ARM64.source.tar.gz.enc.002",
+        "bytes": 1887436800,
+        "sha256": "10c6fc5a2052457708948ca1b83f109b3c674342bd88f2e28575e456d69cb1cc",
+        "asset_id": 764305727,
+        "cloud_uploaded_digest_matches": true
+      },
+      {
+        "name": "Windows11-26H2-ARM64.source.tar.gz.enc.003",
+        "bytes": 1887436800,
+        "sha256": "b4b45ab872bfbbbfc53505359695eb9d2096bf67642baed026cce50cbefd211c",
+        "asset_id": 764305728,
+        "cloud_uploaded_digest_matches": true
+      },
+      {
+        "name": "Windows11-26H2-ARM64.source.tar.gz.enc.004",
+        "bytes": 904927552,
+        "sha256": "1aa4aa8cef0eabac144483fcb44369f3270f3a7ceb1f0374571ff84b7f7201e9",
+        "asset_id": 764305781,
+        "cloud_uploaded_digest_matches": true
+      }
+    ],
+    "source_key_header_checked": true,
+    "support_archive": {
+      "bytes": 961120,
+      "sha256": "61edf4cbd7a8d972fc3d9d5b33184d04682fc700ca2894b860854a1a4d2835a9"
+    },
+    "support_file_count": 42,
+    "support_boundary_checks": {
+      "real_sealed_supplement_decrypted_and_all_42_hashes_verified": "passed",
+      "real_prepared_source_header_and_small_metadata_match": "passed",
+      "changed_ciphertext_hash": "rejected",
+      "mismatched_salt": "rejected",
+      "invalid_cbc_padding_after_outer_hash_updated": "rejected",
+      "wrong_key": "rejected",
+      "path_traversal_member": "rejected",
+      "symlink_member": "rejected",
+      "duplicate_member": "rejected",
+      "missing_approved_members": "rejected",
+      "five_original_tools_copied_unchanged": "passed"
+    },
+    "real_exact_original_package_rebuilt": true,
+    "restoration_source_mode": "prepared_source_stage",
+    "source_receipt_rerun_during_archive": false,
+    "source_manifest_bytes_preserved": true,
+    "full_package_size_sha256_verified": true
+  },
+  "privacy": {
+    "decryption_key_uploaded": false,
+    "plaintext_account_credentials_published": false,
+    "original_phone_vm_modified": false
+  },
+  "recovery_guide": "docs/Windows11-ARM64-成果与恢复.md",
+  "recovery_tool": "tools/windows-release/restore_windows_release.py"
+}

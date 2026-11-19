@@ -1,0 +1,68 @@
+{
+  "format": "droidvm-windows-support-encryption-v1",
+  "status": "complete",
+  "created_at_utc": "2026-11-19T15:48:23.755691+00:00",
+  "archive_name": "Windows11-26H2-ARM64.final-support.tar.gz.enc",
+  "source_release": {
+    "repository": "dixvetianshi/droidvm-apple-builds-20261117",
+    "tag": "windows11-26h2-arm64-run-6",
+    "prefix": "Windows11-26H2-ARM64.source.tar.gz.enc",
+    "qcow2": {
+      "name": "Windows11.qcow2",
+      "bytes": 8556576768,
+      "sha256": "26ee8583dc11164964d34abbad26e069fcce5f8d554b41ce40bfbcbb1317dd4b",
+      "virtual_size": 68719476736
+    }
+  },
+  "final_package": {
+    "name": "Windows11-26H2-ARM64-DroidVM-NX736J.vmpkg",
+    "bytes": 8561582080,
+    "sha256": "b370096917d231d1e9da793f91042cf93ee49f129981b4fd0a5e9b2aac00783a",
+    "compression": "none",
+    "manifest": {
+      "path": "output/windows-package/manifest.json",
+      "bytes": 3402,
+      "sha256": "87da988b5983395e7b1c9f5409c7d01df939b29e32f64b1f00e2e3f32b0e5046"
+    }
+  },
+  "original_package_identity_source": "Previously verified original; restore checks exact size and SHA-256",
+  "encryption": {
+    "cipher": "AES-256-CBC",
+    "padding": "PKCS7",
+    "salt_header": "Salted__",
+    "salt_bytes": 8,
+    "salt_hex": "0b825fddf15e8a2a",
+    "kdf": "PBKDF2-HMAC-SHA256",
+    "iterations": 200000,
+    "key_material_recorded": false
+  },
+  "encrypted": {
+    "bytes": 961120,
+    "sha256": "61edf4cbd7a8d972fc3d9d5b33184d04682fc700ca2894b860854a1a4d2835a9"
+  },
+  "plaintext_archive": {
+    "compression": "gzip",
+    "bytes": 961102,
+    "sha256": "8ee2dd2f909d344e7ebc34d34ee043fa9e95cfc25c0898f2f704d03a9817b350",
+    "tar_bytes": 5232640,
+    "tar_sha256": "4d172e23fd5b64c3f3821c468c1c2eba7713d4fe76ffc34f751fbba69cc372f5"
+  },
+  "support_manifest": {
+    "path": "support-manifest.json",
+    "bytes": 8637,
+    "sha256": "5f44df6e3994614b28a3212a7dcf9d345c27e23c94b1766dbf94388fa8e80a8f"
+  },
+  "members": {
+    "files": 42,
+    "file_bytes": 5184985
+  },
+  "limits": {
+    "support_bytes": 16777216,
+    "file_bytes": 8388608,
+    "json_bytes": 131072
+  },
+  "private_credentials_encrypted": true,
+  "plaintext_credentials_published": false,
+  "qcow2_included": false,
+  "original_files_modified": false
+}

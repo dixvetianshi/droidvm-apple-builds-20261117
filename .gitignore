@@ -1,0 +1,13 @@
+secrets/
+output/
+verification/
+__pycache__/
+*.pyc
+*.vmpkg
+*.img
+*.qcow2
+*.enc
+*.key
+*.pem
+*.log
+tools/env/
