@@ -8,6 +8,16 @@ META_PIN=4261ef27261763c4eaa505a0ec03019963b52f92
 MANIFEST_PIN=8143624b0ff2c37095d296c0f993c64f936a68a9
 CROSVM_PIN=c69de01daf50ee8a24adf07e994adf8bcd5825cf
 REPO_PIN=e71a8c6dd85026c8861e675ed7ff468fc611df44
+SOURCE_LOCK="$ROOT/profiles/crosvm-display-source-lock.json"
+SOURCE_LOCK_SHA256=fe63a6eec0ec48abd7a9551a93e1b60b976ee0171b9a18c1a52f93b9ffccb610
+UPSTREAM_MANIFEST_SHA256=ffa1c625ef1bc6fc0a49070436207425d556488cf4a84a4b33a6ee3087846082
+VIRTUALIZATION_PIN=c8c132c55d7d5932966e8b2f262e2f86d676cbb1
+NATIVE_DISPLAY_PATCH="$ROOT/patches/android-display-owner.patch"
+NATIVE_DISPLAY_PATCH_SHA256=508c025223e29868eb3e9b1f4638d7f41b869221cfb6802c79949e5a6452fbcc
+NATIVE_DISPLAY_SOURCE_SHA256=47d833cf2832ce6c63e4f6e28e6458dd66a3b8d7b2880ca02f7f6e15159e6e61
+NATIVE_DISPLAY_FIXED_SHA256=df3a45d4dede4cac0b0d944a04069fad1d374c8da7b4fd0d721d54405fab5986
+SHIM_RUST_TOOLCHAIN=1.100.0
+SHIM_SHA256=3db0af7122198f1dde9f7fe1ef9794411b519fe153abcc427755f7280078ecad
 OUT="$ROOT/output/crosvm"
 test ! -e "$OUT" || { echo "Preserve the existing output before a new run: $OUT" >&2; exit 1; }
 mkdir -p "$OUT/diagnostics"
@@ -21,6 +31,9 @@ MANIFEST_SOURCE="$WORK/manifest-source"
 LOCKED_MANIFEST="$WORK/locked-manifest"
 REPO_SOURCE="$WORK/git-repo"
 export OUT ROOT META META_PIN MANIFEST_PIN CROSVM_PIN REPO_PIN LOCKED_MANIFEST MANIFEST_SOURCE
+export SOURCE_LOCK SOURCE_LOCK_SHA256 UPSTREAM_MANIFEST_SHA256 VIRTUALIZATION_PIN
+export NATIVE_DISPLAY_PATCH NATIVE_DISPLAY_PATCH_SHA256 NATIVE_DISPLAY_SOURCE_SHA256 NATIVE_DISPLAY_FIXED_SHA256
+export SHIM_RUST_TOOLCHAIN SHIM_SHA256
 export JOBS=${JOBS:-4}
 export REPO_JOBS=${REPO_JOBS:-4}
 export GOMEMLIMIT=${GOMEMLIMIT:-8GiB}
@@ -70,88 +83,73 @@ checkout_commit https://github.com/Droid-VM/droidvm-meta-repo.git "$META_PIN" "$
 checkout_commit https://github.com/Droid-VM/crosvm-minimal-manifest.git "$MANIFEST_PIN" "$MANIFEST_SOURCE"
 checkout_commit https://github.com/GerritCodeReview/git-repo.git "$REPO_PIN" "$REPO_SOURCE"
 
-# Resolve the official manifest once, before downloading source. Fixed fork
-# choices follow the reviewed wip/hackintosh -> droidvm branch chain. AOSP
-# branch revisions are resolved for this run and their exact commits are retained.
+# Reuse the verified 96-project snapshot from the completed original build.
+# declared_revision and selected_ref retain its history; only commit selects
+# source for this rebuild. No moving branch or tag is resolved again.
 python3 - <<'PY'
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import xml.etree.ElementTree as ET
 
+lock_bytes = Path(os.environ['SOURCE_LOCK']).read_bytes()
+if hashlib.sha256(lock_bytes).hexdigest() != os.environ['SOURCE_LOCK_SHA256']:
+    raise SystemExit('The retained 96-project source lock differs from the reviewed snapshot.')
+lock = json.loads(lock_bytes)
+for field, variable in (
+    ('meta_commit', 'META_PIN'),
+    ('repo_tool_commit', 'REPO_PIN'),
+    ('upstream_manifest_commit', 'MANIFEST_PIN'),
+):
+    if lock[field] != os.environ[variable]:
+        raise SystemExit(f'The retained source lock has a different {field}.')
 source = Path(os.environ['MANIFEST_SOURCE']) / 'crosvm-minimal.xml'
+if hashlib.sha256(source.read_bytes()).hexdigest() != os.environ['UPSTREAM_MANIFEST_SHA256']:
+    raise SystemExit('The pinned upstream manifest bytes differ from the verified original input.')
 document = ET.parse(source)
 root = document.getroot()
 defaults = root.find('default').attrib
 remotes = {remote.attrib['name']: remote.attrib['fetch'] for remote in root.findall('remote')}
-pins = {
-    'external/crosvm': ('wip/hackintosh', os.environ['CROSVM_PIN']),
-    'hardware/google/gfxstream': ('droidvm', 'cbc6df3b11b3eac8fb13d89e0a542f763b3bdfcc'),
-    'external/virglrenderer': ('wip/hackintosh', '2529a9f77a1a3f9cd41d50b9174d2e41ea1b75dd'),
-    'packages/modules/Virtualization': ('wip/hackintosh', 'c8c132c55d7d5932966e8b2f262e2f86d676cbb1'),
-    'external/libvncserver': ('droidvm', '082e869d0e6e2441b810fc9877bce1acd30f9393'),
-    'external/zstd': ('droidvm', '0552a06f6a0b50cdeed444534810741a670d6d46'),
-    'external/virtio-media': ('wip/hackintosh', '3fe8fb594f5761c4d70d0f05781af23f42b47698'),
-    'external/rust/crates/v4l2r': ('wip/hackintosh', '7eb3afa6c4ff7d795394ad09dece6099b4e6a38e'),
-    'build/soong': ('android16-qpr2-release', 'c2db5181e9e1b6a383f6e858fb39b3db26aba7e7'),
-}
 projects = root.findall('project')
-if len(projects) != 96:
-    raise SystemExit(f'The reviewed minimal manifest changed: {len(projects)} projects, expected 96')
-paths = {project.attrib.get('path', project.attrib['name']) for project in projects}
-if not pins.keys() <= paths:
-    raise SystemExit(f'Pinned projects missing from manifest: {sorted(pins.keys() - paths)}')
-
-def resolve(project):
+resolved = lock['projects']
+records = {record['path']: record for record in resolved}
+paths = [project.attrib.get('path', project.attrib['name']) for project in projects]
+if len(projects) != 96 or len(resolved) != 96 or len(records) != 96 or len(set(paths)) != 96:
+    raise SystemExit('The retained source lock and upstream manifest must each own 96 unique projects.')
+if set(paths) != set(records):
+    raise SystemExit('The retained source lock paths differ from the pinned upstream manifest.')
+for project in projects:
     name = project.attrib['name']
     path = project.attrib.get('path', name)
     remote = project.attrib.get('remote', defaults['remote'])
     url = remotes[remote].rstrip('/') + '/' + name
     revision = project.attrib.get('revision', defaults['revision'])
-    if path in pins:
-        selected_ref, commit = pins[path]
-    elif re.fullmatch('[0-9a-f]{40}', revision):
-        selected_ref, commit = revision, revision
-    else:
-        refs = [revision, f'refs/heads/{revision}', f'refs/tags/{revision}', f'refs/tags/{revision}^{{}}']
-        result = subprocess.run(['git', 'ls-remote', '--exit-code', url, *refs],
-                                text=True, capture_output=True, timeout=90, check=True)
-        rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
-        peeled = [sha for sha, ref in rows if ref.endswith('^{}')]
-        choices = set(peeled or [sha for sha, ref in rows])
-        if len(choices) != 1:
-            raise SystemExit(f'Cannot select one commit for {url} at {revision}: {sorted(choices)}')
-        selected_ref, commit = revision, choices.pop()
-    if not re.fullmatch('[0-9a-f]{40}', commit):
-        raise SystemExit(f'Invalid source commit for {path}: {commit}')
-    return {'path': path, 'name': name, 'url': url, 'declared_revision': revision,
-            'selected_ref': selected_ref, 'commit': commit}
-
-with ThreadPoolExecutor(max_workers=int(os.environ['REPO_JOBS'])) as workers:
-    resolved = list(workers.map(resolve, projects))
-for project, record in zip(projects, resolved):
+    record = records[path]
+    if (record['name'], record['url'], record['declared_revision']) != (name, url, revision):
+        raise SystemExit(f'The retained source provenance differs from the upstream manifest for {path}.')
+    if not re.fullmatch('[0-9a-f]{40}', record['commit']):
+        raise SystemExit(f'Invalid retained source commit for {path}: {record["commit"]}')
     project.set('revision', record['commit'])
     if not re.fullmatch('[0-9a-f]{40}', record['selected_ref']):
         ref = record['selected_ref']
         project.set('upstream', ref if ref.startswith('refs/') else f'refs/heads/{ref}')
+for path, variable in (
+    ('external/crosvm', 'CROSVM_PIN'),
+    ('packages/modules/Virtualization', 'VIRTUALIZATION_PIN'),
+):
+    if records[path]['commit'] != os.environ[variable]:
+        raise SystemExit(f'The retained source lock has a different commit for {path}.')
 directory = Path(os.environ['LOCKED_MANIFEST'])
 directory.mkdir()
 target = directory / 'crosvm-minimal.xml'
-document.write(target, encoding='utf-8', xml_declaration=True)
+target.write_bytes(ET.tostring(root, encoding='utf-8', xml_declaration=True))
+if hashlib.sha256(target.read_bytes()).hexdigest() != lock['locked_manifest_sha256']:
+    raise SystemExit('The regenerated locked manifest differs from the original completed build.')
 out = Path(os.environ['OUT'])
-(out / 'source-lock.json').write_text(json.dumps({
-    'meta_commit': os.environ['META_PIN'],
-    'repo_tool_commit': os.environ['REPO_PIN'],
-    'upstream_manifest_commit': os.environ['MANIFEST_PIN'],
-    'locked_manifest_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
-    'scope': '96-project standalone Android crosvm tree; no guest Mesa/additions or Apple files',
-    'projects': resolved,
-}, indent=2) + '\n')
-print(f'Locked all {len(resolved)} source projects before synchronization.')
+(out / 'source-lock.json').write_bytes(lock_bytes)
+print(f'Reused all {len(resolved)} verified source commits without resolving moving refs.')
 PY
 
 git -C "$LOCKED_MANIFEST" init -b main
@@ -192,9 +190,60 @@ if actual != expected:
 print('All synchronized project commits match the source lock.')
 PY
 
+# The display owner is a cc_library_static linked into crosvm. Apply the
+# reviewed source-only patch before the complete Soong build and retain its
+# exact patch and before/after source identities with the resulting VMM.
+python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+
+out = Path(os.environ['OUT'])
+repository = Path(os.environ['META']) / 'crosvm_build/packages/modules/Virtualization'
+commit = subprocess.check_output(['git', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
+if commit != os.environ['VIRTUALIZATION_PIN']:
+    raise SystemExit('The synchronized Virtualization checkout differs from the reviewed patch base.')
+source_path = 'libs/android_display_backend/crosvm_android_display_client.cpp'
+source = repository / source_path
+before = hashlib.sha256(source.read_bytes()).hexdigest()
+if before != os.environ['NATIVE_DISPLAY_SOURCE_SHA256']:
+    raise SystemExit('The native display source differs from the reviewed unpatched bytes.')
+patch = Path(os.environ['NATIVE_DISPLAY_PATCH'])
+patch_bytes = patch.read_bytes()
+patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
+if patch_sha256 != os.environ['NATIVE_DISPLAY_PATCH_SHA256']:
+    raise SystemExit('The native display patch differs from the reviewed final patch.')
+command = ['git', '-c', 'core.autocrlf=false', '-C', str(repository), 'apply', '--whitespace=error']
+subprocess.run([*command, '--check', str(patch)], check=True)
+subprocess.run([*command, str(patch)], check=True)
+after = hashlib.sha256(source.read_bytes()).hexdigest()
+if after != os.environ['NATIVE_DISPLAY_FIXED_SHA256']:
+    raise SystemExit('The patched native display source differs from the reviewed final bytes.')
+retained_patch = out / 'diagnostics/android-display-owner.patch'
+retained_patch.write_bytes(patch_bytes)
+(out / 'native-display-patch.json').write_text(json.dumps({
+    'project_path': 'packages/modules/Virtualization',
+    'project_url': 'https://github.com/Droid-VM/Virtualization',
+    'upstream_commit': commit,
+    'source_path': source_path,
+    'source_sha256_before': before,
+    'source_sha256_after': after,
+    'patch': retained_patch.relative_to(out).as_posix(),
+    'patch_sha256': patch_sha256,
+    'source_lock_snapshot': 'profiles/crosvm-display-source-lock.json',
+    'source_lock_snapshot_sha256': os.environ['SOURCE_LOCK_SHA256'],
+    'build_linkage': 'libcrosvm_android_display_client (cc_library_static) linked into crosvm',
+    'real_android_surface_vulkan_verification': 'not performed by this build',
+    'phone_apple_guest_boot_verification': 'not performed by this build',
+}, indent=2) + '\n')
+print('Applied the reviewed native display patch and verified exact before/after source bytes.')
+PY
+
 # The shim is a separate bare-metal crate; Soong uses its own Rust prebuilts.
-rustup toolchain install stable --profile minimal --target aarch64-unknown-none-softfloat
-export RUSTUP_TOOLCHAIN=stable
+rustup toolchain install "$SHIM_RUST_TOOLCHAIN" --profile minimal --target aarch64-unknown-none-softfloat
+export RUSTUP_TOOLCHAIN="$SHIM_RUST_TOOLCHAIN"
 rustc --version | tee "$OUT/diagnostics/shim-rustc-version.txt"
 cargo --version | tee "$OUT/diagnostics/shim-cargo-version.txt"
 space_report before-build
@@ -217,7 +266,10 @@ git -C "$META/crosvm_build/external/boringssl" diff --binary \
 # Keep the matching non-platform runtime libraries. The platform shadow list is
 # the policy of this pinned meta repo's 6_build_apk_prepare.sh: those libraries
 # are supplied by Android, and shipping a duplicate can break its own consumers.
+# Apply the local linker-stub exclusion as well; full-build still retains the
+# original collected file and its checksum as build evidence.
 python3 - <<'PY'
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -226,6 +278,7 @@ import subprocess
 import sys
 sys.path.insert(0, str(Path(os.environ['ROOT']) / 'tools'))
 from fetch_runtime import digest, inspect_embedded_flags
+from runtime_payload_policy import EXCLUDED_LINK_STUB_NAMES, RUNTIME_PAYLOAD_POLICY_SOURCE
 
 meta = Path(os.environ['META'])
 out = Path(os.environ['OUT'])
@@ -244,6 +297,9 @@ for name in ('shim.elf', 'shim.bin'):
 shim_bytes = (shim / 'shim.bin').read_bytes()
 if not shim_bytes or shim_bytes != (meta / 'crosvm/hypervisor/src/gunyah/shim.bin').read_bytes():
     raise SystemExit('The retained shim differs from the VMM include_bytes! input.')
+shim_sha256 = hashlib.sha256(shim_bytes).hexdigest()
+if shim_sha256 != os.environ['SHIM_SHA256']:
+    raise SystemExit('The rebuilt shim bytes differ from the original verified Apple/Gunyah shim.')
 markers = inspect_embedded_flags(binary)
 additional = {'mbi-spis': b'mbi-spis', 'embedded-shim': shim_bytes}
 observed = {name: False for name in additional}
@@ -268,9 +324,12 @@ if 'AArch64' not in elf:
 platform = {name + '.so' for name in (
     'libgui', 'libaaudio', 'libbinder_ndk', 'libc++', 'libbase', 'libcap',
     'libcutils', 'liblog', 'libminijail', 'libnativewindow', 'libprocessgroup')}
+platform.update(EXCLUDED_LINK_STUB_NAMES)
 files = [(binary, runtime / 'usr/bin/crosvm')]
 files += [(path, runtime / 'usr/lib' / path.name)
           for path in sorted(complete.glob('*.so')) if path.name not in platform]
+if len(files) != 71:
+    raise SystemExit(f'The pinned runtime payload changed: {len(files)} files, expected 71.')
 for original, target in files:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(original, target)
@@ -280,20 +339,30 @@ report = {
     'crosvm_commit': os.environ['CROSVM_PIN'],
     'build_target': 'crosvm_device_only / aosp_arm64 trunk_staging eng',
     'max_build_jobs': int(os.environ['JOBS']),
-    'shim_rust_toolchain_selection': 'stable, resolved and recorded on this runner',
+    'shim_rust_toolchain_selection': os.environ['SHIM_RUST_TOOLCHAIN'],
+    'shim_sha256': shim_sha256,
+    'shim_expected_sha256': os.environ['SHIM_SHA256'],
     'shim_rustc_version': (out / 'diagnostics/shim-rustc-version.txt').read_text().strip(),
     'shim_cargo_version': (out / 'diagnostics/shim-cargo-version.txt').read_text().strip(),
     'source_lock': 'source-lock.json',
+    'source_lock_snapshot': 'profiles/crosvm-display-source-lock.json',
+    'source_lock_snapshot_sha256': os.environ['SOURCE_LOCK_SHA256'],
+    'source_lock_reused_without_ref_resolution': True,
     'synchronized_manifest': 'source-manifest.xml',
+    'native_display_patch': json.loads((out / 'native-display-patch.json').read_text()),
     'platform_library_policy_source': 'droidvm-meta-repo/6_build_apk_prepare.sh at the meta_commit',
+    'local_runtime_policy_source': RUNTIME_PAYLOAD_POLICY_SOURCE,
+    'excluded_link_stubs': sorted(path.name for path in complete.glob('*.so')
+                                 if path.name in EXCLUDED_LINK_STUB_NAMES),
     'omitted_platform_libraries': sorted(path.name for path in complete.glob('*.so') if path.name in platform),
     'full_build_files': {path.relative_to(out).as_posix(): digest(path)
                          for directory in (complete, shim) for path in sorted(directory.iterdir()) if path.is_file()},
     'runtime_files': {target.relative_to(out).as_posix(): digest(target) for original, target in files},
+    'runtime_file_count': len(files),
     'crosvm_embedded_option_names': markers,
     'retained_shim_embedded_in_crosvm': observed['embedded-shim'],
     'collection_scope': 'official direct and transitive DT_NEEDED collection (--deep); bionic libc/libdl/libm are provided by Android',
-    'runtime_overlay_policy': 'non-platform libraries only; full-build and shim are retained evidence, not a phone installation payload',
+    'runtime_overlay_policy': 'non-platform implementation libraries only; Android linker stubs excluded; full-build and shim are retained evidence, not a phone installation payload',
     'aosp_build_patch': 'diagnostics/boringssl-build.patch',
     'static_elf_header': elf,
     'static_dynamic_section': dynamic,
