@@ -111,8 +111,11 @@ def main():
         "scope": {
             "only_target": {"uid": 501, "name": "lsd", "path": "/usr/libexec/lsd"},
             "active_transitions_mb": [[16, 64], [64, 16]],
+            "pair_transitions_mb": [[[16, 12], [64, 64]], [[64, 64], [16, 12]]],
+            "verbs": ["inspect", "raise64", "restore16", "raiseboth64", "restore16and12"],
             "kernel_commands": {"get": 8, "set": 7, "flags": 0, "properties_bytes": 16},
-            "inactive_preservation": "observed effective value and both attributes",
+            "inactive_preservation": "active-only verbs preserve the observed inactive value; pair verbs change the fixed pair; both preserve attributes",
+            "pair_preservation": "both attributes; only the fixed active/inactive pair changes",
             "original_default_sentinel_semantics": "unknown after GET8 expansion",
             "mutation_requires_root": True,
             "identity_checks": "PID, UID, name, executable and start sec/usec before/after",

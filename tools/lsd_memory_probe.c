@@ -105,8 +105,8 @@ struct report {
     int pid, error_number, exit_code;
     uint64_t expected_sec, expected_usec;
     bool has_expected, has_before, has_after, ok, write_attempted;
-    bool set_returned_success, idempotent;
-    int32_t desired;
+    bool set_returned_success, idempotent, pair_change;
+    int32_t desired, desired_inactive;
     struct identity first, before_write, after_write, final;
     probe_limits before, after;
 };
@@ -171,9 +171,10 @@ static int get_limits(int pid, probe_limits *out) {
     return result == 0 ? 0 : (errno ? errno : EIO);
 }
 
-static bool unchanged_other_limits(const probe_limits *before, const probe_limits *after) {
+static bool unchanged_other_limits(const probe_limits *before, const probe_limits *after,
+                                   bool pair_change) {
     return before->memlimit_active_attr == after->memlimit_active_attr &&
-           before->memlimit_inactive == after->memlimit_inactive &&
+           (pair_change || before->memlimit_inactive == after->memlimit_inactive) &&
            before->memlimit_inactive_attr == after->memlimit_inactive_attr;
 }
 
@@ -242,9 +243,13 @@ static int emit(const struct report *r) {
     printf(",\"errno\":%d,\"error\":", r->error_number); json_string(r->error_reason);
     fputs(",\"proc_info_contract\":", stdout); json_string(PROBE_PROC_INFO_SOURCE);
     fputs(",\"memlimit_contract\":", stdout); json_string(PROBE_MEMLIMIT_SOURCE);
+    printf(",\"pair_limit_operation\":%s", boolean(r->pair_change));
     fputs(",\"limits_are_observed_effective\":true,\"original_default_sentinel_semantics\":\"unknown\","
-          "\"preservation_scope\":\"SET7 preserves the observed inactive value and both attributes; GET8 may expand defaults. "
-          "restore16 restores the observed active value, not unknown original default semantics.\","
+          "\"preservation_scope\":", stdout);
+    json_string(r->pair_change ?
+          "SET7 changes only the observed active/inactive pair 16/12 <-> 64/64 and preserves both attributes; original default semantics remain unknown." :
+          "SET7 preserves the observed inactive value and both attributes; GET8 may expand defaults. restore16 restores the observed active value, not unknown original default semantics.");
+    fputs(","
           "\"identity_atomicity\":\"best effort; the kernel SET7 accepts PID, not the start-time token\","
           "\"persistent_configuration_written\":false,\"total_ram_changed\":false}\n", stdout);
     return ferror(stdout) ? 1 : r->exit_code;
@@ -257,17 +262,21 @@ int main(int argc, char **argv) {
     bool inspect = r.verb && !strcmp(r.verb, "inspect");
     bool raise = r.verb && !strcmp(r.verb, "raise64");
     bool restore = r.verb && !strcmp(r.verb, "restore16");
-    if ((!inspect && !raise && !restore) || argc != (inspect ? 3 : 5) ||
+    bool raise_pair = r.verb && !strcmp(r.verb, "raiseboth64");
+    bool restore_pair = r.verb && !strcmp(r.verb, "restore16and12");
+    if ((!inspect && !raise && !restore && !raise_pair && !restore_pair) || argc != (inspect ? 3 : 5) ||
         !decimal(argv[2], INT_MAX, &parsed_pid) || parsed_pid <= 1 ||
         (!inspect && (!decimal(argv[3], UINT64_MAX, &r.expected_sec) ||
                       !decimal(argv[4], 999999, &r.expected_usec)))) {
         r.error_stage = "arguments"; r.error_number = EINVAL; r.exit_code = 2;
-        r.error_reason = "Usage: inspect PID | raise64 PID START_SEC START_USEC | restore16 PID START_SEC START_USEC";
+        r.error_reason = "Usage: inspect PID | raise64/restore16/raiseboth64/restore16and12 PID START_SEC START_USEC";
         return emit(&r);
     }
     r.pid = (int)parsed_pid;
     r.has_expected = !inspect;
-    r.desired = raise ? 64 : 16;
+    r.pair_change = raise_pair || restore_pair;
+    r.desired = (raise || raise_pair) ? 64 : 16;
+    r.desired_inactive = raise_pair ? 64 : 12;
     const char *reason = NULL;
 
 #define FAIL(stage, number, message) do { \
@@ -294,19 +303,26 @@ int main(int argc, char **argv) {
         return emit(&r);
     }
     if (geteuid() != 0) FAIL("caller_authority", EPERM, "Mutation requires a root caller");
-    if (r.before.memlimit_active != r.desired &&
-        r.before.memlimit_active != (raise ? 16 : 64))
+    if (r.pair_change) {
+        bool original_pair = r.before.memlimit_active == 16 && r.before.memlimit_inactive == 12;
+        bool raised_pair = r.before.memlimit_active == 64 && r.before.memlimit_inactive == 64;
+        if (!original_pair && !raised_pair)
+            FAIL("pair_precondition", EINVAL, "Only observed limit pair 16/12 <-> 64/64 is accepted");
+    } else if (r.before.memlimit_active != r.desired &&
+               r.before.memlimit_active != (raise ? 16 : 64))
         FAIL("active_precondition", EINVAL, "Only observed active 16->64 or 64->16 is accepted");
 
     READ_ID(before_write, "identity_before_write");
     if (!same_identity(&r.first, &r.before_write))
         FAIL("identity_before_write", ESTALE, "The selected lsd identity changed before SET7");
-    if (r.before.memlimit_active != r.desired) {
+    if (r.before.memlimit_active != r.desired ||
+        (r.pair_change && r.before.memlimit_inactive != r.desired_inactive)) {
         if ((r.before.memlimit_active_attr | r.before.memlimit_inactive_attr) &
             ~MEMORYSTATUS_MEMLIMIT_ATTR_FATAL)
             FAIL("attribute_precondition", EINVAL, "Attributes are outside the pinned XNU contract");
         probe_limits desired = r.before;
         desired.memlimit_active = r.desired;
+        if (r.pair_change) desired.memlimit_inactive = r.desired_inactive;
         r.write_attempted = true;
         errno = 0;
         result = memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
@@ -323,8 +339,10 @@ int main(int argc, char **argv) {
     READ_ID(final, "identity_after_read");
     if (!same_identity(&r.first, &r.final))
         FAIL("identity_after_read", ESTALE, "The selected lsd identity changed during the final GET8");
-    if (r.after.memlimit_active != r.desired || !unchanged_other_limits(&r.before, &r.after))
-        FAIL("verify_after", EIO, "Active limit or preserved observed fields differ on readback");
+    if (r.after.memlimit_active != r.desired ||
+        (r.pair_change && r.after.memlimit_inactive != r.desired_inactive) ||
+        !unchanged_other_limits(&r.before, &r.after, r.pair_change))
+        FAIL("verify_after", EIO, "Requested limits or preserved attributes/fields differ on readback");
     r.idempotent = !r.write_attempted;
     r.ok = true;
     return emit(&r);
