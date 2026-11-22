@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "source_repository": "Droid-VM/gunyah_host_mod",
+  "source_commit": "44e8ae5a088a3a35290a5cacb205640cff187b99",
+  "upstream_source": {
+    "path": "gunyah_host_share/GKI6.6/gunyah_share_mod.c",
+    "url": "https://raw.githubusercontent.com/Droid-VM/gunyah_host_mod/44e8ae5a088a3a35290a5cacb205640cff187b99/gunyah_host_share/GKI6.6/gunyah_share_mod.c",
+    "sha256": "73df544b50d146f1a53907393a3a40a64eb4484d660074e6494fb54421cf60ce"
+  },
+  "upstream_support": [
+    {
+      "path": "gunyah_host_share/GKI6.6/uapi_gunyah_share.h",
+      "url": "https://raw.githubusercontent.com/Droid-VM/gunyah_host_mod/44e8ae5a088a3a35290a5cacb205640cff187b99/gunyah_host_share/GKI6.6/uapi_gunyah_share.h",
+      "sha256": "0f1cd1b15c4b2b00a6bfabe8104652b6540bd2a4319cdcaf3975af9180ee11fe"
+    },
+    {
+      "path": "build.sh",
+      "url": "https://raw.githubusercontent.com/Droid-VM/gunyah_host_mod/44e8ae5a088a3a35290a5cacb205640cff187b99/build.sh",
+      "sha256": "ebbb9b63bcd897287c4442d69fd1ed3f205d3e9d575bba17c84de73bf8009921"
+    }
+  ],
+  "clean_v3_patch": {
+    "path": "patches/hostshare/remove-unused-debugfs-probe.patch",
+    "strip": 1,
+    "sha256": "058ca1463c09f484cd401c3906088ecfd15545c9f24781a8cc96a177c234beaf",
+    "bytes": 4166,
+    "before_sha256": "73df544b50d146f1a53907393a3a40a64eb4484d660074e6494fb54421cf60ce",
+    "after_sha256": "10ee8c3c635e2d5ece48606c03cac218f7633e68226646bfe30125b51443fd99"
+  },
+  "lease_patch": {
+    "path": "patches/hostshare/hostshare-lease.patch",
+    "strip": 1,
+    "sha256": "d8ee4c2c95bf137380e2eb052a4be527b4617e68b202949810809867e31a5098",
+    "bytes": 70196
+  },
+  "bundled_source_root": "patches/hostshare/lease-source",
+  "before": [
+    {
+      "path": "gunyah_share_mod.c",
+      "sha256": "10ee8c3c635e2d5ece48606c03cac218f7633e68226646bfe30125b51443fd99",
+      "bytes": 31360
+    }
+  ],
+  "after": [
+    {
+      "path": "Makefile",
+      "sha256": "2006f85c4436baaa7364ffed9b021617ac7c84ba8ced107bee17a15e91f1cdde",
+      "bytes": 196
+    },
+    {
+      "path": "ghsm_lease_impl.c.inc",
+      "sha256": "4d10d9f9458384c4554fbfdbdbb9346f3fcb2d9112a620cb9830ed1c25a996f1",
+      "bytes": 14128
+    },
+    {
+      "path": "ghsm_lease_state.h",
+      "sha256": "0aa13c2f26459caf4b843cfa3c87524546ab3967513fdfc751d0937ecef406bb",
+      "bytes": 2006
+    },
+    {
+      "path": "ghsm_lease_uapi.h",
+      "sha256": "b2f34317da73b49867263bd664c969be1ce74bd33dad693a13ddaeb615c07a48",
+      "bytes": 3043
+    },
+    {
+      "path": "gunyah_share_mod.c",
+      "sha256": "aaf4e5b3a453ea6adbdaf6a3f756bafabbe5d35c3ebc7b8f3ae6dbc692d68a18",
+      "bytes": 35964
+    },
+    {
+      "path": "tests/Makefile",
+      "sha256": "c9ee10a8496b510174c2b24666f4b30809f0066cb1d00d44ada7501b3fdb602c",
+      "bytes": 992
+    },
+    {
+      "path": "tests/README.md",
+      "sha256": "8cbbc6a8af81c593bd20d7674aa2ecbab5786c91ba069be6558bc02c39f91463",
+      "bytes": 1274
+    },
+    {
+      "path": "tests/lease_harness.c",
+      "sha256": "500b5a963678fa603f30963147b0fe0a601d95b9a5727fce7de8d7c570fac076",
+      "bytes": 17148
+    },
+    {
+      "path": "tests/lease_impl_harness.c",
+      "sha256": "fb2908b6af284d35f56d2e40e43dbe746b284f6136752d1682b03cc72d6b899f",
+      "bytes": 14170
+    }
+  ],
+  "toolchain": {
+    "image": "ghcr.io/ylarod/ddk-min@sha256:51159bc935c75a282fc65bc87e02f16bd098d1cdf55dc558c4fdd0fcf7a132e2",
+    "config_digest": "sha256:b3d6c84921b6ff5dc0caea91f06fe71d53b83bf671c55eaaf50ad7eda65b64f2"
+  }
+}

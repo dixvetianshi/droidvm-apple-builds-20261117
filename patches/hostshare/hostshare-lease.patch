@@ -1,0 +1,2153 @@
+diff --git a/Makefile b/Makefile
+new file mode 100644
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,7 @@
++obj-m += gunyah-host-share-gki-6.6.o
++gunyah-host-share-gki-6.6-y := gunyah_share_mod.o
++KDIR ?= /lib/modules/$(shell uname -r)/build
++
++.PHONY: module
++module:
++	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+diff --git a/ghsm_lease_impl.c.inc b/ghsm_lease_impl.c.inc
+new file mode 100644
+--- /dev/null
++++ b/ghsm_lease_impl.c.inc
+@@ -0,0 +1,540 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Session lock owns admission, receipts, counters and leased map VM refs.
++ * ghsm_lock owns map list membership. If nested: ghsm_lock -> session lock.
++ * No RM RPC, resource release, fput or wait runs under the session lock. */
++
++struct ghsm_lease {
++	struct kref refs;
++	spinlock_t lock;
++	struct ghsm_lease_core core;
++	struct list_head receipts;
++	wait_queue_head_t wait;
++	struct file *vm_file; /* OPEN identity ref; transferred by SEAL */
++	u64 generation;
++	u64 next_parcel_id;
++};
++
++struct ghsm_receipt {
++	struct list_head node;
++	struct ghsm_lease *lease;
++	struct ghsm_map *map; /* cleared before map metadata is freed */
++	u64 id;
++	u32 label;
++	bool attached;
++	bool reclaiming;
++	bool completed;
++	bool stalled;
++	int last_errno;
++};
++
++static u64 ghsm_lease_generation; /* ghsm_lock */
++static const struct file_operations ghsm_lease_fops;
++static void ghsm_lease_schedule_reaper(void);
++
++static void ghsm_lease_release_ref(struct kref *refs)
++{
++	struct ghsm_lease *lease = container_of(refs, struct ghsm_lease, refs);
++	struct ghsm_receipt *r, *tmp;
++
++	/* No fd, map or in-flight owner remains at the last reference. */
++	list_for_each_entry_safe(r, tmp, &lease->receipts, node) {
++		list_del(&r->node);
++		kfree(r);
++	}
++	if (lease->vm_file)
++		fput(lease->vm_file);
++	kfree(lease);
++	module_put(THIS_MODULE);
++}
++
++static struct ghsm_receipt *ghsm_lease_find_locked(struct ghsm_lease *lease, u64 id)
++{
++	struct ghsm_receipt *r;
++
++	list_for_each_entry(r, &lease->receipts, node)
++		if (r->id == id)
++			return r;
++	return NULL;
++}
++
++static struct file *ghsm_map_take_vm_file(struct ghsm_map *m)
++{
++	struct file *file;
++	unsigned long flags;
++
++	if (!m->lease) {
++		file = m->vm_file;
++		m->vm_file = NULL;
++		return file;
++	}
++	spin_lock_irqsave(&m->lease->lock, flags);
++	file = m->vm_file;
++	m->vm_file = NULL;
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++	return file;
++}
++
++static struct file *ghsm_map_get_vm_file(struct ghsm_map *m)
++{
++	struct file *file;
++	unsigned long flags;
++
++	if (!m->lease)
++		return m->vm_file ? get_file(m->vm_file) : NULL;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	file = m->vm_file ? get_file(m->vm_file) : NULL;
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++	return file;
++}
++
++static bool ghsm_map_has_vm_file(struct ghsm_map *m)
++{
++	unsigned long flags;
++	bool has_file;
++
++	if (!m->lease)
++		return !!m->vm_file;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	has_file = !!m->vm_file;
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++	return has_file;
++}
++
++static bool ghsm_map_vm_file_equals(struct ghsm_map *m, struct file *file)
++{
++	unsigned long flags;
++	bool same;
++
++	if (!m->lease)
++		return m->vm_file == file;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	same = m->vm_file == file;
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++	return same;
++}
++
++static void ghsm_lease_forget_map_pointer(struct ghsm_map *m)
++{
++	unsigned long flags;
++
++	if (!m->lease)
++		return;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	m->receipt->map = NULL;
++	/* It remains charged/reclaiming until actual resource release finishes. */
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++}
++
++static void ghsm_lease_map_attached(struct ghsm_map *m, struct ghsm_receipt *r)
++{
++	unsigned long flags;
++
++	if (!r)
++		return;
++	m->lease = r->lease;
++	m->receipt = r;
++	m->creating = true;
++	kref_get(&r->lease->refs); /* map resource ownership, not list membership */
++	spin_lock_irqsave(&r->lease->lock, flags);
++	r->map = m;
++	r->attached = true;
++	ghsm_lease_core_map_add(&r->lease->core);
++	spin_unlock_irqrestore(&r->lease->lock, flags);
++}
++
++static void ghsm_lease_map_freed(struct ghsm_lease *lease, struct ghsm_receipt *r)
++{
++	unsigned long flags;
++
++	/* Called after RM success AND the entire map resource/free routine. */
++	spin_lock_irqsave(&lease->lock, flags);
++	r->map = NULL;
++	r->completed = true;
++	r->reclaiming = false;
++	r->last_errno = 0;
++	WARN_ON(!ghsm_lease_core_map_free(&lease->core, r->stalled));
++	r->attached = false;
++	r->stalled = false;
++	spin_unlock_irqrestore(&lease->lock, flags);
++	wake_up_interruptible(&lease->wait);
++	kref_put(&lease->refs, ghsm_lease_release_ref);
++}
++
++static void ghsm_lease_reclaim_started(struct ghsm_map *m)
++{
++	unsigned long flags;
++
++	if (!m->lease)
++		return;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	m->receipt->reclaiming = true;
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++}
++
++static void ghsm_lease_reclaim_failed(struct ghsm_map *m, int error, bool stalled)
++{
++	unsigned long flags;
++
++	if (!m->lease)
++		return;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	m->receipt->last_errno = error;
++	m->lease->core.last_errno = error;
++	if (stalled && !m->receipt->stalled) {
++		m->receipt->stalled = true;
++		ghsm_lease_core_stall(&m->lease->core, error);
++	}
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++	wake_up_interruptible(&m->lease->wait);
++}
++
++static void ghsm_lease_requeued(struct ghsm_map *m)
++{
++	unsigned long flags;
++
++	if (!m->lease)
++		return;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	m->receipt->reclaiming = false;
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++}
++
++static void ghsm_lease_parked(struct ghsm_map *m)
++{
++	unsigned long flags;
++
++	if (!m->lease)
++		return;
++	spin_lock_irqsave(&m->lease->lock, flags);
++	if (!m->receipt->stalled) {
++		m->receipt->stalled = true;
++		ghsm_lease_core_stall(&m->lease->core, m->receipt->last_errno);
++	}
++	spin_unlock_irqrestore(&m->lease->lock, flags);
++	wake_up_interruptible(&m->lease->wait);
++}
++
++static struct ghsm_lease *ghsm_lease_get_fd(int fd, struct file **out_file)
++{
++	struct file *file = fget(fd);
++
++	if (!file || file->f_op != &ghsm_lease_fops) {
++		if (file)
++			fput(file);
++		return ERR_PTR(-EBADF);
++	}
++	*out_file = file;
++	return file->private_data;
++}
++
++static struct ghsm_receipt *ghsm_lease_share_begin(struct ghsm_lease *lease,
++					       struct file *vm_file, u32 label)
++{
++	struct ghsm_receipt *r, *other;
++	unsigned long flags;
++	int error = 0;
++
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return ERR_PTR(-ENOMEM);
++	spin_lock_irqsave(&lease->lock, flags);
++	if (lease->core.sealed)
++		error = -EPIPE;
++	else if (lease->vm_file != vm_file)
++		error = -EXDEV;
++	else if (lease->next_parcel_id == U64_MAX ||
++		 lease->core.inflight_shares == U32_MAX)
++		error = -EOVERFLOW;
++	if (!error)
++		list_for_each_entry(other, &lease->receipts, node)
++			if (other->label == label && !other->completed) {
++				error = -EBUSY; /* includes dying/reclaiming, unlike find_map */
++				break;
++			}
++	if (!error) {
++		r->lease = lease;
++		r->id = ++lease->next_parcel_id;
++		r->label = label;
++		r->reclaiming = true; /* producer owns it until ioctl completion */
++		WARN_ON(!ghsm_lease_core_begin_share(&lease->core));
++		list_add_tail(&r->node, &lease->receipts);
++	}
++	spin_unlock_irqrestore(&lease->lock, flags);
++	if (error) {
++		kfree(r);
++		return ERR_PTR(error);
++	}
++	return r;
++}
++
++static void ghsm_lease_share_finish(struct ghsm_lease *lease,
++				  struct ghsm_receipt *r, bool shared)
++{
++	unsigned long flags;
++	struct file *vm_file = NULL;
++	bool map_ref = false;
++
++	if (!shared) {
++		/* Backend error cleanup has already unpinned/freed partial resources. */
++		spin_lock_irqsave(&lease->lock, flags);
++		if (r->attached) {
++			WARN_ON(!ghsm_lease_core_map_free(&lease->core, r->stalled));
++			map_ref = true;
++		}
++		list_del(&r->node);
++		WARN_ON(!ghsm_lease_core_end_share(&lease->core));
++		spin_unlock_irqrestore(&lease->lock, flags);
++		kfree(r);
++		wake_up_interruptible(&lease->wait);
++		if (map_ref)
++			kref_put(&lease->refs, ghsm_lease_release_ref);
++		return;
++	}
++	mutex_lock(&ghsm_lock);
++	spin_lock_irqsave(&lease->lock, flags);
++	/* Reaper cannot reclaim a creating map before producer access ends. */
++	if (WARN_ON(!r->map)) {
++		spin_unlock_irqrestore(&lease->lock, flags);
++		mutex_unlock(&ghsm_lock);
++		return;
++	}
++	r->map->creating = false;
++	if (lease->core.sealed) {
++		r->map->dying = true;
++		r->map->retries = 0;
++		vm_file = r->map->vm_file;
++		r->map->vm_file = NULL;
++	}
++	r->reclaiming = false;
++	spin_unlock_irqrestore(&lease->lock, flags);
++	mutex_unlock(&ghsm_lock);
++	if (vm_file)
++		fput(vm_file);
++	/* r may now be reclaimed/acknowledged; do not dereference it again. */
++	spin_lock_irqsave(&lease->lock, flags);
++	WARN_ON(!ghsm_lease_core_end_share(&lease->core));
++	spin_unlock_irqrestore(&lease->lock, flags);
++	wake_up_interruptible(&lease->wait);
++	ghsm_lease_schedule_reaper();
++}
++
++static int ghsm_lease_seal(struct ghsm_lease *lease)
++{
++	struct ghsm_receipt *r;
++	struct ghsm_map *m;
++	struct file *file;
++	unsigned long flags;
++
++	mutex_lock(&ghsm_lock);
++	spin_lock_irqsave(&lease->lock, flags);
++	if (!ghsm_lease_core_seal(&lease->core)) {
++		int ret = lease->core.sealing ? -EAGAIN : 0;
++
++		spin_unlock_irqrestore(&lease->lock, flags);
++		mutex_unlock(&ghsm_lock);
++		return ret;
++	}
++	file = lease->vm_file;
++	lease->vm_file = NULL;
++	spin_unlock_irqrestore(&lease->lock, flags);
++	list_for_each_entry(m, &ghsm_maps, node)
++		if (m->lease == lease) {
++			m->dying = true;
++			if (!m->reset_failed)
++				m->retries = 0;
++		}
++	mutex_unlock(&ghsm_lock);
++	if (file)
++		fput(file);
++	/* Receipts cover listed, creating and temporarily detached reclaimers.
++	 * Transfer each VM ref under its owning lock, then fput outside it. */
++	for (;;) {
++		file = NULL;
++		spin_lock_irqsave(&lease->lock, flags);
++		list_for_each_entry(r, &lease->receipts, node)
++			if (r->map && r->map->vm_file) {
++				file = r->map->vm_file;
++				r->map->vm_file = NULL;
++				break;
++			}
++		spin_unlock_irqrestore(&lease->lock, flags);
++		if (!file)
++			break;
++		fput(file);
++	}
++	spin_lock_irqsave(&lease->lock, flags);
++	ghsm_lease_core_seal_done(&lease->core);
++	spin_unlock_irqrestore(&lease->lock, flags);
++	wake_up_interruptible(&lease->wait);
++	ghsm_lease_schedule_reaper();
++	return 0;
++}
++
++static int ghsm_lease_unshare(struct ghsm_lease *lease, u64 id)
++{
++	struct ghsm_receipt *r;
++	struct ghsm_map *m;
++	unsigned long flags;
++	int ret;
++
++	mutex_lock(&ghsm_lock);
++	spin_lock_irqsave(&lease->lock, flags);
++	r = ghsm_lease_find_locked(lease, id);
++	if (!r) {
++		spin_unlock_irqrestore(&lease->lock, flags);
++		mutex_unlock(&ghsm_lock);
++		return -ENOENT; /* unknown is never a completion ack */
++	}
++	if (r->completed) {
++		list_del(&r->node);
++		spin_unlock_irqrestore(&lease->lock, flags);
++		mutex_unlock(&ghsm_lock);
++		kfree(r);
++		return 0;
++	}
++	if (r->reclaiming || !r->map) {
++		spin_unlock_irqrestore(&lease->lock, flags);
++		mutex_unlock(&ghsm_lock);
++		return -EAGAIN;
++	}
++	m = r->map;
++	if (m->reset_failed) {
++		spin_unlock_irqrestore(&lease->lock, flags);
++		mutex_unlock(&ghsm_lock);
++		return -EIO;
++	}
++	if (r->stalled) {
++		WARN_ON(!ghsm_lease_core_retry(&lease->core));
++		r->stalled = false;
++	}
++	r->reclaiming = true;
++	m->dying = true;
++	m->retries = 0;
++	list_del_init(&m->node);
++	spin_unlock_irqrestore(&lease->lock, flags);
++	mutex_unlock(&ghsm_lock);
++	ret = ghsm_try_destroy(m);
++	if (ret) {
++		mutex_lock(&ghsm_lock);
++		list_add_tail(&m->node, &ghsm_maps);
++		ghsm_lease_requeued(m);
++		mutex_unlock(&ghsm_lock);
++		ghsm_lease_schedule_reaper();
++		return ret;
++	}
++	/* The local reclaim really completed. Another ack may already consume
++	 * the receipt, so find it again rather than reuse an old pointer. */
++	spin_lock_irqsave(&lease->lock, flags);
++	r = ghsm_lease_find_locked(lease, id);
++	if (r && r->completed)
++		list_del(&r->node);
++	else
++		r = NULL;
++	spin_unlock_irqrestore(&lease->lock, flags);
++	kfree(r);
++	return 0;
++}
++
++static long ghsm_lease_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct ghsm_lease *lease = file->private_data;
++	unsigned long flags;
++
++	switch (cmd) {
++	case GHSM_SEAL_VM_LEASE:
++		return ghsm_lease_seal(lease);
++	case GHSM_QUERY_VM_LEASE: {
++		struct ghsm_vm_lease_status status;
++
++		spin_lock_irqsave(&lease->lock, flags);
++		status.version = GHSM_LEASE_ABI_VERSION;
++		status.state = ghsm_lease_core_state(&lease->core);
++		status.generation = lease->generation;
++		status.owned_maps = lease->core.owned_maps;
++		status.inflight_shares = lease->core.inflight_shares;
++		status.last_errno = lease->core.last_errno;
++		spin_unlock_irqrestore(&lease->lock, flags);
++		return copy_to_user((void __user *)arg, &status, sizeof(status)) ? -EFAULT : 0;
++	}
++	case GHSM_UNSHARE_LEASE_PARCEL: {
++		struct ghsm_unshare_lease_parcel request;
++
++		if (copy_from_user(&request, (void __user *)arg, sizeof(request)))
++			return -EFAULT;
++		return ghsm_lease_unshare(lease, request.parcel_id);
++	}
++	default:
++		return -ENOTTY;
++	}
++}
++
++static __poll_t ghsm_lease_poll(struct file *file, poll_table *wait)
++{
++	struct ghsm_lease *lease = file->private_data;
++	unsigned long flags;
++	u32 state;
++
++	poll_wait(file, &lease->wait, wait);
++	spin_lock_irqsave(&lease->lock, flags);
++	state = ghsm_lease_core_state(&lease->core);
++	spin_unlock_irqrestore(&lease->lock, flags);
++	if (state == GHSM_LEASE_COMPLETE)
++		return EPOLLIN | EPOLLRDNORM;
++	if (state == GHSM_LEASE_STALLED)
++		return EPOLLERR;
++	return 0;
++}
++
++static int ghsm_lease_file_release(struct inode *inode, struct file *file)
++{
++	struct ghsm_lease *lease = file->private_data;
++
++	(void)inode;
++	ghsm_lease_seal(lease);
++	kref_put(&lease->refs, ghsm_lease_release_ref);
++	return 0;
++}
++
++static const struct file_operations ghsm_lease_fops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = ghsm_lease_ioctl,
++	.compat_ioctl = ghsm_lease_ioctl,
++	.poll = ghsm_lease_poll,
++	.release = ghsm_lease_file_release,
++};
++
++static int ghsm_open_vm_lease(int vm_fd)
++{
++	struct file *vm_file = NULL;
++	struct ghsm_lease *lease;
++	void *ghvm;
++	int fd;
++
++	ghvm = ghsm_get_ghvm(vm_fd, &vm_file);
++	if (!ghvm)
++		return -EINVAL;
++	lease = kzalloc(sizeof(*lease), GFP_KERNEL);
++	if (!lease) {
++		fput(vm_file);
++		return -ENOMEM;
++	}
++	kref_init(&lease->refs);
++	spin_lock_init(&lease->lock);
++	INIT_LIST_HEAD(&lease->receipts);
++	init_waitqueue_head(&lease->wait);
++	lease->vm_file = vm_file; /* exact OPEN VM identity, no post-seal VM ref */
++	__module_get(THIS_MODULE); /* maps keep code alive even after fd release */
++	mutex_lock(&ghsm_lock);
++	if (ghsm_lease_generation == U64_MAX) {
++		mutex_unlock(&ghsm_lock);
++		kref_put(&lease->refs, ghsm_lease_release_ref);
++		return -EOVERFLOW;
++	}
++	lease->generation = ++ghsm_lease_generation;
++	mutex_unlock(&ghsm_lock);
++	fd = anon_inode_getfd("gunyah-share-lease", &ghsm_lease_fops, lease,
++			      O_RDWR | O_CLOEXEC);
++	if (fd < 0)
++		kref_put(&lease->refs, ghsm_lease_release_ref);
++	return fd;
++}
+diff --git a/ghsm_lease_state.h b/ghsm_lease_state.h
+new file mode 100644
+--- /dev/null
++++ b/ghsm_lease_state.h
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef GHSM_LEASE_STATE_H
++#define GHSM_LEASE_STATE_H
++
++#include "ghsm_lease_uapi.h"
++#ifndef __KERNEL__
++#include <stdbool.h>
++#endif
++
++/* All operations require the owning session lock. No clocks or list counts
++ * enter completion: maps are charged until their actual resources are free. */
++struct ghsm_lease_core {
++	__u64 owned_maps;
++	__u64 stalled_maps;
++	__u32 inflight_shares;
++	bool sealed;
++	bool sealing;
++	__s32 last_errno;
++};
++
++static inline __u32 ghsm_lease_core_state(const struct ghsm_lease_core *c)
++{
++	if (!c->sealed)
++		return GHSM_LEASE_OPEN;
++	if (!c->sealing && !c->inflight_shares && !c->owned_maps)
++		return GHSM_LEASE_COMPLETE;
++	if (c->stalled_maps)
++		return GHSM_LEASE_STALLED;
++	return GHSM_LEASE_CLOSING;
++}
++
++static inline bool ghsm_lease_core_begin_share(struct ghsm_lease_core *c)
++{
++	if (c->sealed || c->inflight_shares == (__u32)~0U)
++		return false;
++	c->inflight_shares++;
++	return true;
++}
++
++static inline bool ghsm_lease_core_end_share(struct ghsm_lease_core *c)
++{
++	if (!c->inflight_shares)
++		return false;
++	c->inflight_shares--;
++	return true;
++}
++
++static inline void ghsm_lease_core_map_add(struct ghsm_lease_core *c)
++{
++	c->owned_maps++;
++}
++
++static inline bool ghsm_lease_core_map_free(struct ghsm_lease_core *c, bool stalled)
++{
++	if (!c->owned_maps || (stalled && !c->stalled_maps))
++		return false;
++	c->owned_maps--;
++	if (stalled)
++		c->stalled_maps--;
++	if (!c->owned_maps)
++		c->last_errno = 0;
++	return true;
++}
++
++static inline void ghsm_lease_core_stall(struct ghsm_lease_core *c, int error)
++{
++	c->stalled_maps++;
++	c->last_errno = error;
++}
++
++static inline bool ghsm_lease_core_retry(struct ghsm_lease_core *c)
++{
++	if (!c->stalled_maps)
++		return false;
++	c->stalled_maps--;
++	return true;
++}
++
++static inline bool ghsm_lease_core_seal(struct ghsm_lease_core *c)
++{
++	if (c->sealed)
++		return false;
++	c->sealed = true;
++	c->sealing = true;
++	return true;
++}
++
++static inline void ghsm_lease_core_seal_done(struct ghsm_lease_core *c)
++{
++	c->sealing = false;
++}
++
++#endif
+diff --git a/ghsm_lease_uapi.h b/ghsm_lease_uapi.h
+new file mode 100644
+--- /dev/null
++++ b/ghsm_lease_uapi.h
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef GHSM_LEASE_UAPI_H
++#define GHSM_LEASE_UAPI_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++#define GHSM_IOCTL_TYPE 0x47
++
++/* Existing wire layouts and ioctl numbers are unchanged. */
++struct ghsm_share_blob {
++	__s32 vm_fd;
++	__u32 label;
++	__u32 flags;
++	__u32 mem_handle;
++	__u64 guest_phys_addr;
++	__u64 memory_size;
++	__u64 userspace_addr;
++};
++#define GHSM_SHARE_BLOB _IOWR(GHSM_IOCTL_TYPE, 0x14, struct ghsm_share_blob)
++
++struct ghsm_share_dmabuf {
++	__s32 vm_fd;
++	__s32 dmabuf_fd;
++	__u32 label;
++	__u32 flags;
++	__u32 mem_handle;
++	__u32 reserved;
++	__u64 guest_phys_addr;
++	__u64 memory_size;
++	__u64 dmabuf_offset;
++};
++#define GHSM_SHARE_DMABUF _IOWR(GHSM_IOCTL_TYPE, 0x16, struct ghsm_share_dmabuf)
++
++struct ghsm_unshare_blob {
++	__s32 vm_fd;
++	__u32 label;
++};
++#define GHSM_UNSHARE_BLOB _IOW(GHSM_IOCTL_TYPE, 0x15, struct ghsm_unshare_blob)
++
++#define GHSM_LEASE_ABI_VERSION 1
++#define GHSM_CAP_VM_LEASE_FD             (1ULL << 0)
++#define GHSM_CAP_SEAL_DROPS_VM_REFS      (1ULL << 1)
++#define GHSM_CAP_COMPLETE_AFTER_UNPIN   (1ULL << 2)
++#define GHSM_CAP_PARCEL_COMPLETION_ID   (1ULL << 3)
++#define GHSM_LEASE_REQUIRED_FEATURES    0xFULL
++
++struct ghsm_lease_caps {
++	__u32 version;
++	__u32 reserved;
++	__u64 features;
++};
++#define GHSM_GET_LEASE_CAPS _IOR(GHSM_IOCTL_TYPE, 0x20, struct ghsm_lease_caps)
++
++/* Returns a nonnegative O_CLOEXEC lease fd, not an ordinary 0/errno ack. */
++struct ghsm_open_vm_lease {
++	__s32 vm_fd;
++	__u32 flags; /* must be zero */
++};
++#define GHSM_OPEN_VM_LEASE _IOW(GHSM_IOCTL_TYPE, 0x21, struct ghsm_open_vm_lease)
++
++struct ghsm_share_blob_lease {
++	struct ghsm_share_blob blob;
++	__s32 lease_fd;
++	__u32 reserved; /* must be zero */
++	__u64 parcel_id; /* output: monotonic identity within this lease */
++};
++#define GHSM_SHARE_BLOB_LEASE _IOWR(GHSM_IOCTL_TYPE, 0x22, struct ghsm_share_blob_lease)
++
++struct ghsm_share_dmabuf_lease {
++	struct ghsm_share_dmabuf blob;
++	__s32 lease_fd;
++	__u32 reserved; /* must be zero; blob.reserved must also be zero */
++	__u64 parcel_id;
++};
++#define GHSM_SHARE_DMABUF_LEASE _IOWR(GHSM_IOCTL_TYPE, 0x23, struct ghsm_share_dmabuf_lease)
++
++enum ghsm_lease_state {
++	GHSM_LEASE_OPEN = 1,
++	GHSM_LEASE_CLOSING = 2,
++	GHSM_LEASE_COMPLETE = 3,
++	GHSM_LEASE_STALLED = 4, /* resources remain owned; never a success */
++};
++
++/* Admission fence/ref drop only. It does not acknowledge RM/unpin completion. */
++#define GHSM_SEAL_VM_LEASE _IO(GHSM_IOCTL_TYPE, 0x24)
++
++struct ghsm_vm_lease_status {
++	__u32 version;
++	__u32 state;
++	__u64 generation;
++	__u64 owned_maps;
++	__u32 inflight_shares;
++	__s32 last_errno;
++};
++#define GHSM_QUERY_VM_LEASE _IOR(GHSM_IOCTL_TYPE, 0x25, struct ghsm_vm_lease_status)
++
++/* 0 only after this exact parcel has been reclaimed and resource-free.
++ * Pending/reclaiming: -EAGAIN or the RM errno. Unknown/retired: -ENOENT.
++ * Every nonzero return leaves completion unconfirmed; retain the backing. */
++struct ghsm_unshare_lease_parcel {
++	__u64 parcel_id;
++};
++#define GHSM_UNSHARE_LEASE_PARCEL _IOW(GHSM_IOCTL_TYPE, 0x26, struct ghsm_unshare_lease_parcel)
++
++#endif
+diff --git a/gunyah_share_mod.c b/gunyah_share_mod.c
+--- a/gunyah_share_mod.c
++++ b/gunyah_share_mod.c
+@@ -48,36 +48,13 @@
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/scatterlist.h>
++#include <linux/anon_inodes.h>
++#include <linux/kref.h>
++#include <linux/poll.h>
+ 
+ /* ---- UAPI (inlined; must match crosvm gunyah_sys bindings + l233 uapi) ---- */
+-#define GHSM_IOCTL_TYPE 0x47 /* 'G' */
+-struct ghsm_share_blob {
+-	__s32 vm_fd;
+-	__u32 label;
+-	__u32 flags;
+-	__u32 mem_handle;
+-	__u64 guest_phys_addr;
+-	__u64 memory_size;
+-	__u64 userspace_addr;
+-};
+-#define GHSM_SHARE_BLOB _IOWR(GHSM_IOCTL_TYPE, 0x14, struct ghsm_share_blob)
+-struct ghsm_share_dmabuf {
+-	__s32 vm_fd;
+-	__s32 dmabuf_fd;
+-	__u32 label;
+-	__u32 flags;
+-	__u32 mem_handle;
+-	__u32 reserved;
+-	__u64 guest_phys_addr;
+-	__u64 memory_size;
+-	__u64 dmabuf_offset;
+-};
+-#define GHSM_SHARE_DMABUF _IOWR(GHSM_IOCTL_TYPE, 0x16, struct ghsm_share_dmabuf)
+-struct ghsm_unshare_blob {
+-	__s32 vm_fd;
+-	__u32 label;
+-};
+-#define GHSM_UNSHARE_BLOB _IOW(GHSM_IOCTL_TYPE, 0x15, struct ghsm_unshare_blob)
++#include "ghsm_lease_uapi.h"
++#include "ghsm_lease_state.h"
+ 
+ /* ---- vendored 6.6 RM types (match include/linux/gunyah.h @ 6.6.118) ---- */
+ enum gunyah_rm_mem_type { GUNYAH_RM_MEM_TYPE_NORMAL = 0, GUNYAH_RM_MEM_TYPE_IO = 1 };
+@@ -184,6 +161,8 @@
+ }
+ 
+ /* ---- tracked live parcels (per (vm,label)) so we can reclaim + unpin ---- */
++struct ghsm_lease;
++struct ghsm_receipt;
+ struct ghsm_map {
+ 	struct list_head node;
+ 	void *ghvm;			/* struct gunyah_vm* (identity only; NEVER
+@@ -212,9 +191,17 @@
+ 	struct dma_buf_attachment *attachment;
+ 	struct sg_table *sgt;
+ 	struct gunyah_rm_mem_parcel parcel;
++	struct ghsm_lease *lease;
++	struct ghsm_receipt *receipt;
++	bool creating; /* leased SHARE still owns producer access */
+ };
+ static LIST_HEAD(ghsm_maps);
+ static DEFINE_MUTEX(ghsm_lock);
++
++/* VM/file validation and reclaim retain their original implementation. */
++static void *ghsm_get_ghvm(int vm_fd, struct file **out_file);
++static int ghsm_try_destroy(struct ghsm_map *m);
++#include "ghsm_lease_impl.c.inc"
+ 
+ static struct ghsm_map *find_map(void *ghvm, u32 label)
+ {
+@@ -230,6 +217,11 @@
+  * never unpinned (leak-over-corruption). */
+ static void ghsm_map_free(struct ghsm_map *m)
+ {
++	struct ghsm_lease *lease = m->lease;
++	struct ghsm_receipt *receipt = m->receipt;
++	struct file *vm_file = ghsm_map_take_vm_file(m);
++
++	ghsm_lease_forget_map_pointer(m);
+ 	if (m->dmabuf) {
+ 		dma_buf_unmap_attachment(m->attachment, m->sgt,
+ 					 DMA_BIDIRECTIONAL);
+@@ -238,14 +230,16 @@
+ 	} else {
+ 		unpin_user_pages(m->pages, m->npages);
+ 	}
+-	if (m->vm_file)
+-		fput(m->vm_file);
++	if (vm_file)
++		fput(vm_file);
+ 	if (p_rm_put)
+ 		p_rm_put(m->rm);
+ 	kvfree(m->pages);
+ 	kfree(m->parcel.acl_entries);
+ 	kvfree(m->parcel.mem_entries);	/* kvcalloc'd in ghsm_share() */
+ 	kfree(m);
++	if (lease)
++		ghsm_lease_map_freed(lease, receipt);
+ }
+ 
+ /* Try to reclaim a (detached) map's parcel.  0 = reclaimed and freed.  On
+@@ -254,15 +248,19 @@
+  * a later retry succeed — pages stay pinned, and the map stays allocated. */
+ static int ghsm_try_destroy(struct ghsm_map *m)
+ {
+-	int ret = p_rm_mem_reclaim(m->rm, &m->parcel);
++	struct file *vm_file;
++	int ret;
++
++	ghsm_lease_reclaim_started(m);
++	ret = p_rm_mem_reclaim(m->rm, &m->parcel);
+ 	if (ret == 0) {
+ 		ghsm_map_free(m);
+ 		return 0;
+ 	}
+-	if (m->vm_file) {
+-		fput(m->vm_file);
+-		m->vm_file = NULL;
+-	}
++	vm_file = ghsm_map_take_vm_file(m);
++	if (vm_file)
++		fput(vm_file);
++	ghsm_lease_reclaim_failed(m, ret, false);
+ 	return ret;
+ }
+ 
+@@ -271,6 +269,11 @@
+ 
+ static void ghsm_reaper(struct work_struct *work);
+ static DECLARE_DELAYED_WORK(ghsm_reaper_work, ghsm_reaper);
++
++static void ghsm_lease_schedule_reaper(void)
++{
++	schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
++}
+ 
+ /*
+  * GC tick, armed whenever any parcel exists.
+@@ -300,27 +303,37 @@
+ 	/* Pass 1: mark every parcel of an ownerless (dead-crosvm) VM dying. */
+ 	list_for_each_entry(m, &ghsm_maps, node) {
+ 		long ours = 0;
+-
+-		if (m->dying || !m->vm_file)
++		struct file *vm_file;
++
++		if (m->creating || m->dying)
++			continue;
++		vm_file = ghsm_map_get_vm_file(m);
++		if (!vm_file)
+ 			continue;
+ 		list_for_each_entry(n, &ghsm_maps, node)
+-			if (n->vm_file == m->vm_file)
++			if (ghsm_map_vm_file_equals(n, vm_file))
+ 				ours++;
+-		if (file_count(m->vm_file) > ours)
++		/* Account for this inspection reference, which also keeps the
++		 * identity alive if SEAL takes the map's original ref. */
++		if (file_count(vm_file) > ours + 1) {
++			fput(vm_file);
+ 			continue;	/* crosvm still holds the VM fd */
++		}
+ 		pr_info("VM of parcel label=%u is ownerless — reclaiming its parcels\n",
+ 			m->label);
+ 		list_for_each_entry(n, &ghsm_maps, node)
+-			if (n->vm_file == m->vm_file)
++			if (ghsm_map_vm_file_equals(n, vm_file))
+ 				n->dying = true;
++		fput(vm_file);
+ 	}
+ 
+ 	/* Pass 2: reclaim dying parcels. */
+ 	list_for_each_entry_safe(m, tmp, &ghsm_maps, node) {
+ 		u32 label = m->label;
+ 		unsigned long npages = m->npages;
+-
+-		if (!m->dying || m->retries >= GHSM_REAP_MAX_TRIES)
++		struct file *vm_file = NULL;
++
++		if (!m->dying || m->creating || m->retries >= GHSM_REAP_MAX_TRIES)
+ 			continue;
+ 
+ 		/*
+@@ -330,16 +343,26 @@
+ 		 * accepts, so the retry budget would be spent for nothing and end in
+ 		 * the same leak two minutes later. Latch it and give up now.
+ 		 */
+-		if (m->vm_file && ghvm_status(m->ghvm) == GHSM_VM_STATUS_RESET_FAILED)
++		if (m->lease) {
++			/* SEAL may release the map ref concurrently. A temporary file
++			 * ref protects the private VM state only for this inspection. */
++			vm_file = ghsm_map_get_vm_file(m);
++			if (vm_file && ghvm_status(m->ghvm) == GHSM_VM_STATUS_RESET_FAILED)
++				m->reset_failed = true;
++			if (vm_file)
++				fput(vm_file);
++		} else if (m->vm_file &&
++			   ghvm_status(m->ghvm) == GHSM_VM_STATUS_RESET_FAILED) {
+ 			m->reset_failed = true;
++		}
+ 		if (m->reset_failed) {
+ 			pr_warn("VM of parcel label=%u failed to reset — giving up now, leaking %lu pinned pages\n",
+ 				label, npages);
+ 			m->retries = GHSM_REAP_MAX_TRIES;
+-			if (m->vm_file) {
+-				fput(m->vm_file);
+-				m->vm_file = NULL;
+-			}
++			ghsm_lease_reclaim_failed(m, -EIO, true);
++			vm_file = ghsm_map_take_vm_file(m);
++			if (vm_file)
++				fput(vm_file);
+ 			continue;
+ 		}
+ 
+@@ -351,6 +374,9 @@
+ 		}
+ 		m->retries++;
+ 		list_add_tail(&m->node, &ghsm_maps);
++		ghsm_lease_requeued(m);
++		if (m->retries >= GHSM_REAP_MAX_TRIES)
++			ghsm_lease_parked(m);
+ 		if (m->retries >= GHSM_REAP_MAX_TRIES)
+ 			pr_warn("reaper giving up on parcel label=%u — leaking %lu pinned pages\n",
+ 				label, npages);
+@@ -439,11 +465,13 @@
+ /* Core: pin the userspace buffer, build a SHARE parcel (guest keeps host access),
+  * hand it to the RM, return the handle. Mirrors gunyah_gup_share_parcel. */
+ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
+-		      u32 label, u32 flags, u64 uaddr, u64 size, u32 *out_handle)
++		      u32 label, u32 flags, u64 uaddr, u64 size, u32 *out_handle,
++		      struct ghsm_receipt *receipt)
+ {
+ 	unsigned long npages, i, n_entries, entry;
+ 	struct page **pages;
+ 	struct ghsm_map *m;
++	struct file *held_vm_file;
+ 	u16 guest_vmid, host_vmid;
+ 	unsigned int gup_flags;
+ 	u64 run_size;
+@@ -493,6 +521,7 @@
+ 	if (!m) { ret = -ENOMEM; goto unpin; }
+ 	m->ghvm = ghvm; m->label = label; m->pages = pages; m->npages = npages;
+ 	m->vm_file = get_file(vmf);
++	ghsm_lease_map_attached(m, receipt);
+ 	m->rm = rm;
+ 	if (p_rm_get)
+ 		p_rm_get(rm);
+@@ -558,7 +587,10 @@
+ free_m:
+ 	if (p_rm_put)
+ 		p_rm_put(m->rm);
+-	fput(m->vm_file);
++	held_vm_file = ghsm_map_take_vm_file(m);
++	if (held_vm_file)
++		fput(held_vm_file);
++	ghsm_lease_forget_map_pointer(m);
+ 	kfree(m);
+ unpin:
+ 	unpin_user_pages(pages, pinned > 0 ? pinned : 0);
+@@ -573,12 +605,13 @@
+ static int ghsm_share_dmabuf(void *ghvm, struct file *vmf,
+ 			     struct gunyah_rm *rm, u32 label, u32 flags,
+ 			     int dmabuf_fd, u64 offset, u64 size,
+-			     u32 *out_handle)
++			     u32 *out_handle, struct ghsm_receipt *receipt)
+ {
+ 	struct dma_buf_attachment *attachment;
+ 	struct gunyah_rm_mem_entry *entries;
+ 	struct dma_buf *dmabuf;
+ 	struct ghsm_map *m;
++	struct file *held_vm_file;
+ 	struct scatterlist *sg;
+ 	u64 skip, remain;
+ 	u16 guest_vmid, host_vmid;
+@@ -683,6 +716,7 @@
+ 	m->label = label;
+ 	m->npages = size >> PAGE_SHIFT;
+ 	m->vm_file = get_file(vmf);
++	ghsm_lease_map_attached(m, receipt);
+ 	m->rm = rm;
+ 	m->dmabuf = dmabuf;
+ 	m->attachment = attachment;
+@@ -718,13 +752,15 @@
+ free_tracked:
+ 	if (p_rm_put)
+ 		p_rm_put(m->rm);
+-	fput(m->vm_file);
+-	m->vm_file = NULL;
++	held_vm_file = ghsm_map_take_vm_file(m);
++	if (held_vm_file)
++		fput(held_vm_file);
+ free_entries_dmabuf:
+ 	kvfree(entries);
+ unmap:
+ 	dma_buf_unmap_attachment(attachment, m->sgt, DMA_BIDIRECTIONAL);
+ free_m_only:
++	ghsm_lease_forget_map_pointer(m);
+ 	kfree(m);
+ detach:
+ 	dma_buf_detach(dmabuf, attachment);
+@@ -740,6 +776,10 @@
+ 
+ 	mutex_lock(&ghsm_lock);
+ 	m = find_map(ghvm, label);
++	if (m && m->creating) {
++		mutex_unlock(&ghsm_lock);
++		return -EAGAIN; /* leased SHARE producer still owns its map */
++	}
+ 	if (m)
+ 		list_del(&m->node);
+ 	mutex_unlock(&ghsm_lock);
+@@ -758,6 +798,7 @@
+ 		m->retries = 0;
+ 		m->dying = true;
+ 		list_add_tail(&m->node, &ghsm_maps);
++		ghsm_lease_requeued(m);
+ 		schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
+ 		mutex_unlock(&ghsm_lock);
+ 		return ret;
+@@ -775,6 +816,110 @@
+ 	long ret;
+ 
+ 	switch (cmd) {
++	case GHSM_GET_LEASE_CAPS: {
++		struct ghsm_lease_caps caps = {
++			.version = GHSM_LEASE_ABI_VERSION,
++			.features = GHSM_LEASE_REQUIRED_FEATURES,
++		};
++
++		return copy_to_user((void __user *)arg, &caps, sizeof(caps)) ? -EFAULT : 0;
++	}
++	case GHSM_OPEN_VM_LEASE: {
++		struct ghsm_open_vm_lease request;
++
++		if (copy_from_user(&request, (void __user *)arg, sizeof(request)))
++			return -EFAULT;
++		if (request.flags)
++			return -EINVAL;
++		return ghsm_open_vm_lease(request.vm_fd);
++	}
++	case GHSM_SHARE_BLOB_LEASE: {
++		struct ghsm_share_blob_lease b;
++		struct ghsm_lease *lease;
++		struct ghsm_receipt *receipt;
++		struct file *lease_file = NULL;
++		u32 handle = 0;
++		u64 id;
++
++		if (copy_from_user(&b, (void __user *)arg, sizeof(b)))
++			return -EFAULT;
++		if (b.reserved)
++			return -EINVAL;
++		lease = ghsm_lease_get_fd(b.lease_fd, &lease_file);
++		if (IS_ERR(lease))
++			return PTR_ERR(lease);
++		ghvm = ghsm_get_ghvm(b.blob.vm_fd, &vmf);
++		if (!ghvm) {
++			fput(lease_file);
++			return -EINVAL;
++		}
++		receipt = ghsm_lease_share_begin(lease, vmf, b.blob.label);
++		if (IS_ERR(receipt)) {
++			fput(vmf);
++			fput(lease_file);
++			return PTR_ERR(receipt);
++		}
++		id = receipt->id;
++		rm = ghvm_rm(ghvm);
++		ret = ghsm_share(ghvm, vmf, rm, b.blob.label, b.blob.flags,
++				 b.blob.userspace_addr, b.blob.memory_size, &handle, receipt);
++		if (!ret) {
++			b.blob.mem_handle = handle;
++			b.parcel_id = id;
++			ret = copy_to_user((void __user *)arg, &b, sizeof(b)) ? -EFAULT : 0;
++			/* A reply-copy failure does not erase an already shared parcel.
++			 * Its session remains charged and the error exit can seal/wait. */
++			ghsm_lease_share_finish(lease, receipt, true);
++		} else {
++			ghsm_lease_share_finish(lease, receipt, false);
++		}
++		fput(vmf);
++		fput(lease_file);
++		return ret;
++	}
++	case GHSM_SHARE_DMABUF_LEASE: {
++		struct ghsm_share_dmabuf_lease b;
++		struct ghsm_lease *lease;
++		struct ghsm_receipt *receipt;
++		struct file *lease_file = NULL;
++		u32 handle = 0;
++		u64 id;
++
++		if (copy_from_user(&b, (void __user *)arg, sizeof(b)))
++			return -EFAULT;
++		if (b.reserved || b.blob.reserved)
++			return -EINVAL;
++		lease = ghsm_lease_get_fd(b.lease_fd, &lease_file);
++		if (IS_ERR(lease))
++			return PTR_ERR(lease);
++		ghvm = ghsm_get_ghvm(b.blob.vm_fd, &vmf);
++		if (!ghvm) {
++			fput(lease_file);
++			return -EINVAL;
++		}
++		receipt = ghsm_lease_share_begin(lease, vmf, b.blob.label);
++		if (IS_ERR(receipt)) {
++			fput(vmf);
++			fput(lease_file);
++			return PTR_ERR(receipt);
++		}
++		id = receipt->id;
++		rm = ghvm_rm(ghvm);
++		ret = ghsm_share_dmabuf(ghvm, vmf, rm, b.blob.label, b.blob.flags,
++					b.blob.dmabuf_fd, b.blob.dmabuf_offset,
++					b.blob.memory_size, &handle, receipt);
++		if (!ret) {
++			b.blob.mem_handle = handle;
++			b.parcel_id = id;
++			ret = copy_to_user((void __user *)arg, &b, sizeof(b)) ? -EFAULT : 0;
++			ghsm_lease_share_finish(lease, receipt, true);
++		} else {
++			ghsm_lease_share_finish(lease, receipt, false);
++		}
++		fput(vmf);
++		fput(lease_file);
++		return ret;
++	}
+ 	case GHSM_SHARE_BLOB: {
+ 		struct ghsm_share_blob b;
+ 		u32 handle = 0;
+@@ -784,7 +929,7 @@
+ 		if (!ghvm) return -EINVAL;
+ 		rm = ghvm_rm(ghvm);
+ 		ret = ghsm_share(ghvm, vmf, rm, b.label, b.flags,
+-				 b.userspace_addr, b.memory_size, &handle);
++				 b.userspace_addr, b.memory_size, &handle, NULL);
+ 		fput(vmf);
+ 		if (ret) return ret;
+ 		b.mem_handle = handle;
+@@ -805,7 +950,7 @@
+ 		rm = ghvm_rm(ghvm);
+ 		ret = ghsm_share_dmabuf(ghvm, vmf, rm, b.label, b.flags,
+ 					b.dmabuf_fd, b.dmabuf_offset,
+-					b.memory_size, &handle);
++					b.memory_size, &handle, NULL);
+ 		fput(vmf);
+ 		if (ret)
+ 			return ret;
+@@ -865,7 +1010,7 @@
+ 		n += sysfs_emit_at(buf, n,
+ 				   "label=%u pages=%lu dying=%d retries=%d vm_held=%d reset_failed=%d\n",
+ 				   m->label, m->npages, m->dying, m->retries,
+-				   !!m->vm_file, m->reset_failed);
++				   ghsm_map_has_vm_file(m), m->reset_failed);
+ 	}
+ 	mutex_unlock(&ghsm_lock);
+ 	return n;
+@@ -900,7 +1045,7 @@
+ 		misc_deregister(&ghsm_dev);
+ 		return ret;
+ 	}
+-	pr_info("loaded v6/dmabuf+gup (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
++	pr_info("loaded v6/dmabuf+gup lease-abi=1 (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
+ 		p_rm_mem_share, p_rm_mem_reclaim, !!p_rm_get, vmid_off, rm_off);
+ 	return 0;
+ }
+@@ -921,12 +1066,13 @@
+ 	 * a deferred fput would not run until this syscall returns and the
+ 	 * retry loop below would never see the reclaim unblock. */
+ 	list_for_each_entry(m, &all, node) {
+-		if (m->vm_file) {
++		struct file *vm_file = ghsm_map_take_vm_file(m);
++
++		if (vm_file) {
+ 			if (p_fput_sync)
+-				p_fput_sync(m->vm_file);
++				p_fput_sync(vm_file);
+ 			else
+-				fput(m->vm_file);
+-			m->vm_file = NULL;
++				fput(vm_file);
+ 		}
+ 	}
+ 
+@@ -959,4 +1105,4 @@
+ module_exit(ghsm_exit);
+ MODULE_LICENSE("GPL");
+ MODULE_IMPORT_NS(DMA_BUF);
+-MODULE_DESCRIPTION("Standalone runtime SHARE_BLOB/DMABUF for upstream gunyah 6.6 (GuestAccept)");
++MODULE_DESCRIPTION("Runtime SHARE_BLOB/DMABUF with VM-owned completion leases for upstream gunyah 6.6");
+diff --git a/tests/Makefile b/tests/Makefile
+new file mode 100644
+--- /dev/null
++++ b/tests/Makefile
+@@ -0,0 +1,22 @@
++CC ?= cc
++COMMON = -std=gnu11 -O1 -g -Wall -Wextra -Werror -pthread
++
++lease_harness: lease_harness.c ../ghsm_lease_state.h ../ghsm_lease_uapi.h
++	$(CC) $(COMMON) -fsanitize=address,undefined -o $@ lease_harness.c
++
++lease_race_harness: lease_harness.c ../ghsm_lease_state.h ../ghsm_lease_uapi.h
++	$(CC) $(COMMON) -fsanitize=thread -o $@ lease_harness.c
++
++lease_impl_harness: lease_impl_harness.c ../ghsm_lease_impl.c.inc ../ghsm_lease_state.h ../ghsm_lease_uapi.h
++	$(CC) $(COMMON) -Wno-unused-function -fsanitize=address,undefined -o $@ lease_impl_harness.c
++
++lease_impl_race_harness: lease_impl_harness.c ../ghsm_lease_impl.c.inc ../ghsm_lease_state.h ../ghsm_lease_uapi.h
++	$(CC) $(COMMON) -Wno-unused-function -fsanitize=thread -o $@ lease_impl_harness.c
++
++test: lease_harness lease_race_harness lease_impl_harness lease_impl_race_harness
++	./lease_harness
++	TSAN_OPTIONS=halt_on_error=1 ./lease_race_harness
++	./lease_impl_harness
++	TSAN_OPTIONS=halt_on_error=1 ./lease_impl_race_harness
++
++.PHONY: test
+diff --git a/tests/README.md b/tests/README.md
+new file mode 100644
+--- /dev/null
++++ b/tests/README.md
+@@ -0,0 +1,7 @@
++The harness includes the production `ghsm_lease_state.h` and `ghsm_lease_uapi.h` directly. Each state mutation runs under the fixture session lock. Allocated heap objects model RM parcels, GUP pins, DMA attachments and a VM reference; ownership is discharged through the production helper only after those objects are actually freed.
++
++Cases cover normal completion, sealing while admitted work remains, partial SHARE failure after pinning, reaper list removal, RM errors, explicit retries, repeated seal/cancel, independent sessions and a pthread-barrier race between an admitted SHARE and sealing. Static assertions pin legacy and leased wire sizes, field offsets, state values and ioctl encodings, including the exact-parcel receipt request.
++
++`make test` on Linux runs the same production-boundary scenarios with ASan/UBSan and separately with TSan. A local NDK `-fsyntax-only` check establishes C syntax and target ABI layout only.
++
++This fixture does not execute Gunyah ioctls, real RM calls, GUP/unpin, DMA-BUF operations, module lifecycle, a guest or the production driver's deferred work. Passing it does not establish real-kernel completion or provider compatibility. The real counter/lock/defer/receipt wiring requires its own source review and target verification.
+diff --git a/tests/lease_harness.c b/tests/lease_harness.c
+new file mode 100644
+--- /dev/null
++++ b/tests/lease_harness.c
+@@ -0,0 +1,499 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Userspace tests of the production caller-lock state helpers and wire ABI.
++ * Heap objects model RM parcels, GUP pins and DMA attachments. They must be
++ * freed before map_free can discharge ownership. This is not a kernel/VM test.
++ */
++#include <errno.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../ghsm_lease_state.h"
++
++#define ABI_SIZE(type, size) _Static_assert(sizeof(struct type) == (size), #type " size")
++#define ABI_OFFSET(type, field, offset) _Static_assert(offsetof(struct type, field) == (offset), #type "." #field " offset")
++ABI_SIZE(ghsm_share_blob, 40);
++ABI_SIZE(ghsm_share_dmabuf, 48);
++ABI_SIZE(ghsm_unshare_blob, 8);
++ABI_SIZE(ghsm_lease_caps, 16);
++ABI_SIZE(ghsm_open_vm_lease, 8);
++ABI_SIZE(ghsm_share_blob_lease, 56);
++ABI_SIZE(ghsm_share_dmabuf_lease, 64);
++ABI_SIZE(ghsm_vm_lease_status, 32);
++ABI_SIZE(ghsm_unshare_lease_parcel, 8);
++ABI_OFFSET(ghsm_share_blob, vm_fd, 0);
++ABI_OFFSET(ghsm_share_blob, mem_handle, 12);
++ABI_OFFSET(ghsm_share_blob, guest_phys_addr, 16);
++ABI_OFFSET(ghsm_share_blob, memory_size, 24);
++ABI_OFFSET(ghsm_share_blob, userspace_addr, 32);
++ABI_OFFSET(ghsm_share_dmabuf, dmabuf_fd, 4);
++ABI_OFFSET(ghsm_share_dmabuf, reserved, 20);
++ABI_OFFSET(ghsm_share_dmabuf, guest_phys_addr, 24);
++ABI_OFFSET(ghsm_share_dmabuf, dmabuf_offset, 40);
++ABI_OFFSET(ghsm_lease_caps, features, 8);
++ABI_OFFSET(ghsm_open_vm_lease, flags, 4);
++ABI_OFFSET(ghsm_share_blob_lease, lease_fd, 40);
++ABI_OFFSET(ghsm_share_blob_lease, reserved, 44);
++ABI_OFFSET(ghsm_share_blob_lease, parcel_id, 48);
++ABI_OFFSET(ghsm_share_dmabuf_lease, lease_fd, 48);
++ABI_OFFSET(ghsm_share_dmabuf_lease, reserved, 52);
++ABI_OFFSET(ghsm_share_dmabuf_lease, parcel_id, 56);
++ABI_OFFSET(ghsm_vm_lease_status, generation, 8);
++ABI_OFFSET(ghsm_vm_lease_status, owned_maps, 16);
++ABI_OFFSET(ghsm_vm_lease_status, inflight_shares, 24);
++ABI_OFFSET(ghsm_vm_lease_status, last_errno, 28);
++_Static_assert(GHSM_SHARE_BLOB == 0xc0284714U, "legacy blob ioctl unchanged");
++_Static_assert(GHSM_UNSHARE_BLOB == 0x40084715U, "legacy unshare ioctl unchanged");
++_Static_assert(GHSM_SHARE_DMABUF == 0xc0304716U, "legacy dmabuf ioctl unchanged");
++_Static_assert(GHSM_GET_LEASE_CAPS == 0x80104720U, "caps ioctl");
++_Static_assert(GHSM_OPEN_VM_LEASE == 0x40084721U, "open ioctl returns fd separately");
++_Static_assert(GHSM_SHARE_BLOB_LEASE == 0xc0384722U, "leased blob ioctl");
++_Static_assert(GHSM_SHARE_DMABUF_LEASE == 0xc0404723U, "leased dmabuf ioctl");
++_Static_assert(GHSM_SEAL_VM_LEASE == 0x00004724U, "seal has no payload or completion ack");
++_Static_assert(GHSM_QUERY_VM_LEASE == 0x80204725U, "query ioctl");
++_Static_assert(GHSM_UNSHARE_LEASE_PARCEL == 0x40084726U, "exact parcel unshare ioctl");
++_Static_assert(GHSM_LEASE_ABI_VERSION == 1 && GHSM_LEASE_REQUIRED_FEATURES == 0xFULL,
++               "version and required capability mask");
++_Static_assert(GHSM_LEASE_OPEN == 1 && GHSM_LEASE_CLOSING == 2 &&
++               GHSM_LEASE_COMPLETE == 3 && GHSM_LEASE_STALLED == 4, "wire state values");
++
++static atomic_uint failures;
++#define CHECK(condition, ...) do { \
++    if (!(condition)) { \
++        atomic_fetch_add_explicit(&failures, 1, memory_order_relaxed); \
++        fprintf(stderr, "FAIL %s:%d (%s): ", __FILE__, __LINE__, #condition); \
++        fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); \
++    } \
++} while (0)
++
++static void require(bool condition)
++{
++    if (!condition) {
++        fputs("test fixture allocation or pthread operation failed\n", stderr);
++        abort();
++    }
++}
++
++struct fake_map;
++struct session {
++    pthread_mutex_t lock;
++    struct ghsm_lease_core core;
++    struct fake_map *listed;
++    void *vm_reference;
++};
++
++struct admitted_share {
++    struct session *session;
++    bool active;
++};
++
++struct fake_map {
++    struct session *session;
++    struct fake_map *next;
++    bool linked;
++    bool stalled;
++    void *rm_parcel;
++    void *gup_pages;
++    void *dma_attachment;
++};
++
++static void lock(struct session *s) { require(pthread_mutex_lock(&s->lock) == 0); }
++static void unlock(struct session *s) { require(pthread_mutex_unlock(&s->lock) == 0); }
++
++static void session_init(struct session *s)
++{
++    memset(s, 0, sizeof(*s));
++    require(pthread_mutex_init(&s->lock, NULL) == 0);
++    s->vm_reference = malloc(1);
++    require(s->vm_reference != NULL);
++}
++
++static struct admitted_share begin_share(struct session *s)
++{
++    struct admitted_share share = { .session = s };
++    lock(s);
++    share.active = ghsm_lease_core_begin_share(&s->core);
++    unlock(s);
++    return share;
++}
++
++static bool end_share(struct admitted_share *share)
++{
++    bool ended;
++    if (!share->active)
++        return false;
++    lock(share->session);
++    ended = ghsm_lease_core_end_share(&share->session->core);
++    unlock(share->session);
++    if (ended)
++        share->active = false;
++    return ended;
++}
++
++static struct fake_map *allocate_pinned_map(struct admitted_share *share, bool dma)
++{
++    struct fake_map *m;
++    require(share->active);
++    m = calloc(1, sizeof(*m));
++    require(m != NULL);
++    m->session = share->session;
++    m->gup_pages = malloc(128);
++    require(m->gup_pages != NULL);
++    if (dma) {
++        m->dma_attachment = malloc(1);
++        require(m->dma_attachment != NULL);
++    }
++    lock(m->session);
++    ghsm_lease_core_map_add(&m->session->core);
++    unlock(m->session);
++    return m;
++}
++
++static void rm_share_and_link(struct fake_map *m)
++{
++    require(m->rm_parcel == NULL && !m->linked);
++    m->rm_parcel = malloc(1);
++    require(m->rm_parcel != NULL);
++    lock(m->session);
++    m->next = m->session->listed;
++    m->session->listed = m;
++    m->linked = true;
++    unlock(m->session);
++}
++
++/* List removal changes discovery only, never the production ownership charge. */
++static void unlink_for_reaper(struct fake_map *m)
++{
++    struct fake_map **cursor;
++    lock(m->session);
++    cursor = &m->session->listed;
++    while (*cursor && *cursor != m)
++        cursor = &(*cursor)->next;
++    require(*cursor == m);
++    *cursor = m->next;
++    m->next = NULL;
++    m->linked = false;
++    unlock(m->session);
++}
++
++static bool reclaim_rm(struct fake_map *m, int result)
++{
++    require(!m->linked && m->rm_parcel != NULL);
++    if (result) {
++        lock(m->session);
++        if (!m->stalled) {
++            ghsm_lease_core_stall(&m->session->core, result);
++            m->stalled = true;
++        }
++        unlock(m->session);
++        return false;
++    }
++    free(m->rm_parcel);
++    m->rm_parcel = NULL;
++    return true;
++}
++
++static bool explicitly_retry(struct fake_map *m)
++{
++    bool retry = false;
++    lock(m->session);
++    if (m->stalled) {
++        retry = ghsm_lease_core_retry(&m->session->core);
++        if (retry)
++            m->stalled = false;
++    }
++    unlock(m->session);
++    return retry;
++}
++
++static void unpin_and_detach(struct fake_map *m)
++{
++    require(!m->linked && m->rm_parcel == NULL);
++    free(m->gup_pages);
++    m->gup_pages = NULL;
++    free(m->dma_attachment);
++    m->dma_attachment = NULL;
++}
++
++static bool resource_free(struct fake_map *m)
++{
++    struct session *s = m->session;
++    bool stalled = m->stalled;
++    bool freed;
++    if (m->linked || m->rm_parcel || m->gup_pages || m->dma_attachment)
++        return false;
++    free(m);  /* The concrete map and all its resource objects are gone first. */
++    lock(s);
++    freed = ghsm_lease_core_map_free(&s->core, stalled);
++    unlock(s);
++    return freed;
++}
++
++static bool begin_seal(struct session *s)
++{
++    bool begun;
++    lock(s);
++    begun = ghsm_lease_core_seal(&s->core);
++    unlock(s);
++    return begun;
++}
++
++static void drop_vm_reference_and_finish_seal(struct session *s)
++{
++    void *reference;
++    lock(s);
++    reference = s->vm_reference;
++    s->vm_reference = NULL;
++    unlock(s);
++    free(reference);  /* Model the actual reference drop before seal_done. */
++    lock(s);
++    ghsm_lease_core_seal_done(&s->core);
++    unlock(s);
++}
++
++/* Cancellation has no separate completion operation: it is the same seal
++ * admission fence used when the caller closes an observer. It frees no map. */
++static void cancel_admission(struct session *s)
++{
++    if (begin_seal(s))
++        drop_vm_reference_and_finish_seal(s);
++}
++
++static void expect(struct session *s, __u32 state, __u64 owned, __u32 inflight, __u64 stalled)
++{
++    struct ghsm_lease_core snapshot;
++    lock(s);
++    snapshot = s->core;
++    unlock(s);
++    CHECK(ghsm_lease_core_state(&snapshot) == state && snapshot.owned_maps == owned &&
++          snapshot.inflight_shares == inflight && snapshot.stalled_maps == stalled,
++          "state=%u owned=%llu inflight=%u stalled=%llu; expected %u/%llu/%u/%llu",
++          ghsm_lease_core_state(&snapshot), (unsigned long long)snapshot.owned_maps,
++          snapshot.inflight_shares, (unsigned long long)snapshot.stalled_maps,
++          state, (unsigned long long)owned, inflight, (unsigned long long)stalled);
++}
++
++static void session_destroy(struct session *s)
++{
++    expect(s, GHSM_LEASE_COMPLETE, 0, 0, 0);
++    require(s->listed == NULL && s->vm_reference == NULL);
++    require(pthread_mutex_destroy(&s->lock) == 0);
++}
++
++static void test_normal_completion(void)
++{
++    struct session s;
++    struct admitted_share share;
++    struct fake_map *m;
++    session_init(&s);
++    share = begin_share(&s);
++    CHECK(share.active, "open session admits share");
++    m = allocate_pinned_map(&share, true);
++    rm_share_and_link(m);
++    CHECK(end_share(&share), "accepted share leaves admission");
++    CHECK(begin_seal(&s), "first seal starts");
++    expect(&s, GHSM_LEASE_CLOSING, 1, 0, 0);
++    drop_vm_reference_and_finish_seal(&s);
++    unlink_for_reaper(m);
++    expect(&s, GHSM_LEASE_CLOSING, 1, 0, 0);
++    CHECK(!resource_free(m), "list_del cannot complete an RM parcel with pins");
++    CHECK(reclaim_rm(m, 0), "RM accepted reclaim");
++    expect(&s, GHSM_LEASE_CLOSING, 1, 0, 0);
++    CHECK(!resource_free(m), "RM success alone cannot acknowledge unpin");
++    unpin_and_detach(m);
++    expect(&s, GHSM_LEASE_CLOSING, 1, 0, 0);
++    CHECK(resource_free(m), "resource-free map discharges actual ownership");
++    session_destroy(&s);
++}
++
++static void test_sealing_and_partial_failed_share(void)
++{
++    struct session s;
++    struct admitted_share share;
++    struct fake_map *m;
++    session_init(&s);
++    share = begin_share(&s);
++    CHECK(share.active, "share admission precedes a seal");
++    CHECK(begin_seal(&s), "seal starts while admitted share is in progress");
++    CHECK(!begin_share(&s).active, "sealed session rejects subsequent admission");
++    expect(&s, GHSM_LEASE_CLOSING, 0, 1, 0);
++    m = allocate_pinned_map(&share, false); /* GUP succeeded, RM share then failed. */
++    drop_vm_reference_and_finish_seal(&s);
++    expect(&s, GHSM_LEASE_CLOSING, 1, 1, 0);
++    CHECK(!resource_free(m), "partial share failure still owns its GUP resources");
++    unpin_and_detach(m);
++    CHECK(resource_free(m), "failed share cleanup frees its concrete resources");
++    expect(&s, GHSM_LEASE_CLOSING, 0, 1, 0);
++    CHECK(end_share(&share), "completion must also wait for the admitted call");
++    CHECK(!end_share(&share), "duplicate end cannot underflow admission");
++    session_destroy(&s);
++
++    session_init(&s);
++    CHECK(begin_seal(&s), "empty session starts sealing");
++    expect(&s, GHSM_LEASE_CLOSING, 0, 0, 0);
++    CHECK(!begin_seal(&s), "duplicate seal does not clear the sealing phase");
++    expect(&s, GHSM_LEASE_CLOSING, 0, 0, 0);
++    drop_vm_reference_and_finish_seal(&s);
++    session_destroy(&s);
++}
++
++static void test_stalled_retry_and_cancel(void)
++{
++    struct session s;
++    struct admitted_share share;
++    struct fake_map *m;
++    unsigned int i;
++    session_init(&s);
++    share = begin_share(&s);
++    m = allocate_pinned_map(&share, false);
++    rm_share_and_link(m);
++    CHECK(end_share(&share), "share ended");
++    cancel_admission(&s);
++    unlink_for_reaper(m);
++    CHECK(!reclaim_rm(m, -EAGAIN), "failed RM reclaim remains owned");
++    expect(&s, GHSM_LEASE_STALLED, 1, 0, 1);
++    CHECK(!resource_free(m) && m->rm_parcel && m->gup_pages,
++          "reaper list removal and failure leave concrete resources intact");
++    for (i = 0; i < 32; i++) {
++        cancel_admission(&s);
++        CHECK(!begin_seal(&s), "duplicate seal is idempotent");
++        expect(&s, GHSM_LEASE_STALLED, 1, 0, 1);
++    }
++    lock(&s);
++    CHECK(s.core.last_errno == -EAGAIN, "query retains the real stalled reason");
++    unlock(&s);
++    CHECK(explicitly_retry(m), "explicit retry removes only the stalled tag");
++    CHECK(!explicitly_retry(m), "retry cannot consume another map's tag");
++    expect(&s, GHSM_LEASE_CLOSING, 1, 0, 0);
++    CHECK(!reclaim_rm(m, -EIO), "another real RM failure stalls it again");
++    expect(&s, GHSM_LEASE_STALLED, 1, 0, 1);
++    CHECK(explicitly_retry(m) && reclaim_rm(m, 0), "explicit retry can eventually reclaim");
++    expect(&s, GHSM_LEASE_CLOSING, 1, 0, 0);
++    unpin_and_detach(m);
++    CHECK(resource_free(m), "retry acknowledges only after actual resource free");
++    lock(&s);
++    CHECK(s.core.last_errno == 0, "final resource free clears the last failure");
++    unlock(&s);
++    session_destroy(&s);
++}
++
++static void test_two_sessions(void)
++{
++    struct session a, b;
++    struct admitted_share sa, sb;
++    struct fake_map *ma, *mb;
++    session_init(&a);
++    session_init(&b);
++    sa = begin_share(&a);
++    sb = begin_share(&b);
++    ma = allocate_pinned_map(&sa, false);
++    mb = allocate_pinned_map(&sb, true);
++    rm_share_and_link(ma);
++    rm_share_and_link(mb);
++    CHECK(end_share(&sa) && end_share(&sb), "both independent admissions finish");
++    cancel_admission(&a);
++    unlink_for_reaper(ma);
++    CHECK(!reclaim_rm(ma, -EPERM), "only A stalls");
++    expect(&a, GHSM_LEASE_STALLED, 1, 0, 1);
++    expect(&b, GHSM_LEASE_OPEN, 1, 0, 0);
++    cancel_admission(&b);
++    unlink_for_reaper(mb);
++    CHECK(reclaim_rm(mb, 0), "B reclaims normally");
++    unpin_and_detach(mb);
++    CHECK(resource_free(mb), "B completes independently");
++    expect(&a, GHSM_LEASE_STALLED, 1, 0, 1);
++    session_destroy(&b);
++    CHECK(explicitly_retry(ma) && reclaim_rm(ma, 0), "A needs its own retry");
++    unpin_and_detach(ma);
++    CHECK(resource_free(ma), "A finally completes");
++    session_destroy(&a);
++}
++
++struct admitted_race {
++    struct session session;
++    struct fake_map *map;
++    pthread_barrier_t admitted, staged, finish;
++};
++
++static void barrier(pthread_barrier_t *b)
++{
++    int ret = pthread_barrier_wait(b);
++    require(ret == 0 || ret == PTHREAD_BARRIER_SERIAL_THREAD);
++}
++
++static void *admitted_worker(void *arg)
++{
++    struct admitted_race *r = arg;
++    struct admitted_share share = begin_share(&r->session);
++    CHECK(share.active, "race: admitted call owns its inflight charge");
++    barrier(&r->admitted);
++    /* This allocation races the seal thread's admission fence and ref drop. */
++    r->map = allocate_pinned_map(&share, true);
++    rm_share_and_link(r->map);
++    barrier(&r->staged);
++    barrier(&r->finish);
++    CHECK(end_share(&share), "race: admitted call finishes after seal");
++    return NULL;
++}
++
++static void *seal_worker(void *arg)
++{
++    struct admitted_race *r = arg;
++    barrier(&r->admitted);
++    CHECK(begin_seal(&r->session), "race: seal wins the admission fence");
++    drop_vm_reference_and_finish_seal(&r->session);
++    barrier(&r->staged);
++    return NULL;
++}
++
++static void test_seal_with_admitted_share(void)
++{
++    struct admitted_race r;
++    pthread_t share_thread, seal_thread;
++    session_init(&r.session);
++    r.map = NULL;
++    require(pthread_barrier_init(&r.admitted, NULL, 2) == 0);
++    require(pthread_barrier_init(&r.staged, NULL, 3) == 0);
++    require(pthread_barrier_init(&r.finish, NULL, 2) == 0);
++    require(pthread_create(&share_thread, NULL, admitted_worker, &r) == 0);
++    require(pthread_create(&seal_thread, NULL, seal_worker, &r) == 0);
++    barrier(&r.staged);
++    expect(&r.session, GHSM_LEASE_CLOSING, 1, 1, 0);
++    CHECK(r.map && r.map->rm_parcel && r.map->gup_pages && r.map->dma_attachment,
++          "race: resources remain real while admission has not returned");
++    CHECK(!begin_share(&r.session).active, "race: later admission is rejected");
++    barrier(&r.finish);
++    require(pthread_join(share_thread, NULL) == 0);
++    require(pthread_join(seal_thread, NULL) == 0);
++    expect(&r.session, GHSM_LEASE_CLOSING, 1, 0, 0);
++    unlink_for_reaper(r.map);
++    CHECK(reclaim_rm(r.map, 0), "race: final RM reclaim succeeds");
++    unpin_and_detach(r.map);
++    CHECK(resource_free(r.map), "race: resource free, not sealing, completes it");
++    session_destroy(&r.session);
++    require(pthread_barrier_destroy(&r.finish) == 0);
++    require(pthread_barrier_destroy(&r.staged) == 0);
++    require(pthread_barrier_destroy(&r.admitted) == 0);
++}
++
++int main(void)
++{
++    unsigned int count;
++    test_normal_completion();
++    test_sealing_and_partial_failed_share();
++    test_stalled_retry_and_cancel();
++    test_two_sessions();
++    test_seal_with_admitted_share();
++    count = atomic_load_explicit(&failures, memory_order_relaxed);
++    if (count) {
++        fprintf(stderr, "%u FAILURE(S)\n", count);
++        return 1;
++    }
++    puts("lease production-helper/UAPI harness passed; kernel VM/GUP not tested");
++    return 0;
++}
+diff --git a/tests/lease_impl_harness.c b/tests/lease_impl_harness.c
+new file mode 100644
+--- /dev/null
++++ b/tests/lease_impl_harness.c
+@@ -0,0 +1,346 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Production lease implementation over deterministic files/RM resources.
++ * This validates ownership/cancellation concurrency, not real Gunyah/GUP. */
++#define _GNU_SOURCE
++#include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/epoll.h>
++#include "../ghsm_lease_state.h"
++
++typedef uint64_t u64;
++typedef uint32_t u32;
++typedef unsigned int __poll_t;
++typedef void poll_table;
++#define __user
++#define U64_MAX UINT64_MAX
++#define U32_MAX UINT32_MAX
++#define GFP_KERNEL 0
++#define THIS_MODULE ((void *)1)
++#define ERR_PTR(n) ((void *)(intptr_t)(n))
++#define PTR_ERR(p) ((long)(intptr_t)(p))
++#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
++#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
++#define WARN_ON(c) ((c) ? (abort(), 1) : 0)
++
++struct list_head { struct list_head *next, *prev; };
++#define INIT_LIST_HEAD(h) ((h)->next = (h)->prev = (h))
++#define LIST_HEAD(n) struct list_head n = { &(n), &(n) }
++static void list_add_tail(struct list_head *n, struct list_head *h)
++{ n->prev = h->prev; n->next = h; h->prev->next = n; h->prev = n; }
++static void list_del(struct list_head *n)
++{ n->prev->next = n->next; n->next->prev = n->prev; }
++static void list_del_init(struct list_head *n) { list_del(n); INIT_LIST_HEAD(n); }
++#define list_entry(p,t,m) container_of(p,t,m)
++#define list_for_each_entry(p,h,m) \
++ for (p = list_entry((h)->next, __typeof__(*p), m); &p->m != (h); \
++      p = list_entry(p->m.next, __typeof__(*p), m))
++#define list_for_each_entry_safe(p,n,h,m) \
++ for (p = list_entry((h)->next, __typeof__(*p), m), n = list_entry(p->m.next, __typeof__(*p), m); \
++      &p->m != (h); p = n, n = list_entry(n->m.next, __typeof__(*n), m))
++
++typedef struct { atomic_flag held; } spinlock_t;
++static _Thread_local spinlock_t *current_spin;
++static void spin_lock_init(spinlock_t *l) { atomic_flag_clear(&l->held); }
++static void spin_lock(spinlock_t *l)
++{
++ assert(!current_spin);
++ while (atomic_flag_test_and_set_explicit(&l->held, memory_order_acquire)) sched_yield();
++ current_spin = l;
++}
++static void spin_unlock(spinlock_t *l)
++{ assert(current_spin == l); current_spin = NULL; atomic_flag_clear_explicit(&l->held, memory_order_release); }
++#define spin_lock_irqsave(l,f) do { (f) = 0; spin_lock(l); } while (0)
++#define spin_unlock_irqrestore(l,f) do { (void)(f); spin_unlock(l); } while (0)
++static pthread_mutex_t ghsm_lock = PTHREAD_MUTEX_INITIALIZER;
++static void mutex_lock(pthread_mutex_t *m) { assert(!current_spin); assert(!pthread_mutex_lock(m)); }
++static void mutex_unlock(pthread_mutex_t *m) { assert(!pthread_mutex_unlock(m)); }
++
++struct kref { atomic_uint count; };
++static void kref_init(struct kref *r) { atomic_init(&r->count, 1); }
++static void kref_get(struct kref *r) { assert(atomic_fetch_add(&r->count, 1)); }
++static void kref_put(struct kref *r, void (*done)(struct kref *))
++{ unsigned int old = atomic_fetch_sub(&r->count, 1); assert(old); if (old == 1) done(r); }
++typedef struct { atomic_uint wakes; } wait_queue_head_t;
++static void init_waitqueue_head(wait_queue_head_t *w) { atomic_init(&w->wakes, 0); }
++static void wake_up_interruptible(wait_queue_head_t *w) { atomic_fetch_add(&w->wakes, 1); }
++
++struct inode { int unused; };
++struct file;
++struct file_operations {
++ void *owner;
++ long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
++ long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
++ __poll_t (*poll)(struct file *, poll_table *);
++ int (*release)(struct inode *, struct file *);
++};
++struct file { atomic_uint refs; const struct file_operations *f_op; void *private_data; };
++static struct file *fds[128];
++static pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
++static atomic_uint module_refs, vm_releases, resource_releases, scheduled;
++static void *kzalloc(size_t n, int flags) { (void)flags; return calloc(1,n); }
++static void kfree(void *p) { free(p); }
++static void __module_get(void *m) { (void)m; atomic_fetch_add(&module_refs,1); }
++static void module_put(void *m) { (void)m; assert(atomic_fetch_sub(&module_refs,1)); }
++static struct file *get_file(struct file *f) { assert(atomic_fetch_add(&f->refs,1)); return f; }
++static void fput(struct file *f)
++{
++ unsigned int old;
++ assert(!current_spin && f);
++ old = atomic_fetch_sub(&f->refs,1); assert(old);
++ if (old != 1) return;
++ if (f->f_op && f->f_op->release) f->f_op->release(NULL,f);
++ else atomic_fetch_add(&vm_releases,1);
++ free(f);
++}
++static struct file *fget(int fd)
++{
++ struct file *f = NULL;
++ mutex_lock(&fd_lock);
++ if (fd >= 0 && fd < 128 && fds[fd]) f = get_file(fds[fd]);
++ mutex_unlock(&fd_lock);
++ return f;
++}
++static int install_file(struct file *f)
++{
++ int i;
++ mutex_lock(&fd_lock);
++ for (i=0;i<128;i++) if (!fds[i]) { fds[i]=f; break; }
++ mutex_unlock(&fd_lock);
++ assert(i<128); return i;
++}
++static void close_fd(int fd)
++{
++ struct file *f;
++ mutex_lock(&fd_lock); f=fds[fd]; assert(f); fds[fd]=NULL; mutex_unlock(&fd_lock); fput(f);
++}
++static int anon_inode_getfd(const char *name, const struct file_operations *ops, void *data, int flags)
++{
++ struct file *f=calloc(1,sizeof(*f));
++ assert(f && (flags & O_CLOEXEC)); (void)name;
++ atomic_init(&f->refs,1); f->f_op=ops; f->private_data=data; return install_file(f);
++}
++static void poll_wait(struct file *f, wait_queue_head_t *w, poll_table *p) { (void)f;(void)w;(void)p; }
++static int copy_from_user(void *to,const void *from,size_t n) { memcpy(to,from,n);return 0; }
++static int copy_to_user(void *to,const void *from,size_t n) { memcpy(to,from,n);return 0; }
++
++struct ghsm_lease;
++struct ghsm_receipt;
++struct ghsm_map {
++ struct list_head node;
++ struct file *vm_file;
++ struct ghsm_lease *lease;
++ struct ghsm_receipt *receipt;
++ u32 label;
++ bool creating, dying, reset_failed;
++ int retries;
++ void *pins;
++};
++static LIST_HEAD(ghsm_maps);
++static void *ghsm_get_ghvm(int fd,struct file **out)
++{
++ struct file *f=fget(fd);
++ if (!f) return NULL;
++ if (f->f_op) { fput(f);return NULL; }
++ *out=f;return f->private_data;
++}
++static int ghsm_try_destroy(struct ghsm_map *m);
++#include "../ghsm_lease_impl.c.inc"
++
++static void ghsm_lease_schedule_reaper(void) { atomic_fetch_add(&scheduled,1); }
++static atomic_int rm_result;
++static atomic_int gate_stage;
++static pthread_barrier_t entered, resume_work;
++static int ghsm_try_destroy(struct ghsm_map *m)
++{
++ int result;
++ struct file *vm_file;
++ struct ghsm_lease *lease=m->lease;
++ struct ghsm_receipt *receipt=m->receipt;
++ ghsm_lease_reclaim_started(m);
++ if (atomic_load(&gate_stage)==1) { pthread_barrier_wait(&entered);pthread_barrier_wait(&resume_work); }
++ result=atomic_load(&rm_result);
++ if (result) {
++  vm_file=ghsm_map_take_vm_file(m);if(vm_file)fput(vm_file);
++  ghsm_lease_reclaim_failed(m,result,false);return result;
++ }
++ vm_file=ghsm_map_take_vm_file(m);
++ ghsm_lease_forget_map_pointer(m);
++ if (atomic_load(&gate_stage)==2) { pthread_barrier_wait(&entered);pthread_barrier_wait(&resume_work); }
++ assert(m->pins);free(m->pins);m->pins=NULL;atomic_fetch_add(&resource_releases,1);
++ if(vm_file)fput(vm_file);
++ free(m);
++ ghsm_lease_map_freed(lease,receipt);
++ return 0;
++}
++
++static int new_vm(void)
++{
++ struct file *f=calloc(1,sizeof(*f));assert(f);
++ atomic_init(&f->refs,1);f->private_data=f;return install_file(f);
++}
++static struct ghsm_lease *lease_of(int fd) { return fds[fd]->private_data; }
++static struct ghsm_map *publish_map(struct ghsm_lease *lease,struct file *vm_file,
++                                   struct ghsm_receipt *r)
++{
++ struct ghsm_map *m=calloc(1,sizeof(*m));assert(m);
++ INIT_LIST_HEAD(&m->node);m->vm_file=get_file(vm_file);m->label=r->label;
++ m->pins=malloc(128);assert(m->pins);
++ ghsm_lease_map_attached(m,r);
++ mutex_lock(&ghsm_lock);list_add_tail(&m->node,&ghsm_maps);mutex_unlock(&ghsm_lock);
++ ghsm_lease_share_finish(lease,r,true);
++ return m;
++}
++static u64 share_one(int leasefd,int vmfd,u32 label,struct ghsm_map **out)
++{
++ struct ghsm_lease *lease=lease_of(leasefd);
++ struct file *vm=fget(vmfd);struct ghsm_receipt *r;u64 id;
++ r=ghsm_lease_share_begin(lease,vm,label);assert(!IS_ERR(r));id=r->id;
++ *out=publish_map(lease,vm,r);fput(vm);return id;
++}
++static struct ghsm_vm_lease_status status_of(int fd)
++{
++ struct ghsm_vm_lease_status s;
++ assert(!ghsm_lease_ioctl(fds[fd],GHSM_QUERY_VM_LEASE,(unsigned long)&s));return s;
++}
++static void clean_session(int leasefd,int vmfd)
++{ close_fd(leasefd);close_fd(vmfd);assert(!atomic_load(&module_refs)); }
++
++static void test_exact_receipt(void)
++{
++ int vmfd=new_vm(),leasefd=ghsm_open_vm_lease(vmfd);
++ struct ghsm_map *m;struct ghsm_receipt *r;u64 id;
++ struct ghsm_lease *lease=lease_of(leasefd);
++ unsigned int before=atomic_load(&resource_releases);
++ assert(leasefd>=0);
++ id=share_one(leasefd,vmfd,17,&m);
++ atomic_store(&rm_result,-EBUSY);
++ assert(ghsm_lease_unshare(lease,id)==-EBUSY);
++ assert(status_of(leasefd).owned_maps==1);
++ r=ghsm_lease_share_begin(lease,fds[vmfd],17);
++ assert(IS_ERR(r)&&PTR_ERR(r)==-EBUSY); /* dying remains an owner */
++ assert(ghsm_lease_unshare(lease,id+1)==-ENOENT);
++ atomic_store(&rm_result,0);
++ assert(!ghsm_lease_unshare(lease,id));
++ assert(atomic_load(&resource_releases)==before+1);
++ assert(ghsm_lease_unshare(lease,id)==-ENOENT); /* consumed receipt, not false success */
++ assert(status_of(leasefd).state==GHSM_LEASE_OPEN);
++ assert(!ghsm_lease_seal(lease));
++ assert(status_of(leasefd).state==GHSM_LEASE_COMPLETE);
++ assert(ghsm_lease_poll(fds[leasefd],NULL)&EPOLLIN);
++ clean_session(leasefd,vmfd);
++}
++
++struct worker { struct ghsm_lease *lease;u64 id;int result; };
++static void *unshare_worker(void *arg)
++{ struct worker *w=arg;w->result=ghsm_lease_unshare(w->lease,w->id);return NULL; }
++static void test_seal_reclaim_race(int stage,int rm_error)
++{
++ int vmfd=new_vm(),leasefd=ghsm_open_vm_lease(vmfd);
++ struct ghsm_map *m;pthread_t thread;
++ struct worker w={.lease=lease_of(leasefd)};
++ unsigned int released=atomic_load(&resource_releases);
++ w.id=share_one(leasefd,vmfd,91,&m);
++ assert(!pthread_barrier_init(&entered,NULL,2));assert(!pthread_barrier_init(&resume_work,NULL,2));
++ atomic_store(&gate_stage,stage);atomic_store(&rm_result,rm_error);
++ assert(!pthread_create(&thread,NULL,unshare_worker,&w));
++ pthread_barrier_wait(&entered);
++ assert(!ghsm_lease_seal(w.lease));
++ assert(!ghsm_lease_seal(w.lease));
++ assert(status_of(leasefd).state==GHSM_LEASE_CLOSING);
++ assert(atomic_load(&resource_releases)==released);
++ assert(ghsm_lease_unshare(w.lease,w.id)==-EAGAIN);
++ close_fd(vmfd); /* query/reclaim no longer has any VM fd */
++ pthread_barrier_wait(&resume_work);assert(!pthread_join(thread,NULL));
++ atomic_store(&gate_stage,0);
++ if(rm_error) {
++  assert(w.result==rm_error && status_of(leasefd).owned_maps==1);
++  ghsm_lease_reclaim_failed(m,rm_error,true);
++  assert(status_of(leasefd).state==GHSM_LEASE_STALLED);
++  assert(ghsm_lease_poll(fds[leasefd],NULL)==EPOLLERR);
++  atomic_store(&rm_result,0);assert(!ghsm_lease_unshare(w.lease,w.id));
++ } else assert(!w.result);
++ assert(status_of(leasefd).state==GHSM_LEASE_COMPLETE);
++ assert(atomic_load(&resource_releases)==released+1);
++ close_fd(leasefd);assert(!atomic_load(&module_refs));
++ pthread_barrier_destroy(&entered);pthread_barrier_destroy(&resume_work);
++}
++
++static void test_late_creation_and_error(void)
++{
++ int vmfd=new_vm(),leasefd=ghsm_open_vm_lease(vmfd);
++ struct ghsm_lease *lease=lease_of(leasefd);
++ struct file *vm=fget(vmfd);
++ struct ghsm_receipt *r=ghsm_lease_share_begin(lease,vm,100);
++ struct ghsm_map *m;u64 id=r->id;
++ assert(!IS_ERR(r));assert(!ghsm_lease_seal(lease));
++ assert(status_of(leasefd).state==GHSM_LEASE_CLOSING);
++ m=publish_map(lease,vm,r);
++ assert(m->dying&&!m->vm_file);fput(vm);close_fd(vmfd);
++ atomic_store(&rm_result,0);assert(!ghsm_lease_unshare(lease,id));
++ assert(status_of(leasefd).state==GHSM_LEASE_COMPLETE);
++ close_fd(leasefd);assert(!atomic_load(&module_refs));
++
++ vmfd=new_vm();leasefd=ghsm_open_vm_lease(vmfd);lease=lease_of(leasefd);
++ r=ghsm_lease_share_begin(lease,fds[vmfd],101);assert(!IS_ERR(r));
++ m=calloc(1,sizeof(*m));assert(m);m->vm_file=get_file(fds[vmfd]);m->pins=malloc(64);assert(m->pins);
++ ghsm_lease_map_attached(m,r);assert(!ghsm_lease_seal(lease));
++ assert(status_of(leasefd).owned_maps==1&&status_of(leasefd).inflight_shares==1);
++ vm=ghsm_map_take_vm_file(m);ghsm_lease_forget_map_pointer(m);if(vm)fput(vm);
++ free(m->pins);free(m); /* backend partial failure really finishes first */
++ ghsm_lease_share_finish(lease,r,false);
++ assert(status_of(leasefd).state==GHSM_LEASE_COMPLETE);
++ clean_session(leasefd,vmfd);
++}
++
++static void test_fd_release_keeps_resources(void)
++{
++ int vmfd=new_vm(),leasefd=ghsm_open_vm_lease(vmfd);
++ struct ghsm_map *m;struct ghsm_lease *lease=lease_of(leasefd);
++ share_one(leasefd,vmfd,200,&m);
++ close_fd(leasefd);
++ assert(atomic_load(&module_refs)==1&&m->dying&&!m->vm_file);
++ assert(lease->core.owned_maps==1); /* map, not closed fd, owns this reference */
++ close_fd(vmfd);
++ mutex_lock(&ghsm_lock);list_del_init(&m->node);mutex_unlock(&ghsm_lock);
++ atomic_store(&rm_result,0);assert(!ghsm_try_destroy(m));
++ assert(!atomic_load(&module_refs));
++}
++
++static void test_other_vm_isolation(void)
++{
++ int a=new_vm(),b=new_vm(),la=ghsm_open_vm_lease(a),lb=ghsm_open_vm_lease(b);
++ struct ghsm_map *ma,*mb;u64 ia,ib;struct ghsm_receipt *r;
++ ia=share_one(la,a,1,&ma);ib=share_one(lb,b,1,&mb);
++ r=ghsm_lease_share_begin(lease_of(la),fds[b],3);
++ assert(IS_ERR(r)&&PTR_ERR(r)==-EXDEV);
++ assert(!ghsm_lease_seal(lease_of(la)));
++ assert(ma->dying&&!ma->vm_file&&!mb->dying&&mb->vm_file);
++ atomic_store(&rm_result,0);assert(!ghsm_lease_unshare(lease_of(la),ia));
++ assert(status_of(la).state==GHSM_LEASE_COMPLETE&&status_of(lb).state==GHSM_LEASE_OPEN);
++ close_fd(la);close_fd(a);
++ assert(!ghsm_lease_unshare(lease_of(lb),ib));
++ close_fd(lb);close_fd(b);assert(!atomic_load(&module_refs));
++}
++
++int main(void)
++{
++ test_exact_receipt();
++ test_seal_reclaim_race(1,-EBUSY);
++ test_seal_reclaim_race(2,0);
++ test_late_creation_and_error();
++ test_fd_release_keeps_resources();
++ test_other_vm_isolation();
++ assert(ghsm_maps.next==&ghsm_maps);
++ puts("production lease implementation harness: all cases passed (mock files/RM only)");
++ return 0;
++}
