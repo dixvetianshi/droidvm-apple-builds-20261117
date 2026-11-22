@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       component:
-        description: Select the original runtime or the reviewed HostShare component
+        description: Select the runtime or one reviewed kernel component
         type: choice
         default: runtime
         options:
           - runtime
           - hostshare-only
+          - reserve-repair
 
 permissions:
   contents: read
@@ -24,7 +25,7 @@ defaults:
 
 jobs:
   build:
-    if: inputs.component != 'hostshare-only'
+    if: inputs.component == 'runtime'
     # A standard GitHub-hosted ARM64 runner for public repositories.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -51,7 +52,7 @@ jobs:
   hostshare:
     if: inputs.component == 'hostshare-only'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,5 +65,25 @@ jobs:
         with:
           name: apple-hostshare-component-${{ github.run_id }}
           path: output/hostshare-component/
+          if-no-files-found: error
+          retention-days: 14
+  reserve:
+    if: inputs.component == 'reserve-repair'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify build-command process ownership and timeout cleanup
+        run: python3 tools/test_build_command_lifecycle.py
+      - name: Compile the pinned reserve repair without installing it
+        run: python3 tools/build_reserve_component_ci.py
+      - name: Retain source identity, component and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-reserve-repair-${{ github.run_id }}
+          path: output/reserve-component/
           if-no-files-found: error
           retention-days: 14

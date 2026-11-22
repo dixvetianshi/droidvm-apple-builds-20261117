@@ -1,0 +1,280 @@
+{
+  "schema": "org.droidvm.reserve-repair-source.v1",
+  "source_repository": "Droid-VM/gh-hugepage-reserve",
+  "source_commit": "00c8a0322aa6fb25593e00352af2764be5317d7e",
+  "patch_sha256": "0950d096d4a1488548e82fb0164bde11f14719e35bfbad53e2d1c7d6369ae729",
+  "before": [
+    {
+      "path": "Makefile",
+      "bytes": 686,
+      "sha256": "4f264b45f584ed8dce1e3053d4945b300320fe824a2efa086105c6e4179a4b22"
+    },
+    {
+      "path": "POOL_DESIGN.md",
+      "bytes": 72341,
+      "sha256": "3754d80f3e0b38885e1ffea053c96170777cb010d244d082828841b43b0af58e"
+    },
+    {
+      "path": "README.md",
+      "bytes": 55928,
+      "sha256": "959282de1c7bb6c93e8a2d5938e3f430296a7196eb5d8af7c61a9e2e7ed30499"
+    },
+    {
+      "path": "abi/Makefile",
+      "bytes": 1226,
+      "sha256": "2d0fa8ca933bb74f89fc57053e621fe750e3e0b86e1448cf88a56312d1c12405"
+    },
+    {
+      "path": "abi/gen_kapi.awk",
+      "bytes": 2961,
+      "sha256": "89374d49aefa4dbf9478e499d80543d412e31f46a1c5f1d8f27cf18142afd9e5"
+    },
+    {
+      "path": "abi/kapi_abi.gen.h",
+      "bytes": 3555,
+      "sha256": "5d13894949593bbc1dc5807e4f10e8f5d0e29bd7a504b3c92c15b133ef4fce8b"
+    },
+    {
+      "path": "abi/kapi_abi.tsv",
+      "bytes": 4414,
+      "sha256": "cfc5125f5131c9ec74a06b685738fb5403b86c80970858301d809e1325ecaa95"
+    },
+    {
+      "path": "abi/kapi_check.c",
+      "bytes": 9392,
+      "sha256": "77e32c1420e827d536cb58ed4e0712173fd50ee8728f08bd767b21118cc7d631"
+    },
+    {
+      "path": "gh_hugepage_reserve.c",
+      "bytes": 10759,
+      "sha256": "9ebd9baa017848db4ca67bfa8b2931e2163299cae646a72a6cb54a015ff51824"
+    },
+    {
+      "path": "package/module.prop",
+      "bytes": 305,
+      "sha256": "59f1586afffbe866bbc0900907296f77c4828ae698e9b588b10ef7346eee9bd1"
+    },
+    {
+      "path": "parts/gh_adjust.c.inc",
+      "bytes": 19522,
+      "sha256": "0bcedd051b64af395174ea4c073e508642f76f3499a6348186b650b8521cd713"
+    },
+    {
+      "path": "parts/gh_defs.h",
+      "bytes": 6823,
+      "sha256": "e2b7269671faf1100d4a4c5f598be5b7d3b0ad124c1de539a223b29a648cca43"
+    },
+    {
+      "path": "parts/gh_hooks.c.inc",
+      "bytes": 10019,
+      "sha256": "ef83720e0b8b6d405314091927fb89bfedadc004a75e5d56b0b51a44d4b56204"
+    },
+    {
+      "path": "parts/gh_kapi.c.inc",
+      "bytes": 28301,
+      "sha256": "57144fef6284e295ca78c82324b6d74630a4b1e88381511454af6c5dac35633f"
+    },
+    {
+      "path": "parts/gh_kernel_env.h",
+      "bytes": 3382,
+      "sha256": "d40cbad52a827b997e8acf9f14cd78d5b9d0a96d3fd9c3cc2f9a202c23492fc5"
+    },
+    {
+      "path": "parts/gh_owner.c.inc",
+      "bytes": 7643,
+      "sha256": "9d975a9a7c7ea653a35388201591cf1e78ee55bde3902677fafcba6ce68fd4e3"
+    },
+    {
+      "path": "parts/gh_pinprobe.c.inc",
+      "bytes": 6590,
+      "sha256": "e4cd7fca6f260a825b4ddebac8fe7d551e5fe0283478bf33ad0ed716687e011d"
+    },
+    {
+      "path": "parts/gh_pool.c.inc",
+      "bytes": 51055,
+      "sha256": "eeeca2d1d6198a1ffbbfd79acbda2c10895d1987a639c57b138253b5e5e592ac"
+    },
+    {
+      "path": "parts/gh_release.c.inc",
+      "bytes": 3274,
+      "sha256": "4c1a5ad1550eb6bf33e2e815f5d641666b1219a15d28e2878c5c863e8301aa1a"
+    },
+    {
+      "path": "parts/gh_sysfs.c.inc",
+      "bytes": 15232,
+      "sha256": "946aaf8e2bc5c131a1c3926c9100d82ece7663a7f253fe8389cbc90a9b493653"
+    },
+    {
+      "path": "parts/gh_unlock_cma.c.inc",
+      "bytes": 17639,
+      "sha256": "ac863833849f7ba6b290cc3764b63676cba43e499e1feb62711d7808a9c4c4d6"
+    },
+    {
+      "path": "tests/.gitignore",
+      "bytes": 24,
+      "sha256": "24220e88dce0048589de31d78f102b6ad8522b7fc6fb506f59e090bd3fba0d63"
+    },
+    {
+      "path": "tests/Makefile",
+      "bytes": 664,
+      "sha256": "ed30f236a1492e93219568228037a490890f11d48eb0f9859ac1e34d9a8409c0"
+    },
+    {
+      "path": "tests/harness.c",
+      "bytes": 48384,
+      "sha256": "f38781538866d59972860c1ca45bfcf1c3f867ed1005077a13625b400147d5dc"
+    },
+    {
+      "path": "tests/mock_kapi.c.inc",
+      "bytes": 9254,
+      "sha256": "af272da9d942933703f91d9635a863c643ee52239630055155932cb00e5a96db"
+    },
+    {
+      "path": "tests/race_harness.c",
+      "bytes": 10463,
+      "sha256": "f28bf3045a1c8c454fb32b8fc113bab67ec2fff47fe0c0d47cbf38def907bb2b"
+    },
+    {
+      "path": "tests/shim.h",
+      "bytes": 9781,
+      "sha256": "63b746fc6fefcc18c450e34d722b8f0365d60810935a977c98f77f1537809bed"
+    }
+  ],
+  "after": [
+    {
+      "path": "Makefile",
+      "bytes": 686,
+      "sha256": "4f264b45f584ed8dce1e3053d4945b300320fe824a2efa086105c6e4179a4b22"
+    },
+    {
+      "path": "POOL_DESIGN.md",
+      "bytes": 71780,
+      "sha256": "3725029eb664ed3121440d4b1148078e373b77c0d2aa841fcf830c7c3267389b"
+    },
+    {
+      "path": "README.md",
+      "bytes": 56498,
+      "sha256": "a70937ad1069701b44eccfac366cb2d8f286cda1f92d643cdd0b70763eb97af2"
+    },
+    {
+      "path": "abi/Makefile",
+      "bytes": 1226,
+      "sha256": "2d0fa8ca933bb74f89fc57053e621fe750e3e0b86e1448cf88a56312d1c12405"
+    },
+    {
+      "path": "abi/gen_kapi.awk",
+      "bytes": 2961,
+      "sha256": "89374d49aefa4dbf9478e499d80543d412e31f46a1c5f1d8f27cf18142afd9e5"
+    },
+    {
+      "path": "abi/kapi_abi.gen.h",
+      "bytes": 3555,
+      "sha256": "5d13894949593bbc1dc5807e4f10e8f5d0e29bd7a504b3c92c15b133ef4fce8b"
+    },
+    {
+      "path": "abi/kapi_abi.tsv",
+      "bytes": 4414,
+      "sha256": "cfc5125f5131c9ec74a06b685738fb5403b86c80970858301d809e1325ecaa95"
+    },
+    {
+      "path": "abi/kapi_check.c",
+      "bytes": 9392,
+      "sha256": "77e32c1420e827d536cb58ed4e0712173fd50ee8728f08bd767b21118cc7d631"
+    },
+    {
+      "path": "gh_hugepage_reserve.c",
+      "bytes": 10759,
+      "sha256": "9ebd9baa017848db4ca67bfa8b2931e2163299cae646a72a6cb54a015ff51824"
+    },
+    {
+      "path": "package/module.prop",
+      "bytes": 305,
+      "sha256": "59f1586afffbe866bbc0900907296f77c4828ae698e9b588b10ef7346eee9bd1"
+    },
+    {
+      "path": "parts/gh_adjust.c.inc",
+      "bytes": 19603,
+      "sha256": "32fc803ba16087fbdcd9bbfb6f8801b95e0f14df91e611e9ae201a54e72e20c2"
+    },
+    {
+      "path": "parts/gh_defs.h",
+      "bytes": 6439,
+      "sha256": "16e1d840e7805a577aff3d6c1768a211b22677624665616ad05872e11cdb57cf"
+    },
+    {
+      "path": "parts/gh_hooks.c.inc",
+      "bytes": 10019,
+      "sha256": "ef83720e0b8b6d405314091927fb89bfedadc004a75e5d56b0b51a44d4b56204"
+    },
+    {
+      "path": "parts/gh_kapi.c.inc",
+      "bytes": 28301,
+      "sha256": "57144fef6284e295ca78c82324b6d74630a4b1e88381511454af6c5dac35633f"
+    },
+    {
+      "path": "parts/gh_kernel_env.h",
+      "bytes": 3382,
+      "sha256": "d40cbad52a827b997e8acf9f14cd78d5b9d0a96d3fd9c3cc2f9a202c23492fc5"
+    },
+    {
+      "path": "parts/gh_owner.c.inc",
+      "bytes": 7309,
+      "sha256": "791260e0b93f870e655543df68ce44277c1bce002c630cc133e60a486e86fa34"
+    },
+    {
+      "path": "parts/gh_pinprobe.c.inc",
+      "bytes": 6590,
+      "sha256": "e4cd7fca6f260a825b4ddebac8fe7d551e5fe0283478bf33ad0ed716687e011d"
+    },
+    {
+      "path": "parts/gh_pool.c.inc",
+      "bytes": 53959,
+      "sha256": "301ca3e7d182e83233d468b65f35de0cec4b0bc0f43e2d579c722942505b4eee"
+    },
+    {
+      "path": "parts/gh_release.c.inc",
+      "bytes": 3557,
+      "sha256": "6ad7e0865ecf3adc71ff4109597cc683e0e98aab78a05656669c57e128718c3f"
+    },
+    {
+      "path": "parts/gh_sysfs.c.inc",
+      "bytes": 15371,
+      "sha256": "d2d72b3ba896481da0b72d260eb6a2e464dbc75e38900b6f217992270aa43a2b"
+    },
+    {
+      "path": "parts/gh_unlock_cma.c.inc",
+      "bytes": 17639,
+      "sha256": "ac863833849f7ba6b290cc3764b63676cba43e499e1feb62711d7808a9c4c4d6"
+    },
+    {
+      "path": "tests/.gitignore",
+      "bytes": 24,
+      "sha256": "24220e88dce0048589de31d78f102b6ad8522b7fc6fb506f59e090bd3fba0d63"
+    },
+    {
+      "path": "tests/Makefile",
+      "bytes": 664,
+      "sha256": "ed30f236a1492e93219568228037a490890f11d48eb0f9859ac1e34d9a8409c0"
+    },
+    {
+      "path": "tests/harness.c",
+      "bytes": 63508,
+      "sha256": "8e9008af2c84481daed4b944d4553083f20851b3fa27743b46f524eb41bbee4a"
+    },
+    {
+      "path": "tests/mock_kapi.c.inc",
+      "bytes": 9254,
+      "sha256": "af272da9d942933703f91d9635a863c643ee52239630055155932cb00e5a96db"
+    },
+    {
+      "path": "tests/race_harness.c",
+      "bytes": 14643,
+      "sha256": "cbd49100d7c4837458021db1d82f0eff0c2492b43c43eae77627977c2052db2b"
+    },
+    {
+      "path": "tests/shim.h",
+      "bytes": 9809,
+      "sha256": "d58af79b0224fbf7a4ee5de574270f960e1542994bbf4f62591346979dae9cc1"
+    }
+  ]
+}

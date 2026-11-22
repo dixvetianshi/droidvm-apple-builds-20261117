@@ -1,0 +1,2089 @@
+diff --git a/POOL_DESIGN.md b/POOL_DESIGN.md
+--- a/POOL_DESIGN.md
++++ b/POOL_DESIGN.md
+@@ -36,12 +36,10 @@
+ 4. **失敗 = 誠實回報 + 既有出路**。會失敗的邊回報實收;收不回的東西總有一條已畫好的
+    邊在等(sweep 不回→purge;grab 不到→留 CMA 續計;湊不成→flush)。不為失敗開新
+    路徑、不因「可能失敗」拒絕執行。
+-5. **放手是事件+短寬限,purge 是時鐘,輪次只是載具**。served 頁的放手由 **pid
+-   死亡事件**驅動,外加 `DEATH_GRACE(=ROUNDS−2=3s)` 的短寬限讓 exit 路徑自己的
+-   free(delayed_fput、晚到 unpin)以**回收**而非放手回家——時鐘只在死亡時啟動且
+-   永不清除(死亡單向),不存在可與 VM 重開競態的 idle 計時;owner 活著——不論
+-   vm_count——一律不放手。released 頁的 purge 由 `slot.released_at + GRACE(10s)`
+-   承擔。輪次重跑、高頻觸發、被續命都不改變任何事件或時限——冪等。
++5. **引用歸屬決定放手**。PID 死亡只解除 owner 歸屬,仍在使用的頁進入
++   PENDING 並保留池保護參照;只有 `count==1 && !mapping` 才放最後參照。
++   每秒有界輪轉等待真正的外部釋放,不以死亡秒數棄頁。RELEASED 已放參照後
++   的 purge 仍由 `slot.released_at + GRACE(10s)` 承擔。
+ 6. **帳實相符**。先改 state 再放手(release 先標再 put、shed 先標再 free,反序即資料
+    遺失);CMA 標籤與 freelist 一致(絕不只翻標籤);計數/串列/state 互證(G,
+    debug=1 時 pool_check)。
+@@ -130,7 +128,7 @@
+ | sysfs → worker | `adjust_user_acquire/cancel/try`、`release_run(1)`、**accessor**:`adjust_running()`、`adjust_stop_reason_str()` | 不裸讀 worker 內部變數 |
+ | sysfs → hooks | `hooks_serve_set/reclaim_set`、`hooks_*_active()` | 讀回實際掛載狀態 |
+ | sysfs ↔ 政策 param | `module_param` 綁 worker 的 gh_param_*(refill_enable / drop_slab / mem_floor / debug) | param 即介面,knob 住在消費者 |
+-| release → pool | `pool_served_to_released/served_to_ext(EXPIRED)/owner_sweep` | |
++| release → pool | `pool_served_to_released/pending_to_released/owner_sweep` | |
+ | release → kapi | `drain_pages`(第 3 輪 pcp-lag) | §0 (8):不帶頁身分的重活可直走 kapi |
+ | release → adjust | `adjust_try(RELEASE)` 每輪 | 圖上唯一的 worker→worker 邊 |
+ | adjust → pool | 全部經 public(轉移邊、prepare/scan/cursor、targets_snapshot、window_candidate/evict) | 狀態機唯二驅動者之一 |
+@@ -154,17 +152,17 @@
+   top[] = span_GB 個 chunk 指標,NULL = 整 GB 非 RAM
+   slot(pfn): top[off>>30][(off>>21)&511]          /* 兩次解參考,O(1) 最壞 */
+ 
+-每格 20B:state / origin / owner_id(SERVED/RELEASED 有效;generation+index,防
+-pid reuse)/ released_at(秒)/ prev,next(僅 AVAIL 掛串列時有效,NIL=~0)
+-
+-串列只有 avail 三條——維護串列的唯一正當理由是 atomic 上下文要 O(1)「下一個可用」,
+-全設計只有 serve 符合:
++每格 20B:state / origin / owner_id(SERVED 有效;generation+index,防
++pid reuse;PENDING 為 0)/ released_at(秒)/ prev,next(AVAIL 或 PENDING 單一串列,NIL=~0)
++
++avail 三條供 atomic serve O(1) 取得下一格;PENDING 另有一條有界輪轉串列:
+   avail_non        塊 !cma_able(straggler)
+-  avail_cma_able   塊 cma_able 但有兄弟在外(served/released/cand)
++  avail_cma_able   塊 cma_able 但有兄弟在外(served/pending/released/cand)
+   avail_cma_ready  塊全 AVAIL;flip 唯一來源
+ 
+-其他狀態不掛串列,消費者全在 worker/rmmod(可睡),用索引序表掃或 O(1) 標量門檻:
+-  SERVED    全表索引掃(O(span),1s 節奏)
++其他狀態用索引序表掃或 O(1) 標量門檻:
++  SERVED    有 SERVED 才全表索引掃(O(span),1s 節奏)
++  PENDING   每秒最多 256 格,不變者移尾;只在此串列,不在 AVAIL
+   RELEASED  (released_count, released_oldest) 門檻:count==0 或未過 GRACE → O(1) 返回
+   CAND      pool 內 FIFO 小陣列(≤S)
+   VERIFY    只存在於 verify_cma_params 單次呼叫內
+@@ -191,14 +189,15 @@
+ | `external` | 系統的 |
+ | `avail` | 池中待命(三串列之一) |
+ | `served` | 借給 VM(GUP pin + 我們一份保護參照) |
++| `pending` | owner 已亡,仍持有池保護參照等待外部 pin/mapping 結束;不可 serve |
+ | `released` | 已放手,去向未定(等 hook return / sweep / purge) |
+ | `cand` | collect_cma 組裝中,不可 serve/shed |
+ | `verify` | 驗證窗暫存(單次呼叫內,不可 serve/shed) |
+ | `cma` | 儲備池,借給系統 |
+ 
+ ```
+-custody   = avail + served + released + cand + verify(cand 只算塊判定,不算 held)
+-held      = avail + served + released + verify
++custody   = avail + served + pending + released + cand + verify(cand 只算塊判定,不算 held)
++held      = avail + served + pending + released + verify
+ held_cma  = held + cma
+ 
+ I1  held     → pool_want            (worker 的收斂目標,非瞬間結構不變式)
+@@ -213,14 +212,14 @@
+ G   簿記一致:state/串列/計數器互證(debug=1 pool_check 驗 G/U/W/P)
+ ```
+ 
+-**held 含 released 是刻意的**:released 大概率會回來,不算它,VM 關機瞬間 worker 會
++**held 含 pending/released 是刻意的**:pending 仍有池持有的參照,released 大概率會回來,不算它,VM 關機瞬間 worker 會
+ 去買「正要回家的頁」的替代品。**放棄(purge)那一刻 deficit 才真的打開。**
+ 代價與對策:達標檢查因此看不見「待掃回的自家頁」,§7 PREPARE 的 released 條款補上。
+ 
+ **塊屬性即時導出,不存欄位**:cma_able = 塊的 S 格全在 custody;cma_ready = 全 AVAIL
+ (flip 唯一合法對象——served 是 FOLL_LONGTERM pin,含 pin 的塊翻 CMA 是死路)。
+ 升級點(promote,worker):alloc 落進部分持有塊 / 湊滿缺口 / CMA 整塊拿回;
+-降級點(demote,custody 出口):purge、EXPIRED 放手、DROP、shed 碰 able+。
++降級點(demote,custody 出口):RELEASED purge、ALL 放手、DROP、shed 碰 able+。
+ cma_ready 起落(非升降級)發生在 atomic 熱路徑:serve 斷 ready、return 湊滿,O(S)。
+ 含 not_useable 格的塊永遠成不了 cma_able → 缺口清單直接跳過
+ (實測:84% 的 2MB 窗有 hard straggler,省掉注定失敗的 contig+evict)。
+@@ -233,19 +232,15 @@
+ 
+ - **pid_lock(rwlock)**:owner 註冊表。entry 活到 pid 死亡。**vm_count 只做一件事:
+   serve 的 gate**(vm_boot ++、vm_shutdown --;1→0→1 的 0 期間不 serve)——不驅動
+-  任何放手、不蓋任何時戳。**放手是 pid 死亡的事件後果**(sched_process_exit 標
+-  dead + 蓋 died_at,過 `DEATH_GRACE(3s)` 後的輪次放手——寬限讓 exit 清算自己的
+-  free 還來得及走回收),不是 shutdown 後的計時:舊制的 idle_since + 10s 在
+-  「1→0 蓋戳 → 放手 → 0→1 重開」序列上有誤放手/誤標 abandoned 的競態窗口;
+-  死亡是單向事件、died_at 永不清除,無此窗口(2026-08-28 定案)。
+-  DEATH_GRACE = GH_RELEASE_ROUNDS − 2:死亡事件自己 arm 的保證輪次(5×1s)必定
+-  蓋過寬限到期,不依賴自續;兩者皆編譯期常數,改任一都要重核這個配對
+-  (_Static_assert 擋 ROUNDS<2)。shutdown 因此與 unshare 等價,
++  任何放手、不蓋任何時戳。sched_process_exit 單向標 dead,下一次收集把仍有
++  外部持有者的 SERVED 轉為 PENDING,扣舊 owner 頁數並清 owner_id,保留池參照。
++  PID 死亡不證明所有 pin 已釋放;不再以 3s 死亡寬限把頁標 EXT 或 put。
++  shutdown 因此與 unshare 等價,
+   僅多維護 gate(歸因序:帶 mm 直查 → 比 current->tgid → 唯一活 owner → 放棄記
+-  log——歸因失敗只影響 gate 準度,放手不受影響,由 pid 死亡兜底)。owner sweep
++  log——歸因失敗只影響 gate 準度)。owner sweep
+   只清「已死且名下無頁」者,mmdrop 鎖外。serve 熱路徑先 lockless
+   `pool_owner_maybe()` 快濾,不對就返回不碰任何鎖。
+-- **pool_lock(raw spinlock)**:slot 表、三串列、計數器、游標、掃描集全在它下面。
++- **pool_lock(raw spinlock)**:slot 表、avail 三串列、pending 串列、計數器、游標、掃描集全在它下面。
+ 
+ 唯一巢狀點:atomic serve 以 pid_lock(read) → pool_lock 固定序把「owner 驗證 + 轉移」
+ 做成一次事件(拆兩次呼叫會有 TOCTOU);其他 api 不反向巢狀。
+@@ -308,7 +303,8 @@
+ | return(released→avail/ext) | `pool_released_return(pg)`(free hook,atomic) | MISS / KEEP / DROP |
+ | sweep(released→avail) | `pool_released_to_avail_sweep(pfn)`(adjust) | 會失敗→留 released 等 purge |
+ | purge(released→ext) | `pool_released_to_ext(EXPIRED/ALL)`(adjust/rmmod) | 保證成功(頁早在 buddy) |
+-| expired(served→ext) | `pool_served_to_ext(EXPIRED/ALL)`(release/rmmod) | 保證成功(先改 state 再放手) |
++| pending collect | `pool_pending_to_released(max_scan)`(release) | count==1 且無 mapping 才放參照;count==0 退休 |
++| unload(served/pending→ext) | `pool_served_to_ext(ALL)`(rmmod) | 先改 state,只 put 仍有的池參照 |
+ | flip(avail→cma) | `pool_avail_to_cma(n)`(adjust) | 不失敗(取自 ready,結構保證) |
+ | stage_in(cma→avail) | `pool_cma_to_avail(n)`(adjust) | 會失敗(pin/writeback),回實拿塊數 |
+ | drop(cma→ext) | `pool_cma_to_ext(n/ALL)`(adjust/rmmod) | 會失敗;搶不到的塊留 CMA 續計 |
+@@ -343,17 +339,19 @@
+   狀態變化並忠實回報;RELEASED 之後誰接手(hook µs 級 / sweep 秒級)或走 purge,由
+   條件系統仲裁(§6)。索引掃全表逐 SERVED 三分類:
+   `refcount==1 && !mapping` → 鎖內標 RELEASED 蓋戳 → 鎖外 put_page;
+-  `refcount>1` → pin 未放,下輪再看;
++  `refcount>1` 或 mapping 存在 → pin/unmap 未完成;owner 已亡則轉 PENDING,
++  保留池參照並解除 owner 歸屬;
+   `page_count==0` → **orphan**(free 漏接,參照已蒸發)→ 不 put,標 RELEASED 交給
+-  sweep/purge 既有出路。回傳 pending = 仍 pinned 且 **owner 已亡**的 SERVED 數
+-  (release 自續命的燃料——撐到死亡放手完成,天然有界;活 owner 的頁不論
+-  vm_count 都不算)。
+-- `pool_served_to_ext(EXPIRED|ALL)`:EXPIRED = **owner 已亡且死亡寬限已過**
+-  (dead 且 now−died_at ≥ DEATH_GRACE,∨ generation 不在表;鎖內 state→EXT +
+-  demote,鎖外 put,purge_log + owner.abandoned++)。**活著的 owner——不論
+-  vm_count——一律不碰**:放手是 pid 死亡的事件後果 + 3s 寬限(讓 exit 清算的
+-  free 走回收),不是 idle 計時;stuck pin 在 crosvm 活著期間就留在 SERVED(§11)。
+-  ALL = rmmod 全清,不等 unpin(頁跟著原 holder 活)。
++  sweep/purge 既有出路。回傳實際 collected 數。
++- `pool_pending_to_released(max_scan)`:輪轉最多 max_scan 格;只有
++  `refcount==1 && !mapping` 才解鏈、標 RELEASED、鎖外 put。最後外部 put 是
++  2→1 不會走 free hook,所以 pending 非空時 worker 持續排一次有界輪次。
++  永久 pin 保持可見的 PENDING,不假裝已可用,也不從 EXT 重新推定頁歸屬。
++  若觀測 count==0,保護參照已失效:解鏈退 EXT、記 orphan、不 put,防止
++  同一 PFN 的下一個普通配置被當成池持有。回傳 completed custody edges 數。
++- `pool_served_to_ext(ALL)`:只供 hooks/workers 已停止的 rmmod,從 SERVED 或
++  PENDING 解鏈/解除歸屬後標 EXT,鎖外 put 池參照一次。EXPIRED 不再有作用。
++  PENDING 已零參照時同樣不 put,只退休身份並記 orphan。
+ 
+ **adjust worker 用(可睡)**
+ 
+@@ -409,7 +407,7 @@
+ 
+ **查詢/掃描集**
+ 
+-- O(1) 查詢:`pool_avail/served/released/held/cma/noncma_able/avail_cma_able/
++- O(1) 查詢:`pool_avail/served/pending/released/held/cma/noncma_able/avail_cma_able/
+   cma_params_state/cma_capable`;sysfs 用 `pool_stats_snapshot` /
+   `pool_owner_stats_snapshot`(單快照不混世代)。
+ - `pool_targets_snapshot(bool capped)`:pool_lock 下回正規化快照(ctx 恆
+@@ -573,48 +571,47 @@
+ 
+ ## 6. release_worker
+ 
+-職責:**served→released 全歸它管**、死亡放手(served→ext EXPIRED,owner 已亡
+-且過 DEATH_GRACE 才做)、owner GC、每輪 `adjust_try(RELEASE)` 觸發背景補回。
+-**放手 = pid 死亡事件 + 3s 寬限**(§2):shutdown 不啟動任何時鐘,只收 gate 並
+-arm 回收輪;5 輪是下限且必定蓋過寬限(grace=ROUNDS−2),
+-**pending>0(仍 pinned 且 owner 已亡)時自續 1 輪**——撐到放手完成,天然有界。
+-活 owner 的晚到 unpin 若錯過本窗,頁留在 SERVED(held 記著,帳不開洞),
+-由下一個事件的輪次收回。
+-
+-```
+-release_round()(每 1000ms;ctx 只有 {run, round}):
+-  run 檢查/遞減
+-  pending = pool_served_to_released()      /* 三分類 + 蓋戳,§3.2 */
+-  pool_served_to_ext(EXPIRED)              /* owner 已亡+寬限過即放手;活著不碰 */
++職責:served→released、死亡 owner 的頁轉獨立 PENDING、每秒有界收集 pending、
++owner GC,並在實際 collected/零參照退休或 RELEASED 非空時觸發 adjust(RELEASE)。
++shutdown 只收 serve gate 並 arm 回收輪。owner death 不證明 pin 已放;
++PENDING 保護參照一直保留,每秒最多檢查 256 格,不 ready 者移至串列尾。
++外部最後一次 put 是 2→1,不會走 free hook;即使原 owner 已 GC、此後沒有
++VM 事件,非空 pending 仍會排下一輪。永久 pin 保持 PENDING 且不可 serve;
++不觸發每秒 refill pipeline,也不因超過死亡秒數而強收。
++活 owner 的晚到 unpin 若錯過事件窗,仍依既有 SERVED 後續事件語意。
++
++```
++release_round()(每 1000ms):
++  run/stopping 檢查,run 遞減
++  collected = pool_served_to_released()    /* ready 收回;死 owner 的 pin 轉 PENDING */
++  collected += pool_pending_to_released(256)
+   round==3 → kapi.drain_pages()            /* pcp-lag:實測每 VM 漏 ~2 頁 */
+   drained = (released==0 && pending==0) → run=0
+   final → drain + 再收一次 + owner_sweep(只清死者;vm_count==0 活 pid 保留,UI 要看)
+-  adjust_try(RELEASE)                      /* 等待期 held 含 served/released ⇒ 帳面
+-                                            * 無缺口,只有 precise 有事;DROP/死亡
+-                                            * 放手打開 deficit 後 cheap/full/cta 才動 */
++  在 release_lock 中重核 stopping
++  collected>0 或 released>0 → adjust_try(RELEASE)
+   run==0 && pending>0 → run=1(自續)
+ 事件 facade(hook 只碰這層):
+   release_vm_shutdown → owner_vm_dec(歸因,純 serve-gate 維護)+ release_run(5)
+                         /* 與 unshare 等價,僅多 gate--;不蓋戳、不啟動放手 */
+   release_vm_unshare  → release_run(5)
+-  release_vm_exit     → owner_mark_dead(標死+蓋 died_at)+ release_run(5)
+-                        /* 放手的唯一事件源;grace(3s)過後的保證輪執行 */
+-release_run(n):n=0 取消;run==0 → round=0 起跑;進行中只續命不縮短
+-```
+-
+-`manual_release=1` = `release_run(1)`,與平常輪次同款;放手判準是死亡事件,
+-高頻寫無害。(`reconcile` 已降為舊版相容 no-op——v12 統計即時,舊 app 的輪詢式
++  release_vm_exit     → owner_mark_dead(單向標死)+ release_run(5)
++release_run(n):n=0 設 one-way stopping fence 並取消;stopping 後不接新事件
++               否則 run==0 → round=0 起跑;進行中只續命不縮短
++```
++
++`manual_release=1` = `release_run(1)`,與平常輪次同款,不提前放棄保護參照。
++(`reconcile` 已降為舊版相容 no-op——統計即時,舊 app 的輪詢式
+ 寫入自動得到它要的效果,§10。)
+ 
+ **free hook 缺席時(tracepoint 掛不上 / reclaim_enable=0)同一套流程自適應,無模式
+ 旗標、無特判**:released_return 不會發生,RELEASED 累積在表上;release 每輪照常
+-三分類、蓋戳、算 pending;每輪觸發的 adjust 以
++收集、蓋戳、看 pending;RELEASED 非空觸發的 adjust 以
+ AS_PRECISE 批次 contig 掃回(§7),掃不回的過 GRACE 由 purge 放棄,deficit 打開後
+ refill 補。hook 有無的差別只是 RELEASED 的停留時間(µs vs 秒)與損耗率(put 到
+ sweep 之間被 pcp-steal 的頁走 purge),帳都在 reclaim_debug / purge_log。
+ 
+-狀態名要分清:「仍被 hold」= 保護 ref 未 put = SERVED,收尾邊 `served_to_ext(EXPIRED)`
+-(**事件驅動**:owner 已亡 + DEATH_GRACE);已 put、在 buddy/handover 的才是
++狀態名要分清:保護 ref 未 put = SERVED 或 PENDING;已 put、在 buddy/handover 的才是
+ RELEASED,由
+ `released_to_ext(EXPIRED)` 收(**時鐘驅動**:released_at + GRACE=10s——全設計
+ 僅存的放棄時鐘)。
+@@ -857,18 +854,18 @@
+   3=CONTIG_AT+EVICT_ISOLATE(代號 B)。-ENODEV(insmod 未完)/-EBUSY(USER run 中)
+   /-ENOSYS(缺符號:1 需 contig_pages;2 需 contig_range;3 另需
+   folio_isolate_lru+reclaim_pages)。已達標回 0,reason="already at target"。
+-- `pool_avail` / `pool_cma` / `pool_avail_cma_able` / `pool_size_max`(0400):
+-  O(1) 查詢;avail_cma_able 於 !capable(含 PENDING)恆 0。
+-- `refill_stat`(0400):17 欄 key=value——state(idle/running,由 release run 導出)、
+-  pool_avail、pool_total(已證明容量,§5.1)、served(= served+released)、pool_want、
++- `pool_avail` / `pool_pending` / `pool_cma` / `pool_avail_cma_able` / `pool_size_max`(0400):
++  O(1) 查詢;avail_cma_able 於 !capable(含 CMA 參數 PENDING)恆 0。
++- `refill_stat`(0400):既有欄位後追加 pool_pending——state(idle/running,由 release run 導出)、
++  pool_avail、pool_total(已證明容量,§5.1)、served(= served+pending+released)、pool_want、
+   total_served、total_refilled(= 五個 in_* 之和)、active_vms、
+   acquire_active(= adjust worker **run != 0,任何 profile**:USER 按的、release
+   觸發的背景 refill、SHRINK 都算——app 據此顯示「pool 正在調整」;它同時**就是**
+   可寫訊號:=1 ⇔ 寫 `pool_want*`/`manual_refill` 會 -EBUSY ⇔ 旁路暫停借出,
+-  §4/§9 同一顆 bit)、acquire_mode / acquire_stop_reason(**只反映 USER run**——
+-  這兩個是使用者按的那顆 acquire 的模式與結束原因,背景 run 不碰)、refill_enable、
++  §4/§9 同一顆 bit)、acquire_mode(USER 最後選的模式)、acquire_stop_reason
++  (最後記錄的 run 原因,包括背景 run;idle 時保留,不代表本次重新計算容量)、refill_enable、
+   free_reclaim(free hook 實際狀態)、pool_want_with_cma、pool_cma、
+-  pool_avail_cma_able、cma_pb_order(VERIFIED 才報,否則 -1)。
++  pool_avail_cma_able、cma_pb_order(VERIFIED 才報,否則 -1)、pool_pending。
+ - `acquire_stop_reason` 字串集(app 逐字比對,固定):idle / acquiring /
+   already at target / pool capacity full / cma headroom floor /
+   cma flip failed (systemic) / stopped by user / reached target /
+@@ -877,12 +874,13 @@
+   quality converged / cma sources stuck。
+ - `reclaim_debug`(0400):o9_seen/del_hit/del_miss/gate_drop/skip_unmovable/
+   reject/orphan/purged/in_hook/in_sweep/in_cma/in_user/in_refill。
+-- `vm_owners`(0400):pid/vm_count/served/abandoned/comm 逐行。abandoned 語意
+-  (2026-08-28 起)= **pid 死亡時仍持有而被放手的頁數**;活著的 pid 恆 0——
++- `vm_owners`(0400):pid/vm_count/served/abandoned/comm 逐行。abandoned 是
++  保留的舊格式欄位,本候選不因死亡時鐘放手,值為 0——
+   沒有 abandon-while-alive 概念,舊 app 的「vm_count==0 且 abandoned>0 = 疑似
+   卡死」提示自然靜默(該組合不再出現)。stuck pin 的觀測改用:vm_count==0 而
+   served>0 持續 = crosvm 收尾偏慢或卡住,頁仍在 SERVED 帳上。
+-- `served_summary`(0400):tracked/served/released/live/orphan/purged + per-owner
++- `served_summary`(0400):既有 tracked/served/released/live/orphan/purged 後追加 pending;tracked
++  含 pending,served 含仍保護的 pending,另有 per-owner
+   行,讀時即時快照。per-owner 欄位名固定 **`pages=`**——舊 ABI 名,app 解析釘死;
+   值是即時維護的 owner.served,只有標籤是歷史遺產。
+ - `purge_log`(0400,需 debug=1):放棄頁 pfn/refcount/現況——回答「池短了」和
+@@ -890,7 +888,7 @@
+ - `cma_usage`(0400,~1s 快取):儲備池佔用(free/anon/file MB、塊三態)。
+ - `reconcile`(0200):**舊版相容 no-op**——接受寫 1,什麼都不做。舊版把 per-owner
+   統計與 ghost 清理放在同步的 reconcile pass 裡,舊 app 因此在每次統計讀取前
+-  (甚至每秒)寫它;v12 統計即時維護、放手走時戳,舊 app 想要的效果(下次讀到
++  (甚至每秒)寫它;統計即時維護,舊 app 想要的效果(下次讀到
+   新數字)自動成立——**接受並忽略就是對舊語意最忠實的實作**,同時免疫舊 app
+   輪詢造成的 state 抖動(armed 輪次壽命 ~1s,實測教訓 2026-08-28)。
+   「現在跑一輪 release」= manual_release。
+@@ -986,17 +984,14 @@
+ 
+ **已知邊界**:cma→avail/ext 永久失敗(長期 pin)→ SKIP_THIS_SCAN + hp 上限 +
+ partial,塊留 CMA 續計;**crosvm 活著期間 stuck pin 一律不放手**——頁留 SERVED、
+-池就短著(held 含它,帳面不開洞、不觸發 refill 買替代),放手的唯一事件是 pid
+-死亡。這是刻意的:舊制 idle_since+10s 在「1→0 蓋戳→放手→0→1 重開」上有誤放手
+-/誤標 abandoned 的競態,事件驅動無此窗口;代價是 stuck 期間池短,由「重啟 crosvm
+-即恢復」承擔(§2,2026-08-28 定案)。pid-exit tracepoint 萬一 attach 失敗(不應
+-發生,core tracepoint)→ 死亡放手退化為 owner sweep 的 mm_users==0 偵測(表滿
+-兜底),正確性不變只是慢。
++池就短著(held 含它,帳面不開洞、不觸發 refill 買替代)。PID 死亡觀測後轉
++PENDING,依真實參照歸還,不能承諾只重啟進程即可消除永久外部 pin。若 exit hook
++未觀測死亡,本候選保留既有 SERVED 後續事件語意;mock 不能證明實機 tracepoint
++成功掛載,該路徑須另做 runtime 驗證。
+ 
+ **固定值**:entry 20B(不做 union 壓縮);chunk 1GB;GRACE=10s(僅
+-slot.released_at 的 purge 時鐘);DEATH_GRACE_SEC=GH_RELEASE_ROUNDS−2=3s
+-(owner 死亡放手的寬限,時鐘單向、與 ROUNDS 配對,_Static_assert 擋 ROUNDS<2);
+-GH_RELEASE_ROUNDS=5(載具下限,同時決定 DEATH_GRACE);ADJUST_RUN_MAX=120000;
++slot.released_at 的 purge 時鐘);GH_PENDING_BATCH=256(每秒 pending 檢查上界);
++GH_RELEASE_ROUNDS=5(每 VM 事件的短回收窗);ADJUST_RUN_MAX=120000;
+ PRECISE_BATCH=16 / CHEAP_BATCH=64 / FULL_BATCH=16 / SWEEP_SCAN=256 / CTA_BATCH=8 /
+ FLIP_BATCH=8 / DROP_BATCH=8 / SHED_BATCH=32 / A_STRIDE=8;CMA verify delta 門檻
+ 384 頁、CMA_VERIFY_MISS_MAX=8;S≥16 不支援(保住 atomic 掃描小常數上界)。
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -105,6 +105,7 @@
+ | `external` | the system's (outside custody) |
+ | `avail` | standing by in the pool |
+ | `served` | lent to a VM (GUP pin + one protective reference of ours) |
++| `pending` | detached from a dead owner; pool protection reference retained until external pins/mappings finish |
+ | `released` | the VM let go, destination undecided (waiting for the free hook, or for the give-up timer) |
+ | `cand` | being assembled by collect_cma; cannot be served or shed |
+ | `verify` | scratch window for CMA parameter verification (within one call) |
+@@ -113,8 +114,8 @@
+ **Accounting and invariants** (§1):
+ 
+ ```
+-custody   = avail + served + released + cand + verify
+-held      = avail + served + released + verify
++custody   = avail + served + pending + released + cand + verify
++held      = avail + served + pending + released + verify
+ held_cma  = held + cma
+ 
+ I1  held     → pool_want               (a convergence target, not an instantaneous invariant)
+@@ -236,7 +237,7 @@
+             │            ┌───────────────────────┐   ┌────────────────────┐   │
+             │            │ release_worker (1s×5) │──►│ adjust_worker      │   │
+             │            │ served→released,      │   │ (10ms×MAX)         │   │
+-            │            │ timed give-up, ownerGC│   │ 7-phase pipeline   │   │
++            │            │ pending collect, GC   │   │ 7-phase pipeline   │   │
+             │            └───────────┬───────────┘   └─────────┬──────────┘   │
+             ▼                        ▼                         ▼              │
+ ┌─────────────────────────────────────────────────────────────────────┐       │
+@@ -349,7 +350,8 @@
+ | return (released→avail/ext) | `pool_released_return(pg)` — KEEP/DROP/MISS event api | free hook (atomic) |
+ | sweep (released→avail) | `pool_released_to_avail_sweep(pfn)` | adjust |
+ | purge (released→ext) | `pool_released_to_ext(EXPIRED/ALL)` | adjust / rmmod |
+-| expired (served→ext) | `pool_served_to_ext(EXPIRED/ALL)` | release / rmmod |
++| pending collect | `pool_pending_to_released(max_scan)` | release |
++| unload (served/pending→ext) | `pool_served_to_ext(ALL)` | rmmod |
+ | flip (avail→cma) | `pool_avail_to_cma(n)` | adjust |
+ | stage_in (cma→avail) | `pool_cma_to_avail(n)` | adjust |
+ | drop (cma→ext) | `pool_cma_to_ext(n/ALL)` | adjust / rmmod |
+@@ -422,32 +424,31 @@
+ 
+ Three VM events (vm_shutdown / vm_unshare / pid death) each arm 5 rounds; the
+ event facade also updates the owner table (attributed vm_count decrement — pure
+-serve-gate maintenance — and the dead mark). Five rounds is a guaranteed floor, not a
+-ceiling. Each round does five things:
++serve-gate maintenance — and the dead mark). Drained runs can finish early;
++outstanding PENDING keeps a bounded round scheduled. Each round does five things:
+ 
+ 1. **Collect (served→released)**: index-scan the whole table for SERVED and
+    classify each page by refcount —
+-   - `refcount==1` (only our own protective reference is left) = the VM really
++   - `refcount==1 && !mapping` (only our own protective reference is left) = the VM really
+      let go → mark RELEASED and stamp inside the lock, then `put_page` outside
+      it. After the put the page takes the normal free path, and as it flows
+      through the free hook `pool_released_return` decides whether to take it back
+      or let it go. "Mark before releasing" is a hard rule: in the other order the
+      free hook would not recognise the page and it would be lost.
+-   - `refcount>1` = the VM's/Gunyah's pin is not released yet → do not touch it
+-     this round, look again next round.
++   - `refcount>1` or a remaining mapping = external teardown is unfinished.
++     A dead owner's page moves to pool-owned PENDING, retaining the same
++     protection reference and clearing owner attribution.
+    - `page_count==0` = **orphan**: the free already happened but the hook missed
+      it (pcp lag, or an attach gap), and our reference evaporated with the free →
+      do not put, just mark RELEASED and hand it to the existing sweep (take it
+      back) / purge (give up) exits. No new path is opened.
+-2. **Death give-up (served→ext EXPIRED)**: for each SERVED, look up the owner —
+-   a LIVE owner is never touched, whatever its vm_count (vm_count is only the
+-   serve gate); owner dead (marked) or gone from the table = stop tracking: mark
+-   EXT, drop our reference, record purge_log and `owner.abandoned++`. From then
+-   on the page lives with whoever still pins it, and is none of the module's
+-   business. Giving up is the EVENT consequence of pid death plus DEATH_GRACE
+-   (3s) — a one-way clock started only at death, never cleared (the old
+-   idle+10s clock raced a VM restart 1→0→1 into false give-ups; the grace lets
+-   the exit path's own frees come home as a collect).
++2. **Bounded pending collect**: round-robin at most 256 PENDING pages.
++   Only `refcount==1 && !mapping` permits unlinking, publishing RELEASED, then
++   dropping the pool reference outside the lock. Nonready pages move to the
++   list tail. Owner death never drops an outstanding protection reference.
++   A zero refcount means the protection reference has already vanished:
++   retire that pending identity to EXT, record an orphan, and do not put.
++   A later ordinary occupant at the same PFN has no pool return permission.
+ 3. **`drain_pages` on round 3**: an order-9 free parks in the per-CPU cache
+    (pcp) first and does not flow through the hook immediately — measured ~2 pages
+    lost per VM. Round 3 (≈3s, after the shutdown free storm has passed) drains
+@@ -459,21 +460,22 @@
+    vm_count==0 whose pid is still alive is **kept**, because the app must be able
+    to see a suspicious pid that closed its VM but did not give the pages back
+    (D-state detection, §10).
+-5. **Wake adjust**: `adjust_try(RELEASE)` every round. During the wait, held
+-   still includes served/released, so there is no deficit on the books and only
+-   `precise` actually has work; once DROP/EXPIRED genuinely opens a deficit,
+-   cheap/full/stage_in start moving — the condition system sequences this by
+-   itself, so there is no need for two profiles.
+-
+-**Self-extension**: rounds exhausted but pending>0 (pages still waiting on unpin
+-or grace) → `run=1` for one more round. It is bounded: after at most 10 seconds
+-of grace EXPIRED takes them, and RELEASED converges through purge, so it cannot
+-extend forever.
+-
+-The design core: **give-up is an event plus a short grace (pid death + 3s),
+-purge is a clock (released_at + 10s), the rounds are just the vehicle** — so a
+-high-frequency `manual_release`, or several events arming rounds repeatedly,
+-only cause a few extra harmless scans and never bring either forward.
++5. **Wake adjust when needed**: actual collections, zero-ref retirement, or a nonempty RELEASED
++   set trigger `adjust_try(RELEASE)`. A permanently pinned pending page keeps
++   its protection reference and remains visible, without starting a refill
++   pipeline every second. PENDING counts in held and in block custody.
++
++**Self-extension**: a nonempty PENDING list keeps one bounded round scheduled.
++The final external put is 2→1 and does not run the free hook; these scheduled
++checks collect the original page even after owner GC and without a new VM
++event. The 10s RELEASED purge clock begins only after the protection reference
++is released. The existing late-unpin semantics for a live SERVED owner remain.
++
++**Unload**: after hooks are detached, `release_run(0)` sets a one-way stopping
++fence. It serializes with the worker's final adjust/schedule kick, so teardown
++can cancel both workers and release each SERVED/PENDING protection reference
++once through ALL. Ordinary EXT pages gain no new return permission.
++An already zero-refcount pending page retires without a second put.
+ 
+ **adjust_worker — "drive the pool to target"** (one round per 10ms)
+ 
+@@ -482,7 +484,7 @@
+ | profile | trigger | authorised acquisition strength |
+ |---|---|---|
+ | `INSMOD` | boot; module_init drives it synchronously to completion | cheap + full |
+-| `RELEASE` | every release worker round | precise + stage_in (+ cheap + full, gated by `refill_enable`) |
++| `RELEASE` | actual collections or outstanding RELEASED | precise + stage_in (+ cheap + full, gated by `refill_enable`) |
+ | `SHRINK` | a want target was lowered | stage_in only |
+ | `USER` | the user pressed `acquire` | everything (the only one including main) |
+ 
+@@ -507,7 +509,7 @@
+ numbers, never cached** (the pool situation is changed by hooks at any moment):
+ 
+ ```
+-held           = avail + served + released     how much is in custody now
++held           = avail + served + pending + released + verify  how much is in custody now
+ diff_want      = want − held                   pool share short (+) / over (−) by
+ new_page_need  = want_cma − (held + cma)       total guardianship still short → must ask the system
+ reserve_target = want_cma − want               how big the reservoir should be
+@@ -630,7 +632,7 @@
+ | `parts/gh_defs.h` | shared types, kapi adapter contract, enums | — |
+ | `parts/gh_owner.c.inc` | owner registry (pid-lifetime entries; vm_count is only the serve gate) | mock |
+ | `parts/gh_pool.c.inc` | **the pool object**: all state + locks live here | mock |
+-| `parts/gh_release.c.inc` | release worker (served→released, timed give-up) | mock |
++| `parts/gh_release.c.inc` | release worker (served→released, bounded pending collect) | mock |
+ | `parts/gh_adjust.c.inc` | adjust worker (the 7-phase acquire/flip pipeline) | mock |
+ | `parts/gh_kernel_env.h` | kernel primitive glue (locks, clock, page ops) | on-device |
+ | `parts/gh_kapi.c.inc` | kernel kapi backend (symbol resolve, version shims) | on-device |
+@@ -650,7 +652,7 @@
+ 
+ Testing has three tiers. **Tier 0** (`tests/`, this repo's CI) proves the pool
+ logic with no kernel: `make test` builds `tests/harness.c` and replays 34
+-scenarios covering serve/return, event-driven death give-up + grace, the serve
++scenarios covering serve/return, dead-owner pending custody and late unpin, the serve
+ gate across a VM restart, u32-timestamp wrap, two-owner mm-less attribution,
+ orphan/purge, S=2 block classification, the CMA reservoir (flip/stage-in/drop/
+ verify including the pageblock-order off-by-one), whole-zone sweep with eviction,
+@@ -709,8 +711,9 @@
+ 
+ | file | mode | contents |
+ |---|---|---|
+-| `refill_stat` | 0400 | 17 `key=value` lines (below) |
++| `refill_stat` | 0400 | existing `key=value` lines plus `pool_pending` |
+ | `pool_avail` | 0400 | pages standing by in the pool |
++| `pool_pending` | 0400 | pool-owned protection references waiting after owner death |
+ | `pool_cma` | 0400 | reservoir size (in 2MB-page equivalents) |
+ | `pool_avail_cma_able` | 0400 | avail pages belonging to a cma_able block (0 unless VERIFIED) |
+ | `pool_size_max` | 0400 | RAM-derived cap on both wants |
+@@ -721,15 +724,17 @@
+ | `cma_usage` | 0400 | reservoir occupancy (free/anon/file MB, block tri-state), ~1s cache |
+ 
+ `refill_stat` fields: `state`, `pool_avail`, `pool_total` (proven capacity,
+-§5.1), `served` (= served + released), `pool_want`, `total_served`,
++§5.1), `served` (= served + pending + released), `pool_want`, `total_served`,
+ `total_refilled`, `active_vms`, `acquire_active`, `acquire_mode`,
+ `acquire_stop_reason`, `refill_enable`, `free_reclaim` (the free hook's real
+-state), `pool_want_with_cma`, `pool_cma`, `pool_avail_cma_able`, `cma_pb_order`.
++state), `pool_want_with_cma`, `pool_cma`, `pool_avail_cma_able`, `cma_pb_order`,
++and the appended `pool_pending`.
+ `acquire_active` reflects whether the adjust worker has a run in flight at all
+ (**any profile**, release-triggered background refills and SHRINK included); =1
+ also means want writes return -EBUSY and the CMA bypass pauses lending.
+-`acquire_mode` / `acquire_stop_reason` reflect **USER runs only** — a background
+-run never overwrites them. `cma_pb_order=-1` means the whole CMA side is off for
++`acquire_mode` retains the user's selected mode. `acquire_stop_reason` is the
++last recorded run status, including background statuses; it persists while
++idle and does not recompute current capacity. `cma_pb_order=-1` means the CMA side is off for
+ this boot (missing symbols/preflight values, or verification failed).
+ 
+ `acquire_stop_reason` is a fixed string set the app compares verbatim: `idle` /
+@@ -739,9 +744,9 @@
+ `scanned all present memory` / `low-memory floor` / `evict-B unavailable` /
+ `quality converged` / `cma sources stuck`.
+ 
+-`vm_owners` doubles as a stuck-VM detector. `abandoned` counts pages let go when
+-the pid DIED still holding them; for a live pid it is always 0 (there is no
+-abandon-while-alive anymore). The live-pid stuck signal is vm_count==0 with
++`vm_owners` doubles as a stuck-VM detector. `abandoned` remains as a legacy
++field and is zero in this candidate; death retains outstanding references in
++PENDING. The live-pid stuck signal is vm_count==0 with
+ served>0 persisting: crosvm's teardown is slow or stuck, and the pages are still
+ on the SERVED books — the app can read `/proc/<pid>/stat` and flag a D state.
+ 
+diff --git a/parts/gh_adjust.c.inc b/parts/gh_adjust.c.inc
+--- a/parts/gh_adjust.c.inc
++++ b/parts/gh_adjust.c.inc
+@@ -599,6 +599,7 @@
+ }
+ static const char *gh_adjust_stop_reason_str(void)
+ {
++	/* Last recorded run status, retained while idle; not a fresh capacity test. */
+ 	return GH_READ_ONCE(gh_stop_reason);	/* literals only; annotated for TSan */
+ }
+ 
+diff --git a/parts/gh_defs.h b/parts/gh_defs.h
+--- a/parts/gh_defs.h
++++ b/parts/gh_defs.h
+@@ -17,18 +17,11 @@
+ #define GH_NIL			((u32)~0u)
+ #define GH_PFN_NONE		(~0UL)
+ #define GH_GRACE_SEC		10			/* released_at purge clock (RELEASED only) */
+-/* Give-up on served pages is EVENT-driven — pid death — plus a short grace so
+- * the exit path's own teardown (delayed_fput, late unpins) can hand pages back
+- * as a normal COLLECT instead of a give-up. The clock starts only at death and
+- * is never cleared (death is one-way), so it cannot race a VM restart the way
+- * the old idle_since clock did. The grace must end inside the round window the
+- * pid-exit event itself arms (GH_RELEASE_ROUNDS x 1s), so the guaranteed
+- * rounds scan it after expiry with no reliance on self-extension — hence
+- * ROUNDS-2, and ROUNDS must stay >= 2 (compile-time constants: re-check this
+- * pairing whenever either changes). */
++/* VM events arm a short release window. Dead-owner pages keep their pool
++ * protection reference in PENDING until the external references finish;
++ * this window is not a deadline for giving up on them. */
+ #define GH_RELEASE_ROUNDS	5			/* rounds armed per VM event (1s each) */
+-#define GH_DEATH_GRACE_SEC	(GH_RELEASE_ROUNDS - 2)
+-_Static_assert(GH_RELEASE_ROUNDS >= 2, "death grace needs ROUNDS >= 2");
++#define GH_PENDING_BATCH	256			/* pending checks per 1s round */
+ #define GH_VM_OWNER_MAX		8
+ #define GH_COMM_LEN		16
+ 
+@@ -37,6 +30,7 @@
+ enum gh_state {
+ 	GH_NOT_USEABLE = 0, GH_EXT, GH_AVAIL, GH_SERVED,
+ 	GH_RELEASED, GH_CAND, GH_VERIFY, GH_CMA,
++	GH_PENDING,		/* append: preserve all existing state values */
+ 	GH_STATE_MAX,
+ };
+ 
+@@ -49,9 +43,9 @@
+ struct gh_slot {			/* 20B, fixed (§11) */
+ 	u8  state;
+ 	u8  origin;
+-	u32 owner_id;			/* SERVED/RELEASED: owner generation+index */
++	u32 owner_id;			/* SERVED: owner generation+index; PENDING: 0 */
+ 	u32 released_at;		/* RELEASED: seconds */
+-	u32 prev, next;			/* global slot index, GH_NIL; AVAIL only */
++	u32 prev, next;			/* AVAIL class list OR PENDING list, never both */
+ };
+ 
+ struct gh_slist { u32 head, tail; int n; };
+@@ -127,6 +121,7 @@
+ 	enum gh_cma_params_state cma_params;
+ 	long reject, orphan, gate_drop, purged;
+ 	long origin[GH_ORIGIN_MAX];
++	int pending;			/* append: held refs detached from dead owners */
+ };
+ struct gh_owner_row {
+ 	pid_t tgid; char comm[GH_COMM_LEN];
+diff --git a/parts/gh_owner.c.inc b/parts/gh_owner.c.inc
+--- a/parts/gh_owner.c.inc
++++ b/parts/gh_owner.c.inc
+@@ -3,13 +3,12 @@
+  * Entry lifetime = pid lifetime: an owner that closed its last VM stays in
+  * the table while the process lives (the app watches vm_count==0 with
+  * served>0 persisting as the slow/stuck-teardown signal, §10). Removal
+- * happens only for dead owners with no SERVED/RELEASED left (sweep), keyed
++ * happens only for dead owners with no SERVED left (sweep), keyed
+  * by the pid-exit hook or the mm_users==0 backstop.
+  *
+  * vm_count is ONLY the serve gate (§2): boot ++, shutdown --, no serving
+- * while 0. It drives no give-up and stamps no clock — giving up on a page
+- * is the EVENT consequence of pid death (the old idle_since+10s clock raced
+- * a 1->0->1 VM restart into false give-ups; removed 2026-08-28).
++ * while 0. Death detaches outstanding pages into pool-owned PENDING;
++ * the pool retains its protection refs independently of pid lifetime.
+  */
+ 
+ struct gh_owner {
+@@ -18,12 +17,9 @@
+ 	pid_t tgid;
+ 	char comm[GH_COMM_LEN];
+ 	int  vm_count;
+-	int  dead;			/* pid-exit hook marked; the ONLY give-up driver */
+-	u32  died_at;			/* seconds at death; starts the short give-up
+-					 * grace (GH_DEATH_GRACE_SEC). Never cleared:
+-					 * death is one-way, so no restart race. */
++	int  dead;			/* one-way pid-exit mark; detaches to PENDING */
+ 	long served;			/* pages currently attributed (report) */
+-	long abandoned;			/* pages given up on this owner (report) */
++	long abandoned;			/* retained legacy report field; no timed give-up */
+ };
+ 
+ static gh_rwlock_t gh_pid_lock;
+@@ -65,7 +61,7 @@
+  * fires AFTER exit_mm, so task->mm is already NULL there -- an mm-based filter
+  * (owner_maybe) would always miss on the exit path. Match by tgid instead;
+  * mark_dead re-checks under the lock. (Tier-1 find: mm==NULL at sched_process_
+- * exit meant death give-up never armed; mock can't see this — it calls
++ * exit meant owner death never observed; mock can't see this — it calls
+  * mark_dead directly, bypassing the tracepoint's mm timing.) */
+ static bool gh_owner_tgid_maybe(pid_t tgid)
+ {
+@@ -115,7 +111,6 @@
+ 		gh_strscpy(o->comm, comm, GH_COMM_LEN);
+ 		GH_WRITE_ONCE(o->vm_count, 1);
+ 		o->dead = 0;
+-		o->died_at = 0;
+ 		o->served = 0;
+ 		o->abandoned = 0;
+ 		gh_mmgrab(mm);
+@@ -166,14 +161,13 @@
+ 	gh_write_lock(&gh_pid_lock);
+ 	for (i = 0; i < GH_VM_OWNER_MAX; i++) {
+ 		if (gh_owners[i].mm && gh_owners[i].tgid == tgid && !gh_owners[i].dead) {
+-			GH_WRITE_ONCE(gh_owners[i].died_at, gh_now_sec());
+ 			GH_WRITE_ONCE(gh_owners[i].dead, 1);	/* dead published last */
+ 		}
+ 	}
+ 	gh_write_unlock(&gh_pid_lock);
+ }
+ 
+-/* GC: only dead owners with no SERVED/RELEASED left (page counts fed by the
++/* GC: only dead owners with no SERVED left (page counts fed by the
+  * pool side); mmdrop outside the lock. Never touches live entries. */
+ static void gh_pool_owner_sweep(void)
+ {
+@@ -201,7 +195,7 @@
+ 		gh_mmdrop(drop[i]);
+ }
+ 
+-/* Lockless advisory: is this owner gone or dead (the give-up event, §2)?
++/* Lockless advisory: is this owner gone or dead (detach to PENDING, §2)?
+  * Reads only single-copy-atomic published fields — safe to call WITHOUT
+  * pid_lock, which is exactly why the release pending-count uses it: taking
+  * pid_lock under pool_lock would invert serve's pid->pool order (ABBA). The
+@@ -219,7 +213,7 @@
+ 	return GH_READ_ONCE(o->dead);
+ }
+ 
+-/* pool side reports a page leaving SERVED/RELEASED attribution */
++/* pool side reports a page leaving SERVED attribution */
+ static void gh_owner_served_dec(u32 owner_id)
+ {
+ 	struct gh_owner *o = gh_owner_by_id(owner_id);
+diff --git a/parts/gh_pool.c.inc b/parts/gh_pool.c.inc
+--- a/parts/gh_pool.c.inc
++++ b/parts/gh_pool.c.inc
+@@ -6,8 +6,8 @@
+  * or reads top[]/slots.
+  *
+  * Complete: addressing, avail tri-list + block classification, serve,
+- * released return (KEEP/DROP), served->released, EXPIRED give-up
+- * (owner death), released purge, shed, all five ext_to_avail intake modes,
++ * released return (KEEP/DROP), served->released, dead-owner PENDING custody,
++ * bounded pending collect, released purge, shed, ext_to_avail intake modes,
+  * cand/grab/promote-conservation, scan sets + ext_cursor, CMA edges
+  * (flip/stage_in/drop + occupancy bucket scan), verify_cma_params, window
+  * actions, carveout marking, targets, snapshots, pool_check.
+@@ -24,6 +24,7 @@
+ #define GH_S		(1u << (gh_cma_order - GH_PAGE_ORDER))
+ 
+ static struct gh_slist gh_avail[GH_L_MAX];
++static struct gh_slist gh_pending;		/* owns PENDING prev/next only */
+ static long gh_nstate[GH_STATE_MAX];		/* pages (2MB units) per state */
+ static u32 gh_released_oldest;			/* seconds; valid when RELEASED>0 */
+ 
+@@ -158,7 +159,7 @@
+ 
+ 		if (st != GH_AVAIL)
+ 			all_avail = false;
+-		if (st != GH_AVAIL && st != GH_SERVED && st != GH_RELEASED &&
++		if (st != GH_AVAIL && st != GH_SERVED && st != GH_PENDING && st != GH_RELEASED &&
+ 		    st != GH_CAND && st != GH_VERIFY)
+ 			return GH_L_NON;	/* custody broken: straggler block */
+ 	}
+@@ -290,9 +291,11 @@
+ /* ── queries (O(1) counters) ───────────────────────────── */
+ int gh_pool_avail(void)     { return GH_READ_ONCE(gh_avail[GH_L_NON].n) + GH_READ_ONCE(gh_avail[GH_L_ABLE].n) + GH_READ_ONCE(gh_avail[GH_L_READY].n); }
+ int gh_pool_served(void)    { return (int)GH_READ_ONCE(gh_nstate[GH_SERVED]); }
++int gh_pool_pending(void)   { return (int)GH_READ_ONCE(gh_nstate[GH_PENDING]); }
+ int gh_pool_released(void)  { return (int)GH_READ_ONCE(gh_nstate[GH_RELEASED]); }
+ int gh_pool_cma(void)       { return (int)GH_READ_ONCE(gh_nstate[GH_CMA]); }
+ int gh_pool_held(void)      { return gh_pool_avail() + (int)GH_READ_ONCE(gh_nstate[GH_SERVED]) +
++				     (int)GH_READ_ONCE(gh_nstate[GH_PENDING]) +
+ 				     (int)GH_READ_ONCE(gh_nstate[GH_RELEASED]) + (int)GH_READ_ONCE(gh_nstate[GH_VERIFY]); }
+ int gh_pool_noncma_able(void)    { return GH_READ_ONCE(gh_avail[GH_L_NON].n); }
+ int gh_pool_avail_cma_able(void) { return gh_cma_params == GH_CMA_VERIFIED ? GH_READ_ONCE(gh_avail[GH_L_READY].n) : 0; }
+@@ -392,14 +395,28 @@
+ }
+ 
+ /* ── release worker edges ──────────────────────────────── */
+-/* served -> released for idle pages; returns pending (§3.2/§6) */
++/* Pool lock held. RELEASED has dropped (or lost) the protection reference;
++ * PENDING has not. The released purge clock starts only at this boundary. */
++static void gh_mark_released(struct gh_slot *s, u32 now)
++{
++	gh_set_state(s, GH_RELEASED);
++	GH_WRITE_ONCE(s->released_at, now);
++	if (gh_nstate[GH_RELEASED] == 1)
++		GH_WRITE_ONCE(gh_released_oldest, now);
++}
++
++/* SERVED -> RELEASED when the pool is the sole holder. Dead-owner pages
++ * still in use detach to PENDING WITHOUT dropping the protection reference.
++ * Returns actual collections, not the number of outstanding references. */
+ int gh_pool_served_to_released(void)
+ {
+ 	unsigned long fl;
+ 	u32 idx;
+-	int pending = 0;
++	int collected = 0;
+ 	u32 now = gh_now_sec();
+ 
++	if (gh_pool_served() == 0)
++		return 0;
+ 	for (idx = 0; idx < gh_span_slots; idx++) {
+ 		struct gh_slot *s = gh_slot_at(idx);
+ 		struct page *pg;
+@@ -408,95 +425,141 @@
+ 		if (!s || GH_READ_ONCE(s->state) != GH_SERVED)
+ 			continue;
+ 		pg = pfn_to_page(gh_pfn_of_idx(idx));
+-		cnt = page_count(pg);
+ 		gh_spin_lock(&gh_pool_lock, &fl);
+ 		if (s->state != GH_SERVED) {		/* re-validate under lock */
+ 			gh_spin_unlock(&gh_pool_lock, &fl);
+ 			continue;
+ 		}
++		cnt = page_count(pg);
+ 		if (cnt == 1 && !gh_page_has_mapping(pg)) {
+-			gh_set_state(s, GH_RELEASED);
+-			GH_WRITE_ONCE(s->released_at, now);
+-			if (gh_nstate[GH_RELEASED] == 1)
+-				GH_WRITE_ONCE(gh_released_oldest, now);
++			gh_mark_released(s, now);
+ 			gh_owner_served_dec(s->owner_id);
++			GH_WRITE_ONCE(s->owner_id, 0);
+ 			gh_spin_unlock(&gh_pool_lock, &fl);
+ 			put_page(pg);			/* outside the lock (§2) */
++			collected++;
+ 			continue;
+ 		}
+ 		if (cnt == 0) {				/* orphan: our ref evaporated */
+-			gh_set_state(s, GH_RELEASED);
+-			GH_WRITE_ONCE(s->released_at, now);
+-			if (gh_nstate[GH_RELEASED] == 1)
+-				GH_WRITE_ONCE(gh_released_oldest, now);
++			gh_mark_released(s, now);
+ 			gh_owner_served_dec(s->owner_id);
++			GH_WRITE_ONCE(s->owner_id, 0);
+ 			gh_dbg_orphan++;
+ 			gh_spin_unlock(&gh_pool_lock, &fl);
++			collected++;
+ 			continue;
+ 		}
+-		/* still pinned: pending iff the owner is DEAD (give-up under way,
+-		 * bounded by the next round; a LIVE owner's late unpin is simply
+-		 * left for a later trigger's round, §6). LOCKLESS
+-		 * owner read — taking pid_lock here would invert serve's
+-		 * pid->pool order (§2). Advisory: re-checked next round. */
+-		if (gh_owner_is_dead(GH_READ_ONCE(s->owner_id)))
+-			pending++;
++		/* Death ends pid attribution, not pool custody. Keeping our ref
++		 * prevents PFN reuse while the external holder finishes. */
++		if (gh_owner_is_dead(GH_READ_ONCE(s->owner_id))) {
++			gh_set_state(s, GH_PENDING);
++			gh_owner_served_dec(s->owner_id);
++			GH_WRITE_ONCE(s->owner_id, 0);
++			gh_slist_push(&gh_pending, idx);
++		}
+ 		gh_spin_unlock(&gh_pool_lock, &fl);
+ 		gh_cond_resched_every(idx);
+ 	}
+-	return pending;
+-}
+-
+-/* served -> ext: give-up on owner DEATH (§3.2 EXPIRED; a live owner is never
+- * touched, whatever its vm_count) or rmmod ALL */
++	return collected;
++}
++
++/* Round-robin only the outstanding pool-owned list, at most @max_scan per
++ * round. The last external put is 2->1, so it cannot trigger the free hook;
++ * this collector drops our final reference after observing sole custody.
++ * Returns completed custody edges, including lost-reference retirement. */
++int gh_pool_pending_to_released(int max_scan)
++{
++	unsigned long fl;
++	int nscan, i, collected = 0;
++	u32 now = gh_now_sec();
++
++	if (max_scan <= 0)
++		return 0;
++	gh_spin_lock(&gh_pool_lock, &fl);
++	nscan = gh_pending.n < max_scan ? gh_pending.n : max_scan;
++	gh_spin_unlock(&gh_pool_lock, &fl);
++	for (i = 0; i < nscan; i++) {
++		u32 idx;
++		struct gh_slot *s;
++		struct page *pg;
++		int cnt;
++
++		gh_spin_lock(&gh_pool_lock, &fl);
++		idx = gh_slist_pop(&gh_pending);
++		if (idx == GH_NIL) {
++			gh_spin_unlock(&gh_pool_lock, &fl);
++			break;
++		}
++		s = gh_slot_at(idx);
++		pg = pfn_to_page(gh_pfn_of_idx(idx));
++		cnt = page_count(pg);
++		if (cnt == 0) {
++			enum gh_class before = gh_classify(gh_blk_base(idx));
++
++			/* The protection ref has already vanished. Retire identity
++			 * before this PFN can be reused; no reference remains to put. */
++			gh_set_state(s, GH_EXT);
++			gh_rehome(gh_blk_base(idx), before, gh_classify(gh_blk_base(idx)), GH_NIL);
++			gh_dbg_orphan++;
++			gh_spin_unlock(&gh_pool_lock, &fl);
++			collected++;
++			continue;
++		}
++		if (cnt != 1 || gh_page_has_mapping(pg)) {
++			gh_slist_push(&gh_pending, idx);
++			gh_spin_unlock(&gh_pool_lock, &fl);
++			continue;
++		}
++		gh_mark_released(s, now);
++		gh_spin_unlock(&gh_pool_lock, &fl);
++		put_page(pg);			/* state published; free hook may re-enter */
++		collected++;
++		gh_cond_resched_every(i);
++	}
++	return collected;
++}
++
++/* Explicit unload only: hooks and workers must already be quiescent.
++ * Timed owner death never abandons an owned protection reference. */
+ int gh_pool_served_to_ext(enum gh_exmode mode)
+ {
+ 	unsigned long fl;
+-	u32 idx, now = gh_now_sec();
++	u32 idx;
+ 	int done = 0;
+ 
++	if (mode != GH_ALL)
++		return 0;
+ 	for (idx = 0; idx < gh_span_slots; idx++) {
+ 		struct gh_slot *s = gh_slot_at(idx);
+-		struct gh_owner *o;
+-		bool expire = (mode == GH_ALL);
+ 		enum gh_class before;
+ 		struct page *pg;
+-
+-		if (!s || GH_READ_ONCE(s->state) != GH_SERVED)
+-			continue;
+-		if (!expire) {
+-			gh_read_lock(&gh_pid_lock);
+-			o = gh_owner_by_id(GH_READ_ONCE(s->owner_id));
+-			if (!o)
+-				expire = true;		/* generation gone */
+-			else if (GH_READ_ONCE(o->dead) &&
+-				 (u32)(now - GH_READ_ONCE(o->died_at)) >=
+-					GH_DEATH_GRACE_SEC)
+-				expire = true;		/* pid died AND the short grace is
+-							 * over — the exit path's own frees
+-							 * got their chance to come home as
+-							 * a collect. A LIVE owner is never
+-							 * touched, whatever its vm_count */
+-			if (expire && o)
+-				GH_CTR_ADD(o->abandoned, 1);
+-			gh_read_unlock(&gh_pid_lock);
+-		}
+-		if (!expire)
++		bool lost_ref;
++
++		if (!s || (GH_READ_ONCE(s->state) != GH_SERVED &&
++			   GH_READ_ONCE(s->state) != GH_PENDING))
+ 			continue;
+ 		gh_spin_lock(&gh_pool_lock, &fl);
+-		if (s->state != GH_SERVED) {
++		if (s->state != GH_SERVED && s->state != GH_PENDING) {
+ 			gh_spin_unlock(&gh_pool_lock, &fl);
+ 			continue;
+ 		}
+ 		before = gh_classify(gh_blk_base(idx));
++		pg = pfn_to_page(gh_pfn_of_idx(idx));
++		lost_ref = (page_count(pg) == 0); /* SERVED orphan input exists too */
++		if (s->state == GH_PENDING)
++			gh_slist_unlink(&gh_pending, idx);
++		else
++			gh_owner_served_dec(s->owner_id);
++		GH_WRITE_ONCE(s->owner_id, 0);
+ 		gh_set_state(s, GH_EXT);		/* state first (§2 b) */
+ 		gh_rehome(gh_blk_base(idx), before, gh_classify(gh_blk_base(idx)), GH_NIL);
+-		gh_owner_served_dec(s->owner_id);
+ 		gh_dbg_purged++;
++		if (lost_ref)
++			gh_dbg_orphan++;
+ 		gh_spin_unlock(&gh_pool_lock, &fl);
+-		pg = pfn_to_page(gh_pfn_of_idx(idx));
+ 		gh_purge_log_add(gh_pfn_of_idx(idx), 0, page_count(pg));
+-		put_page(pg);				/* hand back our ref, outside lock */
++		if (!lost_ref)
++			put_page(pg);			/* hand back an owned ref, outside lock */
+ 		done++;
+ 		gh_cond_resched_every(idx);
+ 	}
+@@ -1071,8 +1134,13 @@
+ 		u32 w, guard = 0;
+ 
+ 		for (w = gh_avail[cls].head; w != GH_NIL && guard <= gh_span_slots;
+-		     w = gh_slot_at(w)->next, guard++)
++		     w = gh_slot_at(w)->next, guard++) {
++			if (gh_slot_at(w)->state != GH_AVAIL) {
++				gh_pr_warn("check: list %d owns non-AVAIL idx %u\n", cls, w);
++				ok = false;
++			}
+ 			on_list[cls]++;
++		}
+ 		if (guard > gh_span_slots) {
+ 			gh_pr_warn("check: list %d cycles\n", cls);
+ 			return false;
+@@ -1080,6 +1148,31 @@
+ 		if (on_list[cls] != gh_avail[cls].n) {
+ 			gh_pr_warn("check: list %d walk %d != n %d\n",
+ 				   cls, on_list[cls], gh_avail[cls].n);
++			ok = false;
++		}
++	}
++	{
++		u32 w, previous = GH_NIL, guard = 0;
++		int n = 0;
++
++		for (w = gh_pending.head; w != GH_NIL && guard <= gh_span_slots;
++		     w = gh_slot_at(w)->next, guard++) {
++			struct gh_slot *s = gh_slot_at(w);
++
++			if (s->state != GH_PENDING || s->prev != previous || s->owner_id != 0) {
++				gh_pr_warn("check: pending list ownership invalid at idx %u\n", w);
++				ok = false;
++			}
++			previous = w;
++			n++;
++		}
++		if (guard > gh_span_slots) {
++			gh_pr_warn("check: pending list cycles\n");
++			return false;
++		}
++		if (n != gh_pending.n || n != cnt[GH_PENDING] || previous != gh_pending.tail) {
++			gh_pr_warn("check: pending list walk %d != count %d/state %ld\n",
++				   n, gh_pending.n, cnt[GH_PENDING]);
+ 			ok = false;
+ 		}
+ 	}
+@@ -1109,6 +1202,8 @@
+ 		gh_top[g] = NULL;
+ 	for (i = 0; i < GH_L_MAX; i++)
+ 		gh_avail[i].head = gh_avail[i].tail = GH_NIL, gh_avail[i].n = 0;
++	gh_pending.head = gh_pending.tail = GH_NIL;
++	gh_pending.n = 0;
+ 	for (i = 0; i < GH_STATE_MAX; i++)
+ 		gh_nstate[i] = 0;
+ 	gh_free(gh_scan_main); gh_free(gh_scan_precise); gh_free(gh_scan_cma);
+@@ -1495,6 +1590,7 @@
+ 	o->size_max = gh_pool_size_max; o->total = gh_pool_total;
+ 	o->avail = gh_pool_avail();
+ 	o->served = (int)gh_nstate[GH_SERVED];
++	o->pending = (int)gh_nstate[GH_PENDING];
+ 	o->released = (int)gh_nstate[GH_RELEASED];
+ 	o->verify = (int)gh_nstate[GH_VERIFY];
+ 	o->cma = (int)gh_nstate[GH_CMA];
+diff --git a/parts/gh_release.c.inc b/parts/gh_release.c.inc
+--- a/parts/gh_release.c.inc
++++ b/parts/gh_release.c.inc
+@@ -1,18 +1,16 @@
+ /* gh_hugepage_reserve — release worker (§6).
+- * ctx is only {run, round}: owner state (vm_count / dead) lives in the pool
+- * owner table. Giving up on a page is the EVENT consequence of pid death
+- * (§2) — no clock, no grace on the owner side; the fixed 1s rounds are just
+- * the carrier that executes it. Event facades below are all any hook calls. */
++ * Owner death detaches outstanding references to pool-owned PENDING. Each
++ * 1s round checks a bounded part of that list until the external holders
++ * release; elapsed time never transfers custody to the buddy allocator. */
+ 
+ static int gh_adjust_try(enum gh_profile profile);	/* gh_adjust.c.inc */
+ 
+ static gh_spinlock_t gh_release_lock;
+ static int gh_rel_run, gh_rel_round;
++static int gh_rel_stopping;		/* one-way rmmod cancellation fence */
+ 
+-/* GH_RELEASE_ROUNDS (gh_defs.h) rounds per VM event: a floor of guaranteed 1s
+- * rounds — the run ends early once the release list drains, and self-extends
+- * while any pinned page's owner is DEAD (§6). The death grace is ROUNDS-2, so
+- * the guaranteed rounds themselves outlive it (§2). */
++/* Event rounds may end early when drained. PENDING keeps a single bounded
++ * round armed, including when the old owner's registry entry is gone. */
+ 
+ static int gh_release_active(void)
+ {
+@@ -28,10 +26,10 @@
+ static void gh_release_round(void)
+ {
+ 	unsigned long fl;
+-	int pending, final, round;
++	int pending, final, round, progress;
+ 
+ 	gh_spin_lock(&gh_release_lock, &fl);
+-	if (gh_rel_run == 0) {
++	if (gh_rel_run == 0 || gh_rel_stopping) {
+ 		gh_spin_unlock(&gh_release_lock, &fl);
+ 		return;
+ 	}
+@@ -40,9 +38,9 @@
+ 						 * round==3 test below runs unlocked */
+ 	gh_spin_unlock(&gh_release_lock, &fl);
+ 
+-	pending = gh_pool_served_to_released();
+-	gh_pool_served_to_ext(GH_EXPIRED);	/* give-up: event(death)+grace, any
+-						 * round may execute it (§6) */
++	progress = gh_pool_served_to_released();
++	progress += gh_pool_pending_to_released(GH_PENDING_BATCH);
++	pending = gh_pool_pending();
+ 	if (round == 3 && gh_kapi.drain_pages)
+ 		gh_kapi.drain_pages();		/* pcp-lag: push parked frees at hook */
+ 
+@@ -56,17 +54,25 @@
+ 	if (final) {
+ 		if (gh_kapi.drain_pages)
+ 			gh_kapi.drain_pages();
+-		gh_pool_served_to_released();	/* catch what the drain shook out */
+-		gh_pool_served_to_ext(GH_EXPIRED);
++		progress += gh_pool_served_to_released(); /* drain may finish unmaps */
+ 		gh_pool_owner_sweep();		/* GC dead owners with no pages (§2) */
+ 	}
+-	gh_adjust_try(GH_PROFILE_RELEASE);
++	/* Detach permits owner GC even when a different pending holder is slow. */
++	if (!final)
++		gh_pool_owner_sweep();
+ 
+ 	gh_spin_lock(&gh_release_lock, &fl);
++	if (gh_rel_stopping) {
++		gh_spin_unlock(&gh_release_lock, &fl);
++		return;
++	}
++	/* Serialize this kick with release_run(0): rmmod cancels adjust AFTER
++	 * setting the fence, so a running round cannot start a later pipeline. */
++	if (progress > 0 || gh_pool_released() > 0)
++		gh_adjust_try(GH_PROFILE_RELEASE);
++	pending = gh_pool_pending();
+ 	if (gh_rel_run == 0 && pending > 0)
+-		gh_rel_run = 1;			/* self-extend: grace still running.
+-						 * bounded: EXPIRED fires within GRACE,
+-						 * RELEASED converges via purge */
++		gh_rel_run = 1;			/* bounded work; retain genuine outstanding refs */
+ 	if (gh_rel_run > 0)
+ 		gh_sched_release(1000);
+ 	gh_spin_unlock(&gh_release_lock, &fl);
+@@ -78,7 +84,10 @@
+ 
+ 	gh_spin_lock(&gh_release_lock, &fl);
+ 	if (n == 0) {
++		gh_rel_stopping = 1;
+ 		gh_rel_run = 0;			/* cancel (rmmod) */
++	} else if (gh_rel_stopping) {
++		/* Hooks are detached before cancellation; reject late event work. */
+ 	} else if (gh_rel_run == 0) {
+ 		gh_rel_round = 0;
+ 		gh_rel_run = n;
+diff --git a/parts/gh_sysfs.c.inc b/parts/gh_sysfs.c.inc
+--- a/parts/gh_sysfs.c.inc
++++ b/parts/gh_sysfs.c.inc
+@@ -75,7 +75,7 @@
+ static const struct kernel_param_ops gh_acquire_ops = { .set = gh_acquire_set };
+ module_param_cb(acquire, &gh_acquire_ops, NULL, 0200);
+ 
+-/* ── refill_stat: the 17-key contract (§10) ────────────── */
++/* ── refill_stat: existing keys plus pool_pending (§10) ── */
+ static int gh_refill_stat_get(char *buf, const struct kernel_param *kp)
+ {
+ 	struct gh_pool_stats st;
+@@ -89,7 +89,7 @@
+ 	n += sysfs_emit_at(buf, n, "state=%s\n", gh_release_active() ? "running" : "idle");
+ 	n += sysfs_emit_at(buf, n, "pool_avail=%d\n", st.avail);
+ 	n += sysfs_emit_at(buf, n, "pool_total=%d\n", st.total);
+-	n += sysfs_emit_at(buf, n, "served=%d\n", st.served + st.released);
++	n += sysfs_emit_at(buf, n, "served=%d\n", st.served + st.released + st.pending);
+ 	n += sysfs_emit_at(buf, n, "pool_want=%d\n", st.want);
+ 	n += sysfs_emit_at(buf, n, "total_served=%ld\n", atomic_long_read(&gh_dbg_total_served));
+ 	n += sysfs_emit_at(buf, n, "total_refilled=%ld\n",
+@@ -107,6 +107,7 @@
+ 	n += sysfs_emit_at(buf, n, "pool_avail_cma_able=%d\n", gh_pool_avail_cma_able());
+ 	n += sysfs_emit_at(buf, n, "cma_pb_order=%d\n",
+ 			   st.cma_params == GH_CMA_VERIFIED ? gh_cma_order : -1);
++	n += sysfs_emit_at(buf, n, "pool_pending=%d\n", st.pending);
+ 	return n;
+ }
+ static const struct kernel_param_ops gh_refill_stat_ops = { .get = gh_refill_stat_get };
+@@ -119,6 +120,7 @@
+ 	static const struct kernel_param_ops gh_##name##_ops = { .get = gh_##name##_get }; \
+ 	module_param_cb(name, &gh_##name##_ops, NULL, 0400)
+ GH_RO_INT(pool_avail, st.avail);
++GH_RO_INT(pool_pending, st.pending);
+ GH_RO_INT(pool_cma, st.cma);
+ GH_RO_INT(pool_avail_cma_able, gh_pool_avail_cma_able());
+ GH_RO_INT(pool_size_max, st.size_max);
+@@ -161,7 +163,7 @@
+ /* reconcile: legacy-compat NO-OP (§10). The pre-v12 module computed its
+  * per-owner stats and its ghost-entry cleanup inside a synchronous reconcile
+  * pass, so old apps write this knob (some once per second) before every stats
+- * read. v12 maintains the stats live and gives up on timestamps, so the effect
++ * read. The pool maintains the stats live, so the effect
+  * an old app wants from this write - fresh numbers on its next read - happens
+  * by itself: accepting and doing nothing IS the faithful implementation, and
+  * it keeps a polling writer from flapping state=running (an armed round lives
+@@ -178,8 +180,8 @@
+ module_param_cb(reconcile, &gh_reconcile_ops, NULL, 0200);
+ 
+ /* manual_release: run one release round now - the manual/diagnostic twin of
+- * manual_refill (kick release / kick adjust). Timestamp-driven give-up makes
+- * any frequency harmless (§6); its one real use is collecting released
++ * manual_refill (kick release / kick adjust). No elapsed time drops an owned
++ * protection reference; its one real use is collecting released
+  * stragglers while idle. Not needed before any stats read. */
+ static int gh_manual_release_set(const char *val, const struct kernel_param *kp)
+ {
+@@ -254,12 +256,13 @@
+ 
+ 	gh_pool_stats_snapshot(&st);
+ 	gh_pool_owner_stats_snapshot(&os);
+-	n += sysfs_emit_at(b, n, "tracked=%d\n", st.served + st.released);
+-	n += sysfs_emit_at(b, n, "served=%d\n", st.served);
++	n += sysfs_emit_at(b, n, "tracked=%d\n", st.served + st.released + st.pending);
++	n += sysfs_emit_at(b, n, "served=%d\n", st.served + st.pending);
+ 	n += sysfs_emit_at(b, n, "released=%d\n", st.released);
+ 	n += sysfs_emit_at(b, n, "live=%ld\n", os.live_served);	/* held by live VMs */
+ 	n += sysfs_emit_at(b, n, "orphan=%ld\n", st.orphan);
+ 	n += sysfs_emit_at(b, n, "purged=%ld\n", st.purged);
++	n += sysfs_emit_at(b, n, "pending=%d\n", st.pending);
+ 	for (i = 0; i < os.n; i++)
+ 		n += sysfs_emit_at(b, n, "owner pid=%d pages=%ld abandoned=%ld comm=%s\n",
+ 				   os.row[i].tgid, os.row[i].served,
+diff --git a/tests/harness.c b/tests/harness.c
+--- a/tests/harness.c
++++ b/tests/harness.c
+@@ -46,7 +46,10 @@
+ 	mock_pb_order = 9; mock_evicted = 0; mock_pcp_n = 0;
+ 	gh_adjust_g_active = 0; gh_next_profile = GH_PROFILE_NONE;
+ 	memset(&gh_actx, 0, sizeof(gh_actx));
+-	gh_rel_run = gh_rel_round = 0; gh_stop_reason = "idle";
++	gh_rel_run = gh_rel_round = gh_rel_stopping = 0;
++	GH_WRITE_ONCE(mock_adjust_pending, 0);
++	GH_WRITE_ONCE(mock_release_pending, 0);
++	gh_stop_reason = "idle";
+ 	gh_param_refill_enable = 1;
+ 	memset(mock_mt, 1, sizeof(mock_mt));	/* all MOVABLE */
+ 	gh_migrate_cma = -1; gh_cand_n = 0;
+@@ -94,8 +97,8 @@
+ 	CHECKP();
+ 
+ 	/* guest unpins -> release round puts our ref -> hook KEEPs it back */
+-	set_page_count(pg, 1);
+-	CHECK(gh_pool_served_to_released() == 0, "no pending");
++	put_page(pg);
++	CHECK(gh_pool_served_to_released() == 1, "one actual collection");
+ 	CHECK(gh_pool_avail() == 4 && gh_pool_served() == 0 && gh_pool_released() == 0,
+ 	      "returned via hook: avail=%d", gh_pool_avail());
+ 	CHECKP();
+@@ -123,7 +126,7 @@
+ 	CHECKP();
+ }
+ 
+-static void t_dead_owner_giveup(void)
++static void t_dead_owner_pending_return(void)
+ {
+ 	struct page *pg;
+ 	struct gh_intake_budget b = { .single = 8, .ready = 8 };
+@@ -135,11 +138,10 @@
+ 	while (gh_pool_ext_to_avail(GH_ALLOC_LIGHT, 0, &b, 0)) ;
+ 	pg = gh_pool_avail_to_served(&crosvm, 1234);
+ 	CHECK(pg);
+-
+-	/* VM closes but crosvm keeps the pin (stuck / slow teardown). Give-up is
+-	 * the EVENT consequence of pid death (§2): while crosvm LIVES the page is
+-	 * never taken from it, no matter how long -- vm_count is only the serve
+-	 * gate, there is no idle clock to race a VM restart. */
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++
++	/* A living owner keeps attribution even when its VM gate closes. */
+ 	gh_pool_owner_vm_dec(&crosvm, 1234);
+ 	CHECK(gh_pool_served_to_released() == 0, "live owner: not pending");
+ 	mock_now_sec += 5 * GH_GRACE_SEC;
+@@ -149,21 +151,37 @@
+ 	      page_count(pg) == 2, "page stays SERVED under the live pin");
+ 	CHECKP();
+ 
+-	/* crosvm dies: THE give-up event -- but a short grace first, so the exit
+-	 * path's own frees can still come home as a collect (§2) */
++	/* Death detaches attribution; it never hands a still-pinned PFN away. */
+ 	gh_pool_owner_mark_dead(1234);
+-	CHECK(gh_pool_served_to_released() == 1, "dead owner: pending now");
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 0, "death grace not over yet");
+-	mock_now_sec += GH_DEATH_GRACE_SEC;
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 1, "grace over: given up");
+-	CHECK(gh_owners[0].abandoned == 1 && gh_pool_served() == 0);
+-	CHECK(page_count(pg) == 1, "our ref gone, the stale pin remains");
+-	CHECKP();
+-
+-	/* the pin drains with the corpse: EXT slot -> hook MISS -> buddy */
+-	set_page_count(pg, 1); pg->compound_order = 9;
++	CHECK(gh_pool_served_to_released() == 0, "detach is not a collection");
++	CHECK(gh_pool_served() == 0 && gh_pool_pending() == 1 &&
++	      gh_pool_held() == 2 && gh_pool_avail() == 1,
++	      "pending is held, never available");
++	CHECK(gh_slot_of_pfn(page_to_pfn(pg))->owner_id == 0 &&
++	      gh_owners[0].served == 0 && gh_owners[0].abandoned == 0,
++	      "owner detached without abandoning custody");
++	mock_now_sec += 3;
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 0,
++	      "old death grace cannot collect an external pin");
++	mock_now_sec += 11;
++	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 0 &&
++	      gh_pool_pending_to_released(GH_PENDING_BATCH) == 0,
++	      "old release expiry cannot discard pending custody");
++	CHECK(page_count(pg) == 2 && !pg->free_in_buddy &&
++	      gh_slot_of_pfn(page_to_pfn(pg))->state == GH_PENDING &&
++	      gh_dbg_purged == 0, "both refs and the original PFN survived");
++	CHECKP();
++
++	/* The last external put is 2->1, so the timer collector owns the return. */
+ 	put_page(pg);
+-	CHECK(pg->free_in_buddy, "abandoned page drains to buddy, not the pool");
++	CHECK(page_count(pg) == 1 && gh_pool_pending() == 1 &&
++	      gh_pool_avail() == 1, "external unpin alone cannot run the free hook");
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 1,
++	      "late unpin collects the original page");
++	CHECK(gh_pool_avail() == 2 && gh_pool_pending() == 0 &&
++	      gh_slot_of_pfn(page_to_pfn(pg))->state == GH_AVAIL &&
++	      page_count(pg) == 1 && !pg->free_in_buddy,
++	      "same PFN restored without replacement allocation");
+ 
+ 	crosvm.mm_users = 0;
+ 	gh_pool_owner_sweep();
+@@ -171,15 +189,13 @@
+ 	CHECKP();
+ }
+ 
+-/* Death grace splits the dead owner's pages by what the exit path managed:
+- * pages whose refs came home inside the grace are COLLECTED (back to the
+- * pool), only the still-pinned remainder is given up -- and the freed slot's
+- * reuse gets a fresh generation, so stale owner_ids never bite the newcomer. */
+-static void t_death_grace_split(void)
++/* Early and late returns split by actual references, not owner lifetime. */
++static void t_dead_owner_split_reuse(void)
+ {
+ 	struct page *pa, *pb;
+ 	struct gh_intake_budget b = { .single = 8, .ready = 8 };
+ 	enum gh_target_change ch;
++	u32 old_id;
+ 
+ 	world_reset(GH_PAGE_ORDER);
+ 	gh_pool_owner_add(&crosvm, 1234, "crosvm");
+@@ -188,19 +204,18 @@
+ 	pa = gh_pool_avail_to_served(&crosvm, 1234);
+ 	pb = gh_pool_avail_to_served(&crosvm, 1234);
+ 	CHECK(pa && pb);
++	old_id = gh_slot_of_pfn(page_to_pfn(pb))->owner_id;
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
+ 
+ 	gh_pool_owner_mark_dead(1234);
+-	/* inside the grace, the exit path frees page A (ref drops to ours) */
+-	set_page_count(pa, 1);
+-	CHECK(gh_pool_served_to_released() == 1, "B still pinned = pending");
+-	CHECK(gh_pool_avail() == 1 && gh_pool_served() == 1,
+-	      "A came home as a COLLECT inside the grace");
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 0, "grace shields B too");
+-
+-	mock_now_sec += GH_DEATH_GRACE_SEC;
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 1, "grace over: only B given up");
+-	CHECK(gh_owners[0].abandoned == 1,
+-	      "abandoned counts ONLY what death actually cost");
++	put_page(pa);
++	CHECK(gh_pool_served_to_released() == 1, "A collected, B detached");
++	CHECK(gh_pool_avail() == 1 && gh_pool_served() == 0 &&
++	      gh_pool_pending() == 1 && page_count(pb) == 2,
++	      "only the genuinely unpinned page is available");
++	CHECK(gh_owners[0].abandoned == 0 && gh_owners[0].served == 0,
++	      "dead owner no longer owns either page");
+ 	CHECKP();
+ 
+ 	/* slot reuse: sweep the corpse, register a new owner in its place */
+@@ -210,14 +225,24 @@
+ 	gh_pool_owner_add(&crosvm2, 5678, "crosvm2");
+ 	CHECK(gh_owners[0].mm == &crosvm2 && gh_owners[0].abandoned == 0,
+ 	      "slot reused fresh (new generation, clean counters)");
+-	CHECK(gh_pool_avail_to_served(&crosvm2, 5678) != NULL,
+-	      "newcomer serves normally; stale owner_ids can't bite it");
+-	CHECKP();
+-}
+-
+-/* u32 timestamp wrap: died_at and released_at comparisons must stay wrap-safe
+- * ((u32)(now - then)), or a stamp near the wrap point stalls give-up/purge for
+- * half a wrap period (§11 discipline note -- previously never exercised). */
++	CHECK(gh_owner_id(0) != old_id, "new owner has a new generation");
++	CHECK(gh_pool_avail_to_served(&crosvm2, 5678) == pa,
++	      "newcomer can use only the returned PFN");
++	mock_now_sec += 14;
++	put_page(pb);
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 1,
++	      "old PFN returns after owner GC and slot reuse");
++	CHECK(gh_owners[0].served == 1 && gh_owners[0].vm_count == 1 &&
++	      gh_owners[0].dead == 0 && gh_pool_avail() == 1 &&
++	      gh_slot_of_pfn(page_to_pfn(pb))->state == GH_AVAIL,
++	      "late old return does not debit or close the new owner");
++	put_page(pa);
++	CHECK(gh_pool_served_to_released() == 1 && gh_pool_avail() == 2,
++	      "new owner's page also returns normally");
++	CHECKP();
++}
++
++/* Clock wrap cannot end pending custody; RELEASED expiry remains wrap-safe. */
+ static void t_timestamp_wrap(void)
+ {
+ 	struct page *pg;
+@@ -232,12 +257,15 @@
+ 	pg = gh_pool_avail_to_served(&crosvm, 1234);
+ 	CHECK(pg);
+ 
+-	gh_pool_owner_mark_dead(1234);		/* died_at = 0xFFFFFFFE */
+-	mock_now_sec += 2;			/* now wrapped to 0 */
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 0,
+-	      "2s across the wrap: grace(3) not over");
+-	mock_now_sec += GH_DEATH_GRACE_SEC;	/* 5s since death, across wrap */
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 1, "wrap-safe give-up fired");
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 && gh_pool_pending() == 1);
++	mock_now_sec += 14;
++	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 0 &&
++	      gh_pool_pending_to_released(GH_PENDING_BATCH) == 0 &&
++	      page_count(pg) == 2, "wrap leaves the outstanding pin owned");
++	put_page(pg);
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 1 &&
++	      gh_pool_avail() == 1, "actual unpin returns across wrap");
+ 	CHECKP();
+ 
+ 	/* released_at across the wrap: purge gate must fire too */
+@@ -249,7 +277,7 @@
+ 	while (gh_pool_ext_to_avail(GH_ALLOC_LIGHT, 0, &b, 0)) ;
+ 	pg = gh_pool_avail_to_served(&crosvm, 1234);
+ 	mock_free_hook_armed = 0;		/* park it in RELEASED */
+-	set_page_count(pg, 1);
++	put_page(pg);
+ 	gh_pool_served_to_released();		/* released_at = 0xFFFFFFFF */
+ 	CHECK(gh_pool_released() == 1);
+ 	mock_now_sec += GH_GRACE_SEC - 1;	/* wrapped, 9s elapsed */
+@@ -548,6 +576,7 @@
+ 	int rounds = 0;
+ 
+ 	while (gh_adjust_g_active && rounds < cap) {
++		GH_WRITE_ONCE(mock_adjust_pending, 0);
+ 		gh_adjust_round();
+ 		rounds++;
+ 	}
+@@ -559,14 +588,37 @@
+ 	int rounds = 0;
+ 
+ 	while (gh_release_active() && rounds < cap) {
++		CHECK(GH_READ_ONCE(mock_release_pending), "active release has a scheduled timer");
++		if (!GH_READ_ONCE(mock_release_pending))
++			break;
++		GH_WRITE_ONCE(mock_release_pending, 0);
+ 		mock_now_sec++;				/* 1s cadence */
+ 		gh_release_round();
+-		while (gh_adjust_g_active && rounds < cap)
+-			gh_adjust_round();		/* interleave triggered adjust */
++		if (gh_adjust_g_active)
++			drive_adjust(5000);
+ 		rounds++;
+ 	}
+ 	CHECK(!gh_release_active(), "release converged in %d rounds", rounds);
+ 	return rounds;
++}
++
++/* Advance only work actually queued by the previous callback. Pending may
++ * legitimately outlive this bounded test driver without a new VM event. */
++static void drive_pending_ticks(int ticks)
++{
++	int i;
++
++	for (i = 0; i < ticks; i++) {
++		CHECK(gh_release_active() && GH_READ_ONCE(mock_release_pending),
++		      "pending tick %d remains scheduled", i);
++		if (!gh_release_active() || !GH_READ_ONCE(mock_release_pending))
++			break;
++		GH_WRITE_ONCE(mock_release_pending, 0);
++		mock_now_sec++;
++		gh_release_round();
++		if (gh_adjust_g_active)
++			drive_adjust(5000);
++	}
+ }
+ 
+ static void t_insmod_run(void)
+@@ -614,7 +666,7 @@
+ 	CHECKP();
+ }
+ 
+-static void t_release_stuck_then_refill(void)
++static void t_release_late_pin_timer(void)
+ {
+ 	enum gh_target_change ch;
+ 	struct page *pg;
+@@ -626,9 +678,9 @@
+ 	gh_pool_owner_add(&crosvm, 1234, "crosvm");
+ 	pg = gh_pool_avail_to_served(&crosvm, 1234);
+ 	CHECK(pg);
+-	/* crosvm stuck: pin never drops. While crosvm LIVES nothing is given up
+-	 * (§2) -- the page stays SERVED, held keeps counting it, so no deficit
+-	 * opens and RELEASE buys no replacement: the pool simply runs short. */
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	/* Shutdown while the process is alive preserves attribution. */
+ 	gh_release_vm_shutdown(&crosvm, 1234);
+ 	drive_release(30);
+ 	CHECK(gh_pool_served() == 1 && gh_pool_avail() == 3,
+@@ -636,15 +688,300 @@
+ 	CHECK(gh_owners[0].abandoned == 0, "nothing abandoned while alive");
+ 	CHECKP();
+ 
+-	/* crosvm dies: the give-up event fires, the deficit opens, and the SAME
+-	 * event's release rounds refill the hole (RELEASE profile) */
++	/* The death event is the last VM event in this scenario. Advance well
++	 * past both old expiry windows using only the timer it queued. */
+ 	gh_release_vm_exit(1234);
++	drive_pending_ticks(14);
++	CHECK(gh_pool_served() == 0 && gh_pool_pending() == 1 &&
++	      gh_pool_avail() == 3 && gh_pool_held() == 4 &&
++	      page_count(pg) == 2 && !pg->free_in_buddy,
++	      "late pin remains held without replacement allocation");
++	CHECK(gh_owners[0].mm == NULL && crosvm.grabbed == 0,
++	      "owner GC does not stop its detached page's timer");
++	CHECK(gh_release_active() && mock_release_pending,
++	      "a pending callback remains queued without any new VM event");
++	put_page(pg);
++	CHECK(page_count(pg) == 1 && gh_pool_pending() == 1,
++	      "last external put waits for the already queued collector");
+ 	drive_release(30);
+-	CHECK(gh_pool_served() == 0, "death gave the stuck page up");
+-	CHECK(gh_pool_avail() == 4, "RELEASE refilled the hole: avail=%d",
+-	      gh_pool_avail());
+-	CHECK(gh_owners[0].abandoned == 1, "abandoned = pages held at death");
+-	CHECK(page_count(pg) == 1, "the stale pin remains, our ref is gone");
++	CHECK(gh_pool_avail() == 4 && gh_pool_pending() == 0 &&
++	      gh_slot_of_pfn(page_to_pfn(pg))->state == GH_AVAIL &&
++	      !pg->free_in_buddy && gh_dbg_purged == 0,
++	      "same PFN returns and the timer stops after late unpin");
++	CHECK(!mock_release_pending, "drained timer did not requeue");
++	CHECKP();
++}
++
++static void t_release_mixed_pending(void)
++{
++	struct page *early, *late, *stuck;
++	enum gh_target_change ch;
++
++	world_reset(GH_PAGE_ORDER);
++	gh_pool_set_target(GH_TARGET_WANT, 4, &ch);
++	gh_adjust_try(GH_PROFILE_INSMOD);
++	drive_adjust(5000);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	early = gh_pool_avail_to_served(&crosvm, 1234);
++	late = gh_pool_avail_to_served(&crosvm, 1234);
++	stuck = gh_pool_avail_to_served(&crosvm, 1234);
++	CHECK(early && late && stuck);
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	put_page(early);
++	gh_release_vm_shutdown(&crosvm, 1234);
++	gh_release_vm_exit(1234);
++	drive_pending_ticks(14);
++	CHECK(gh_pool_avail() == 2 && gh_pool_pending() == 2 &&
++	      gh_pool_held() == 4 && gh_pool_released() == 0 &&
++	      gh_slot_of_pfn(page_to_pfn(early))->state == GH_AVAIL,
++	      "early return restores exactly its own page");
++	put_page(late);
++	drive_pending_ticks(2);
++	CHECK(gh_pool_avail() == 3 && gh_pool_pending() == 1 &&
++	      gh_slot_of_pfn(page_to_pfn(late))->state == GH_AVAIL &&
++	      gh_slot_of_pfn(page_to_pfn(stuck))->state == GH_PENDING,
++	      "late page returns while the other external pin stays pending");
++	drive_pending_ticks(20);
++	CHECK(page_count(stuck) == 2 && !stuck->free_in_buddy &&
++	      gh_pool_avail() == 3 && gh_pool_held() == 4 &&
++	      gh_pool_pending() == 1 && gh_dbg_purged == 0 &&
++	      !gh_adjust_running(),
++	      "permanent pin is visible and does not start refill work every tick");
++	CHECKP();
++	/* Finish the fixture with a real unpin; waiting alone never did this. */
++	put_page(stuck);
++	drive_release(30);
++	CHECK(gh_pool_avail() == 4 && gh_pool_pending() == 0);
++	CHECKP();
++}
++
++static void t_pending_batch_fairness(void)
++{
++	struct page *pg[GH_PENDING_BATCH + 1];
++	struct gh_intake_budget b = {
++		.single = GH_PENDING_BATCH + 1, .ready = GH_PENDING_BATCH + 1
++	};
++	int i;
++
++	world_reset(GH_PAGE_ORDER);
++	gh_pool_set_target(GH_TARGET_WANT, GH_PENDING_BATCH + 1, NULL);
++	while (gh_pool_ext_to_avail(GH_ALLOC_LIGHT, 0, &b, 0)) ;
++	CHECK(gh_pool_avail() == GH_PENDING_BATCH + 1);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	for (i = 0; i <= GH_PENDING_BATCH; i++) {
++		pg[i] = gh_pool_avail_to_served(&crosvm, 1234);
++		CHECK(pg[i]);
++	}
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 &&
++	      gh_pool_pending() == GH_PENDING_BATCH + 1);
++	/* Only the page beyond the first full batch is ready. A stuck prefix
++	 * must rotate, not starve it by rescanning the same 256 pages. */
++	put_page(pg[GH_PENDING_BATCH]);
++	CHECK(gh_pool_pending_to_released(0) == 0 &&
++	      gh_pool_pending_to_released(-1) == 0);
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 0 &&
++	      gh_pool_avail() == 0, "first batch contains only still-pinned pages");
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 1 &&
++	      gh_pool_avail() == 1 && gh_pool_pending() == GH_PENDING_BATCH &&
++	      gh_slot_of_pfn(page_to_pfn(pg[GH_PENDING_BATCH]))->state == GH_AVAIL,
++	      "second round reaches the ready page past the stuck prefix");
++	CHECKP();
++	for (i = 0; i < GH_PENDING_BATCH; i++)
++		put_page(pg[i]);
++	CHECK(gh_pool_pending_to_released(1) == 1 &&
++	      gh_pool_avail() == 2 && gh_pool_pending() == GH_PENDING_BATCH - 1,
++	      "explicit one-page budget is respected");
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == GH_PENDING_BATCH - 1,
++	      "short final batch does not visit an already returned page twice");
++	CHECK(gh_pool_pending() == 0 && gh_pool_avail() == GH_PENDING_BATCH + 1);
++	for (i = 0; i <= GH_PENDING_BATCH; i++)
++		CHECK(gh_slot_of_pfn(page_to_pfn(pg[i]))->state == GH_AVAIL &&
++		      page_count(pg[i]) == 1 && !pg[i]->free_in_buddy,
++		      "original batch PFN %d returned", i);
++	CHECKP();
++}
++
++static void t_pending_mapping_and_cma_gate(void)
++{
++	struct page *pg;
++	struct gh_intake_budget b = { .single = 8, .ready = 8 };
++
++	world_reset(10);
++	gh_cma_params = GH_CMA_VERIFIED;
++	gh_pool_set_target(GH_TARGET_WANT, 2, NULL);
++	CHECK(gh_pool_ext_to_avail(GH_ALLOC_BLOCK, 0, &b, 0) == 2);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	pg = gh_pool_avail_to_served(&crosvm, 1234);
++	CHECK(pg);
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 && gh_pool_pending() == 1);
++	CHECK(gh_avail[GH_L_ABLE].n == 1 && gh_avail[GH_L_READY].n == 0 &&
++	      gh_pool_avail_to_cma(1) == 0,
++	      "pending retains block custody without allowing a CMA flip");
++	pg->has_mapping = 1;
++	put_page(pg);
++	CHECK(page_count(pg) == 1 && gh_pool_pending_to_released(GH_PENDING_BATCH) == 0,
++	      "sole ref with a mapping is still not collectable");
++	gh_pool_prepare_scan(GH_A_PRECISE);
++	CHECK(gh_pool_scan_pop(GH_SCAN_PRECISE, NULL) == GH_PFN_NONE,
++	      "pending is excluded from released PFN isolation");
++	pg->has_mapping = 0;
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 1);
++	CHECK(gh_avail[GH_L_READY].n == 2 && gh_avail[GH_L_ABLE].n == 0 &&
++	      gh_pool_pending() == 0,
++	      "actual return promotes both original siblings back to READY");
++	CHECKP();
++}
++
++/* Inject the existing orphan input class after detach: both references
++ * vanished unexpectedly. This does not claim such loss happened on device. */
++static void t_pending_zero_ref_retires_identity(void)
++{
++	struct page *pg, *ordinary;
++	struct gh_intake_budget b = { .single = 8, .ready = 8 };
++	long freed;
++
++	world_reset(10);
++	gh_cma_params = GH_CMA_VERIFIED;
++	gh_pool_set_target(GH_TARGET_WANT, 2, NULL);
++	CHECK(gh_pool_ext_to_avail(GH_ALLOC_BLOCK, 0, &b, 0) == 2);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	pg = gh_pool_avail_to_served(&crosvm, 1234);
++	CHECK(pg);
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 && gh_pool_pending() == 1);
++	put_page(pg);
++	put_page(pg);			/* inject the vanished protection reference */
++	CHECK(page_count(pg) == 0 && pg->free_in_buddy);
++	freed = mock_freed_to_buddy;
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 1,
++	      "zero-ref retirement is a completed custody edge");
++	CHECK(gh_pool_pending() == 0 && gh_pool_held() == 1 && gh_pool_avail() == 1 &&
++	      gh_slot_of_pfn(page_to_pfn(pg))->state == GH_EXT && gh_dbg_orphan == 1 &&
++	      page_count(pg) == 0 && mock_freed_to_buddy == freed,
++	      "lost identity retires without a second zero-ref put");
++	CHECK(gh_avail[GH_L_NON].n == 1 && gh_avail[GH_L_ABLE].n == 0 &&
++	      gh_avail[GH_L_READY].n == 0,
++	      "retirement demotes the still-owned sibling after custody breaks");
++	/* Allow exactly one unrelated external allocation, never a pool refill. */
++	mock_alloc_fail_after = 1;
++	ordinary = mock_alloc_try(GH_PAGE_ORDER, 0);
++	mock_alloc_fail_after = 0;
++	CHECK(ordinary == pg && page_count(ordinary) == 1,
++	      "ordinary external allocation reuses the retired PFN");
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 0 &&
++	      gh_pool_released_return(ordinary) == GH_RETURN_MISS,
++	      "new sole ref cannot be mistaken for the lost pool reference");
++	put_page(ordinary);
++	CHECK(page_count(ordinary) == 0 && ordinary->free_in_buddy &&
++	      gh_pool_avail() == 1 && gh_pool_pending() == 0,
++	      "unrelated eventual free reaches buddy without pool interception");
++	CHECKP();
++
++	/* ALL must also unlink a zero-ref pending slot without put_page(0). */
++	world_reset(10);
++	b.single = b.ready = 8;
++	gh_cma_params = GH_CMA_VERIFIED;
++	gh_pool_set_target(GH_TARGET_WANT, 2, NULL);
++	CHECK(gh_pool_ext_to_avail(GH_ALLOC_BLOCK, 0, &b, 0) == 2);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	pg = gh_pool_avail_to_served(&crosvm, 1234);
++	CHECK(pg);
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 && gh_pool_pending() == 1);
++	put_page(pg);
++	put_page(pg);
++	freed = mock_freed_to_buddy;
++	mock_free_hook_armed = 0;
++	gh_release_run(0);
++	gh_adjust_cancel();
++	CHECK(gh_pool_served_to_ext(GH_ALL) == 1 &&
++	      gh_pool_served_to_ext(GH_ALL) == 0,
++	      "ALL retires the zero-ref slot exactly once");
++	CHECK(gh_pool_pending() == 0 && gh_pool_held() == 1 &&
++	      page_count(pg) == 0 && mock_freed_to_buddy == freed &&
++	      gh_dbg_orphan == 1 && gh_avail[GH_L_NON].n == 1,
++	      "ALL neither decrements an absent ref nor repeats the buddy free");
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 0,
++	      "zero-ref ALL leaves no stale pending link");
++	CHECKP();
++
++	/* The same documented orphan input can still be SERVED at unload,
++	 * before any owner death or release round has detached it. */
++	world_reset(10);
++	b.single = b.ready = 8;
++	gh_cma_params = GH_CMA_VERIFIED;
++	gh_pool_set_target(GH_TARGET_WANT, 2, NULL);
++	CHECK(gh_pool_ext_to_avail(GH_ALLOC_BLOCK, 0, &b, 0) == 2);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	pg = gh_pool_avail_to_served(&crosvm, 1234);
++	CHECK(pg);
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	put_page(pg);
++	put_page(pg);
++	CHECK(page_count(pg) == 0 && gh_pool_served() == 1 &&
++	      gh_pool_pending() == 0 && gh_owners[0].dead == 0,
++	      "zero-ref orphan is still attributed to a live owner before unload");
++	freed = mock_freed_to_buddy;
++	mock_free_hook_armed = 0;
++	gh_release_run(0);
++	gh_adjust_cancel();
++	CHECK(gh_pool_served_to_ext(GH_ALL) == 1 &&
++	      gh_pool_served_to_ext(GH_ALL) == 0,
++	      "ALL retires SERVED zero-ref custody exactly once");
++	CHECK(page_count(pg) == 0 && mock_freed_to_buddy == freed &&
++	      gh_pool_served() == 0 && gh_pool_pending() == 0 &&
++	      gh_pool_held() == 1 && gh_owners[0].served == 0 &&
++	      gh_dbg_orphan == 1 && gh_avail[GH_L_NON].n == 1,
++	      "SERVED orphan ALL releases attribution without a second zero-ref free");
++	CHECKP();
++}
++
++static void t_pending_shrink(void)
++{
++	struct page *pg[4];
++	enum gh_target_change ch;
++	int i, in_buddy = 0;
++
++	world_reset(GH_PAGE_ORDER);
++	gh_pool_set_target(GH_TARGET_WANT, 8, &ch);
++	gh_adjust_try(GH_PROFILE_INSMOD);
++	drive_adjust(5000);
++	gh_pool_owner_add(&crosvm, 1234, "crosvm");
++	for (i = 0; i < 4; i++) {
++		pg[i] = gh_pool_avail_to_served(&crosvm, 1234);
++		CHECK(pg[i]);
++	}
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 && gh_pool_pending() == 4);
++	gh_pool_set_target(GH_TARGET_WANT, 2, &ch);
++	gh_adjust_try(GH_PROFILE_SHRINK);
++	drive_adjust(5000);
++	CHECK(gh_pool_avail() == 0 && gh_pool_pending() == 4 && gh_pool_held() == 4,
++	      "shrink sheds only idle capacity while external pins remain");
++	for (i = 0; i < 4; i++) {
++		CHECK(page_count(pg[i]) == 2 && !pg[i]->free_in_buddy);
++		put_page(pg[i]);
++	}
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 4);
++	CHECK(gh_pool_avail() == 2 && gh_pool_held() == 2 &&
++	      gh_pool_pending() == 0 && gh_dbg_gate_drop == 2,
++	      "late returns DROP only the explicit resize surplus");
++	for (i = 0; i < 4; i++)
++		if (pg[i]->free_in_buddy)
++			in_buddy++;
++	CHECK(in_buddy == 2, "exactly two original pages legitimately reached buddy");
+ 	CHECKP();
+ }
+ 
+@@ -733,7 +1070,7 @@
+ static void t_rmmod_while_served(void)
+ {
+ 	enum gh_target_change ch;
+-	struct page *pinned, *loose;
++	struct page *pinned, *loose, *live, *ready;
+ 	int passes;
+ 
+ 	world_reset(GH_PAGE_ORDER);
+@@ -746,24 +1083,43 @@
+ 	gh_pool_owner_add(&crosvm, 1234, "crosvm");
+ 	pinned = gh_pool_avail_to_served(&crosvm, 1234);	/* VM live, pinned */
+ 	loose  = gh_pool_avail_to_served(&crosvm, 1234);
+-	CHECK(pinned && loose);
++	ready  = gh_pool_avail_to_served(&crosvm, 1234);
++	gh_pool_owner_add(&crosvm2, 5678, "crosvm2");
++	live = gh_pool_avail_to_served(&crosvm2, 5678);
++	CHECK(pinned && loose && ready && live);
+ 	/* guest dropped one page but the free hook never brought it home:
+ 	 * park it in RELEASED so the rmmod released-ALL edge has work too */
+ 	mock_free_hook_armed = 0;			/* = hooks detached first (§8) */
+-	set_page_count(loose, 1);
+-	gh_pool_served_to_released();
+-	CHECK(gh_pool_served() == 1 && gh_pool_released() == 1,
+-	      "one pinned out on loan, one parked released");
++	put_page(loose);
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 1);
++	CHECK(gh_pool_served() == 1 && gh_pool_pending() == 2 &&
++	      gh_pool_released() == 1,
++	      "live SERVED, detached PENDING, and hookless RELEASED coexist");
+ 	CHECK(page_count(pinned) == 2, "guest ref + our protection ref");
++	put_page(ready);			/* pending now holds the sole ref */
+ 
+ 	/* the §8 rmmod sequence, verbatim order: hooks off (above), workers off,
+ 	 * then hand every reference back — no edge may be skipped */
+ 	gh_release_run(0);
+ 	gh_adjust_cancel();
+-	gh_pool_served_to_ext(GH_ALL);
+-	CHECK(gh_pool_served() == 0, "served ALL cleared");
++	GH_WRITE_ONCE(mock_release_pending, 0);
++	GH_WRITE_ONCE(mock_adjust_pending, 0);
++	gh_release_run(GH_RELEASE_ROUNDS);
++	gh_release_round();
++	CHECK(!gh_release_active() && !mock_release_pending &&
++	      !mock_adjust_pending && !gh_adjust_running(),
++	      "stopping fence rejects late event and pending work rearming");
++	CHECK(gh_pool_served_to_ext(GH_ALL) == 3,
++	      "ALL drops one reference from each SERVED or PENDING page");
++	CHECK(gh_pool_served_to_ext(GH_ALL) == 0,
++	      "repeated ALL cannot drop a second reference");
++	CHECK(gh_pool_served() == 0 && gh_pool_pending() == 0,
++	      "served and pending ALL cleared");
+ 	CHECK(page_count(pinned) == 1,
+ 	      "custody released: OUR ref handed back, holder's pin remains");
++	CHECK(page_count(live) == 1 && page_count(ready) == 0 && ready->free_in_buddy,
++	      "live pin survives and sole-ref pending page frees once with hooks off");
+ 	gh_pool_released_to_ext(GH_ALL);
+ 	CHECK(gh_pool_released() == 0, "released ALL cleared");
+ 	for (passes = 0; passes < 3 && gh_pool_cma() > 0; passes++) {
+@@ -782,6 +1138,11 @@
+ 	put_page(pinned);
+ 	CHECK(page_count(pinned) == 0 && MOCK_LD(pinned->free_in_buddy),
+ 	      "holder's eventual free lands in buddy untouched");
++	put_page(live);
++	CHECK(page_count(live) == 0 && live->free_in_buddy,
++	      "live holder also frees normally after unload");
++	CHECK(gh_pool_pending_to_released(GH_PENDING_BATCH) == 0,
++	      "ALL removed every pending list link");
+ 	CHECKP();
+ }
+ 
+@@ -1036,9 +1397,17 @@
+ 	while (gh_pool_ext_to_avail(GH_ALLOC_LIGHT, 0, &b, 0)) ;
+ 	pg = gh_pool_avail_to_served(&crosvm, 1234);
+ 	gh_pool_owner_vm_dec(&crosvm, 1234);
+-	gh_pool_owner_mark_dead(1234);		/* give-up = death event + grace (§2) */
+-	mock_now_sec += GH_DEATH_GRACE_SEC;
+-	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 1);
++	gh_pool_owner_mark_dead(1234);
++	CHECK(gh_pool_served_to_released() == 0 && gh_pool_pending() == 1);
++	mock_now_sec += 14;
++	CHECK(gh_pool_served_to_ext(GH_EXPIRED) == 0);
++	gh_pool_purge_log_snapshot(&log);
++	CHECK(log.total == 0 && gh_dbg_purged == 0,
++	      "ordinary death retains custody without a purge record");
++	mock_free_hook_armed = 0;
++	gh_release_run(0);
++	gh_adjust_cancel();
++	CHECK(gh_pool_served_to_ext(GH_ALL) == 1);
+ 	gh_pool_purge_log_snapshot(&log);
+ 	CHECK(log.total == 1 && log.n == 1, "purge logged");
+ 	CHECK(log.rec[0].pfn == page_to_pfn(pg), "right page");
+@@ -1220,10 +1589,10 @@
+ 	t_serve_return_s1();
+ 	fprintf(stderr, "== t_shrink_gate_drop\n");
+ 	t_shrink_gate_drop();
+-	fprintf(stderr, "== t_dead_owner_giveup\n");
+-	t_dead_owner_giveup();
+-	fprintf(stderr, "== t_death_grace_split\n");
+-	t_death_grace_split();
++	fprintf(stderr, "== t_dead_owner_pending_return\n");
++	t_dead_owner_pending_return();
++	fprintf(stderr, "== t_dead_owner_split_reuse\n");
++	t_dead_owner_split_reuse();
+ 	fprintf(stderr, "== t_timestamp_wrap\n");
+ 	t_timestamp_wrap();
+ 	fprintf(stderr, "== t_two_owner_attribution\n");
+@@ -1252,8 +1621,18 @@
+ 	t_insmod_run();
+ 	fprintf(stderr, "== t_release_cycle\n");
+ 	t_release_cycle();
+-	fprintf(stderr, "== t_release_stuck_then_refill\n");
+-	t_release_stuck_then_refill();
++	fprintf(stderr, "== t_release_late_pin_timer\n");
++	t_release_late_pin_timer();
++	fprintf(stderr, "== t_release_mixed_pending\n");
++	t_release_mixed_pending();
++	fprintf(stderr, "== t_pending_batch_fairness\n");
++	t_pending_batch_fairness();
++	fprintf(stderr, "== t_pending_mapping_and_cma_gate\n");
++	t_pending_mapping_and_cma_gate();
++	fprintf(stderr, "== t_pending_zero_ref_retires_identity\n");
++	t_pending_zero_ref_retires_identity();
++	fprintf(stderr, "== t_pending_shrink\n");
++	t_pending_shrink();
+ 	fprintf(stderr, "== t_hookless_release\n");
+ 	t_hookless_release();
+ 	fprintf(stderr, "== t_shrink_below_served\n");
+diff --git a/tests/race_harness.c b/tests/race_harness.c
+--- a/tests/race_harness.c
++++ b/tests/race_harness.c
+@@ -10,6 +10,8 @@
+  * TSan flags data races; errorcheck mutexes abort on the "put_page under
+  * pool_lock" class of discipline breaks; the final quiescent audit runs
+  * pool_check + accounting invariants.
++ *   R5  late external put races a queued pending collector after owner GC;
++ *       no replacement allocation or later VM event can hide a lost PFN.
+  */
+ #define GH_MOCK 1
+ #define GH_RACE 1
+@@ -57,7 +59,10 @@
+ 	memset(mock_mt, 1, sizeof(mock_mt));
+ 	gh_adjust_g_active = 0; gh_next_profile = GH_PROFILE_NONE;
+ 	memset(&gh_actx, 0, sizeof(gh_actx));
+-	gh_rel_run = gh_rel_round = 0; gh_stop_reason = "idle";
++	gh_rel_run = gh_rel_round = gh_rel_stopping = 0;
++	GH_WRITE_ONCE(mock_adjust_pending, 0);
++	GH_WRITE_ONCE(mock_release_pending, 0);
++	gh_stop_reason = "idle";
+ 	gh_param_refill_enable = 1;
+ 	mock_kapi_install();
+ 	CHECK(gh_pool_init_table(world, 2, 4096) == 0);
+@@ -79,7 +84,7 @@
+ 			g->serves++;
+ 			/* guest "uses" the page, then unpins (its ref drops to
+ 			 * ours-only); the release worker will collect it */
+-			set_page_count(pg, 1);
++			put_page(pg);
+ 		}
+ 	}
+ 	return NULL;
+@@ -177,15 +182,15 @@
+ 		while (GH_READ_ONCE(gh_adjust_g_active))
+ 			gh_adjust_round();
+ 		if (!gh_release_active() && gh_pool_served() == 0 &&
+-		    gh_pool_released() == 0)
++		    gh_pool_pending() == 0 && gh_pool_released() == 0)
+ 			break;
+ 	}
+ 	CHECK(gh_pool_check(), "%s: pool_check", phase);
+-	CHECK(gh_pool_served() == 0 && gh_pool_released() == 0,
+-	      "%s: all pages settled (served=%d released=%d)",
+-	      phase, gh_pool_served(), gh_pool_released());
+-	fprintf(stderr, "%s: avail=%d held=%d total=%d gate_drop=%ld purged=%ld reject=%ld\n",
+-		phase, gh_pool_avail(), gh_pool_held(), gh_pool_total,
++	CHECK(gh_pool_served() == 0 && gh_pool_pending() == 0 && gh_pool_released() == 0,
++	      "%s: all pages settled (served=%d pending=%d released=%d)",
++	      phase, gh_pool_served(), gh_pool_pending(), gh_pool_released());
++	fprintf(stderr, "%s: avail=%d held=%d pending=%d total=%d gate_drop=%ld purged=%ld reject=%ld\n",
++		phase, gh_pool_avail(), gh_pool_held(), gh_pool_pending(), gh_pool_total,
+ 		gh_dbg_gate_drop, gh_dbg_purged, gh_dbg_reject);
+ }
+ 
+@@ -217,6 +222,108 @@
+ 	for (i = 0; i < nguests; i++)
+ 		fprintf(stderr, "  guest%d serves=%ld\n", i, ga[i].serves);
+ 	audit(name);
++	CHECK(gh_pool_avail() == gh_pool_want && gh_pool_held() == gh_pool_want,
++	      "%s: capacity restored without an operator resize", name);
++}
++
++struct late_pin_arg {
++	struct page *pg;
++	pthread_barrier_t past_windows, allow_put, put_done;
++};
++
++/* Unlike the stress thread, this driver only executes queued timer work. */
++static int late_pin_queued_tick(void)
++{
++	int i;
++
++	if (!GH_READ_ONCE(mock_release_pending))
++		return 0;
++	GH_WRITE_ONCE(mock_release_pending, 0);
++	__atomic_fetch_add(&mock_now_sec, 1, __ATOMIC_RELAXED);
++	gh_release_round();
++	for (i = 0; i < 5000 && GH_READ_ONCE(gh_adjust_g_active); i++) {
++		GH_WRITE_ONCE(mock_adjust_pending, 0);
++		gh_adjust_round();
++	}
++	CHECK(!GH_READ_ONCE(gh_adjust_g_active), "R5 triggered adjust converged");
++	return 1;
++}
++
++static void *late_pin_guest_thread(void *arg)
++{
++	struct late_pin_arg *a = arg;
++
++	pthread_barrier_wait(&a->past_windows);
++	pthread_barrier_wait(&a->allow_put);
++	put_page(a->pg);
++	pthread_barrier_wait(&a->put_done);
++	return NULL;
++}
++
++static void *late_pin_release_thread(void *arg)
++{
++	struct late_pin_arg *a = arg;
++	int i;
++
++	for (i = 0; i < 14; i++)
++		CHECK(late_pin_queued_tick(), "R5 pre-unpin timer %d was queued", i);
++	pthread_barrier_wait(&a->past_windows);
++	pthread_barrier_wait(&a->allow_put);
++	/* This callback deliberately races the external 2->1 put. */
++	CHECK(late_pin_queued_tick(), "R5 racing collector was already queued");
++	pthread_barrier_wait(&a->put_done);
++	for (i = 0; i < 30 && gh_release_active(); i++)
++		CHECK(late_pin_queued_tick(), "R5 late collector %d was queued", i);
++	CHECK(!gh_release_active(), "R5 timer stops once the external pin returns");
++	return NULL;
++}
++
++static void t_late_pin_queued_race(void)
++{
++	struct late_pin_arg a;
++	pthread_t guest, rel;
++	enum gh_target_change ch;
++
++	fprintf(stderr, "== R5 late pin vs queued collector ==\n");
++	world_reset();
++	gh_pool_set_target(GH_TARGET_WANT, 4, &ch);
++	gh_adjust_try(GH_PROFILE_INSMOD);
++	while (GH_READ_ONCE(gh_adjust_g_active))
++		gh_adjust_round();
++	gh_pool_owner_add(&vm_a, 100, "vm_a");
++	a.pg = gh_pool_avail_to_served(&vm_a, 100);
++	CHECK(a.pg);
++	gh_param_refill_enable = 0;
++	mock_alloc_fail_after = 0;
++	GH_WRITE_ONCE(mock_adjust_pending, 0);
++	gh_release_vm_shutdown(&vm_a, 100);
++	gh_release_vm_exit(100);
++	CHECK(pthread_barrier_init(&a.past_windows, NULL, 3) == 0);
++	CHECK(pthread_barrier_init(&a.allow_put, NULL, 3) == 0);
++	CHECK(pthread_barrier_init(&a.put_done, NULL, 2) == 0);
++	CHECK(pthread_create(&guest, NULL, late_pin_guest_thread, &a) == 0);
++	CHECK(pthread_create(&rel, NULL, late_pin_release_thread, &a) == 0);
++	pthread_barrier_wait(&a.past_windows);
++	/* Both workers are parked, so these observations are quiescent. */
++	CHECK(page_count(a.pg) == 2 && !MOCK_LD(a.pg->free_in_buddy) &&
++	      gh_pool_pending() == 1 && gh_pool_avail() == 3 && gh_pool_held() == 4,
++	      "R5 original PFN stays owned beyond both old expiry windows");
++	CHECK(gh_owners[0].mm == NULL && vm_a.grabbed == 0,
++	      "R5 pending timer survives owner GC");
++	CHECK(gh_pool_check(), "R5 pending list and custody counts agree");
++	pthread_barrier_wait(&a.allow_put);
++	pthread_join(guest, NULL);
++	pthread_join(rel, NULL);
++	CHECK(gh_pool_avail() == 4 && gh_pool_held() == 4 && gh_pool_pending() == 0 &&
++	      gh_slot_of_pfn(page_to_pfn(a.pg))->state == GH_AVAIL &&
++	      page_count(a.pg) == 1 && !MOCK_LD(a.pg->free_in_buddy) &&
++	      gh_dbg_purged == 0,
++	      "R5 same PFN restored without refill or a new VM event");
++	CHECK(!GH_READ_ONCE(mock_release_pending), "R5 drained timer has no callback");
++	CHECK(gh_pool_check(), "R5 final accounting");
++	pthread_barrier_destroy(&a.put_done);
++	pthread_barrier_destroy(&a.allow_put);
++	pthread_barrier_destroy(&a.past_windows);
+ }
+ 
+ int main(void)
+@@ -273,6 +380,8 @@
+ 		fprintf(stderr, "  guest serves=%ld+%ld\n", ga[0].serves, ga[1].serves);
+ 		gh_release_vm_shutdown(&vm_a, 100);	/* live pages only settle once the VM is down */
+ 		audit("R3 serve mid-acquire");
++		CHECK(gh_pool_avail() == 64 && gh_pool_held() == 64,
++		      "R3 completed acquire capacity restored");
+ 	}
+ 
+ 	/* R4: the operator joins the storm */
+@@ -317,6 +426,8 @@
+ 		audit("R4 operator vs the storm");
+ 	}
+ 
++	t_late_pin_queued_race();
++
+ 	if (failures) {
+ 		fprintf(stderr, "%d FAILURE(S)\n", failures);
+ 		return 1;
+diff --git a/tests/shim.h b/tests/shim.h
+--- a/tests/shim.h
++++ b/tests/shim.h
+@@ -226,7 +226,7 @@
+ 
+ /* worker scheduling stubs: the harness ticks rounds deterministically */
+ static int mock_adjust_pending, mock_release_pending;
+-static inline void gh_sched_adjust(int ms) { (void)ms; mock_adjust_pending = 1; }
+-static inline void gh_sched_release(int ms) { (void)ms; mock_release_pending = 1; }
++static inline void gh_sched_adjust(int ms) { (void)ms; GH_WRITE_ONCE(mock_adjust_pending, 1); }
++static inline void gh_sched_release(int ms) { (void)ms; GH_WRITE_ONCE(mock_release_pending, 1); }
+ #define GH_EBUSY 16
+ #endif

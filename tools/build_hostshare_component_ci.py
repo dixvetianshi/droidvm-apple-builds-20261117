@@ -3,11 +3,14 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import urllib.request
 
 SOURCE_REPO = "Droid-VM/gunyah_host_mod"
@@ -67,11 +70,73 @@ def fetch_source(relative, expected, destination):
     return {"source_url": url, "sha256": expected, "bytes": len(raw)}
 
 
+class OwnedCommandTimeout(RuntimeError):
+    def __init__(self, log, cleanup_complete):
+        self.cleanup_complete = cleanup_complete
+        super().__init__(f"Command timed out; process group cleanup complete={cleanup_complete}: {log.name}")
+
+
+def group_live_members(group):
+    """Read a new session while its un-reaped owned leader reserves its ID."""
+    members = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            raw = (entry / "stat").read_text()
+        except FileNotFoundError:
+            continue
+        fields = raw[raw.rfind(")") + 2:].split()
+        if int(fields[2]) == group and int(fields[3]) == group and fields[0] not in ("Z", "X"):
+            members.append(int(entry.name))
+    return members
+
+
 def run_logged(arguments, log, *, cwd=None, timeout=300):
     with log.open("wb") as stream:
-        result = subprocess.run(arguments, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout)
-    if result.returncode:
-        raise RuntimeError(f"Command exited {result.returncode}; full diagnostic: {log.name}")
+        process = subprocess.Popen(arguments, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
+                                   start_new_session=os.name == "posix")
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            cleanup_complete = True
+            if os.name == "posix":
+                # The owned leader has not been reaped. Its new session's
+                # process-group identity remains reserved while children stop.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                time.sleep(1)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 10
+                try:
+                    while group_live_members(process.pid) and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                    cleanup_complete = not group_live_members(process.pid)
+                except (OSError, ValueError, IndexError):
+                    cleanup_complete = False
+            else:
+                process.kill()
+            if cleanup_complete:
+                process.wait(timeout=30)
+            raise OwnedCommandTimeout(log, cleanup_complete)
+    if returncode:
+        raise RuntimeError(f"Command exited {returncode}; full diagnostic: {log.name}")
+
+
+def apply_checked_patch(patch, candidate_root, output):
+    """Own an explicit replay root even beneath the caller's Git checkout."""
+    git_dir = output / "owned-patch-replay.git"
+    run_logged(["git", "init", "--bare", "--template=", "--initial-branch=codex/patch-replay", str(git_dir)],
+               output / "patch-replay-init.log", timeout=30)
+    command = ["git", "--git-dir=" + str(git_dir), "--work-tree=" + str(candidate_root),
+               "-c", "core.autocrlf=false", "-c", "core.eol=lf", "apply"]
+    run_logged([*command, "--check", str(patch)], output / "patch-check.log", cwd=candidate_root, timeout=30)
+    run_logged([*command, str(patch)], output / "patch-apply.log", cwd=candidate_root, timeout=30)
 
 
 def cleanup_owned_container(cidfile, log):
@@ -133,10 +198,7 @@ def main():
         retained_patch.write_bytes(patch)
         candidate_root = inputs / "candidate"
         shutil.copytree(inputs / "before", candidate_root)
-        run_logged(["git", "-c", "core.autocrlf=false", "apply", "--check", str(retained_patch)],
-                   output / "patch-check.log", cwd=candidate_root)
-        run_logged(["git", "-c", "core.autocrlf=false", "apply", str(retained_patch)],
-                   output / "patch-apply.log", cwd=candidate_root)
+        apply_checked_patch(retained_patch, candidate_root, output)
         before = original.read_bytes()
         candidate = (candidate_root / SOURCE_PATH).read_bytes()
         if sha256(candidate) != CANDIDATE_SHA:
@@ -203,9 +265,11 @@ def main():
                            "runtime_compatibility": "not tested; no module loading is authorized by this workflow"})
     except Exception as error:
         record.update({"status": "failed", "failure": str(error)})
+        if isinstance(error, OwnedCommandTimeout):
+            record["owned_process_group_cleanup_complete"] = error.cleanup_complete
     finally:
         record["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
-        record["retained_files"] = [{"path": str(path.relative_to(output)), "sha256": sha256(path.read_bytes()),
+        record["retained_files"] = [] if record.get("owned_process_group_cleanup_complete") is False else [{"path": str(path.relative_to(output)), "sha256": sha256(path.read_bytes()),
                                       "bytes": path.stat().st_size}
                                      for path in sorted(output.rglob("*")) if path.is_file()]
         (output / "result.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
