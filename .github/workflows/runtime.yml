@@ -2,6 +2,14 @@ name: DroidVM Apple runtime components
 
 on:
   workflow_dispatch:
+    inputs:
+      component:
+        description: Select the original runtime or the reviewed HostShare component
+        type: choice
+        default: runtime
+        options:
+          - runtime
+          - hostshare-only
 
 permissions:
   contents: read
@@ -16,6 +24,7 @@ defaults:
 
 jobs:
   build:
+    if: inputs.component != 'hostshare-only'
     # A standard GitHub-hosted ARM64 runner for public repositories.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -38,4 +47,22 @@ jobs:
           path: output/runtime/
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
+  hostshare:
+    if: inputs.component == 'hostshare-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compile only the reviewed HostShare component
+        run: python3 tools/build_hostshare_component_ci.py
+      - name: Retain component, source identity and complete diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-hostshare-component-${{ github.run_id }}
+          path: output/hostshare-component/
+          if-no-files-found: error
           retention-days: 14

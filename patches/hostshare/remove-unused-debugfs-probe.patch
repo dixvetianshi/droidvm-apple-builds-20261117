@@ -1,0 +1,98 @@
+--- a/gunyah_host_share/GKI6.6/gunyah_share_mod.c
++++ b/gunyah_host_share/GKI6.6/gunyah_share_mod.c
+@@ -40,7 +40,6 @@
+ #include <linux/slab.h>
+ #include <linux/kprobes.h>
+ #include <linux/dcache.h>
+-#include <linux/debugfs.h>
+ #include <linux/types.h>
+ #include <linux/bitops.h>
+ #include <linux/workqueue.h>
+@@ -843,71 +842,6 @@
+ 	.mode = 0600,
+ };
+ 
+-/* ---- debugfs probe for standalone bring-up (no crosvm): ----
+- *   echo "<vm_fd> <size_hex> <label>" > /sys/kernel/debug/gh_share_probe
+- * runs in the echoing process's fd table, so that process must hold the VM fd.
+- * Allocates size bytes, fills a magic pattern, SHAREs to the guest, prints the
+- * handle+gpa-agnostic parcel (the guest accepts by handle). Intentionally leaks
+- * the pages so the guest can accept and read them. */
+-static struct dentry *ghsm_dbg;
+-static ssize_t gsp_write(struct file *f, const char __user *ub, size_t len, loff_t *off)
+-{
+-	char buf[64]; int vm_fd; u64 size; u32 label, handle = 0, *p; unsigned long i;
+-	struct file *vmf = NULL; void *ghvm; struct gunyah_rm *rm; long ret;
+-	void *va; struct page **pages; unsigned long npages;
+-
+-	if (len >= sizeof(buf)) return -EINVAL;
+-	if (copy_from_user(buf, ub, len)) return -EFAULT;
+-	buf[len] = 0;
+-	if (sscanf(buf, "%d %llx %u", &vm_fd, &size, &label) != 3) return -EINVAL;
+-	size = PAGE_ALIGN(size);
+-	npages = size >> PAGE_SHIFT;
+-
+-	ghvm = ghsm_get_ghvm(vm_fd, &vmf);
+-	if (!ghvm) return -EINVAL;
+-	rm = ghvm_rm(ghvm);
+-
+-	va = vmalloc_user(size);		/* page-aligned, user-mappable */
+-	if (!va) { fput(vmf); return -ENOMEM; }
+-	p = va;
+-	for (i = 0; i < size / 4; i++) p[i] = 0xA5A50000u | (u32)i;  /* magic */
+-
+-	pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
+-	if (!pages) { vfree(va); fput(vmf); return -ENOMEM; }
+-	for (i = 0; i < npages; i++) pages[i] = vmalloc_to_page(va + i * PAGE_SIZE);
+-
+-	{
+-		struct ghsm_map *m = kzalloc(sizeof(*m), GFP_KERNEL);
+-		u16 gvm = ghvm_vmid(ghvm), hvm;
+-		if (!m) { kfree(pages); vfree(va); fput(vmf); return -ENOMEM; }
+-		if (gunyah_rm_get_vmid(rm, &hvm)) { kfree(m); kfree(pages); vfree(va); fput(vmf); return -EIO; }
+-		m->parcel.mem_type = GUNYAH_RM_MEM_TYPE_NORMAL;
+-		m->parcel.label = label | GHSM_LABEL_NS;
+-		m->parcel.mem_handle = GUNYAH_MEM_HANDLE_INVAL;
+-		m->parcel.n_acl_entries = 2;
+-		m->parcel.acl_entries = kcalloc(2, sizeof(struct gunyah_rm_mem_acl_entry), GFP_KERNEL);
+-		m->parcel.acl_entries[0].vmid = cpu_to_le16(gvm);
+-		m->parcel.acl_entries[0].perms = GUNYAH_RM_ACL_R | GUNYAH_RM_ACL_W;
+-		m->parcel.acl_entries[1].vmid = cpu_to_le16(hvm);
+-		m->parcel.acl_entries[1].perms = GUNYAH_RM_ACL_R | GUNYAH_RM_ACL_W | GUNYAH_RM_ACL_X;
+-		m->parcel.n_mem_entries = npages;
+-		m->parcel.mem_entries = kcalloc(npages, sizeof(struct gunyah_rm_mem_entry), GFP_KERNEL);
+-		for (i = 0; i < npages; i++) {
+-			m->parcel.mem_entries[i].phys_addr = cpu_to_le64(page_to_phys(pages[i]));
+-			m->parcel.mem_entries[i].size = cpu_to_le64(PAGE_SIZE);
+-		}
+-		ret = p_rm_mem_share(rm, &m->parcel);
+-		handle = m->parcel.mem_handle;
+-		pr_info("GSP: SHARE probe vm_fd=%d guest_vmid=%u size=0x%llx label=%u => ret=%ld handle=0x%x magic=0xA5A5xxxx (LEAKED for guest accept)\n",
+-			vm_fd, gvm, size, label, ret, handle);
+-		/* leak m/pages/va intentionally */
+-	}
+-	kfree(pages);		/* the pages[] array; underlying vmalloc pages stay pinned by parcel */
+-	fput(vmf);
+-	return ret ? ret : len;
+-}
+-static const struct file_operations gsp_fops = { .owner = THIS_MODULE, .write = gsp_write };
+-
+ /* outstanding: read-only live view of the tracked-parcel table */
+ static int ghsm_outstanding_get(char *buf, const struct kernel_param *kp)
+ {
+@@ -966,7 +900,6 @@
+ 		misc_deregister(&ghsm_dev);
+ 		return ret;
+ 	}
+-	ghsm_dbg = debugfs_create_file("gh_share_probe", 0200, NULL, NULL, &gsp_fops);
+ 	pr_info("loaded v6/dmabuf+gup (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
+ 		p_rm_mem_share, p_rm_mem_reclaim, !!p_rm_get, vmid_off, rm_off);
+ 	return 0;
+@@ -977,7 +910,6 @@
+ 	LIST_HEAD(all);
+ 	int tries, leaked = 0;
+ 
+-	debugfs_remove(ghsm_dbg);
+ 	misc_deregister(&ghsm_dev);	/* no open fds remain (.owner refcount) */
+ 	cancel_delayed_work_sync(&ghsm_reaper_work);
+ 
