@@ -1,11 +1,11 @@
 {
   "base_commit": "c69de01daf50ee8a24adf07e994adf8bcd5825cf",
-  "patch_sha256": "817ee5fa89ca175eabeb13db95f1d7aa0c8a34470d6c4fcb4a76292254a33dd9",
+  "patch_sha256": "f01ceb49a8babeba74d5773598e0656d32cda51dcac5a26bee8700d012ef9862",
   "files": [
     {
       "file": "hypervisor/src/gunyah/mod.rs",
       "pinned_sha256": "048480dc8a5d494d886d4000403eee041651c52967b808d5b23b9353029310ae",
-      "final_lf_sha256": "63d798541cdea2660ea182b97b181ec1515b2bdb79837a32e3a8ff1ea86e4d38"
+      "final_lf_sha256": "7517ae1625a99007803020b7d506f3414ecb2fe0b7b5a572e489fd2a8c92bbb7"
     },
     {
       "file": "hypervisor/src/gunyah/mthp.rs",

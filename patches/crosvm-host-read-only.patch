@@ -279,14 +279,14 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
 +        offset: u64,
 +        size: u64,
 +    ) -> Result<Option<usize>> {
-+        let source = base::fstat(&base::Descriptor(fd.as_raw_descriptor()))?;
++        let source = base::linux::fstat(&base::Descriptor(fd.as_raw_descriptor()))?;
 +        let mut owned = false;
 +        let mut found = None;
 +        for region in self.guest_mem.regions() {
 +            if !matches!(region.shm, vm_memory::BackingObject::Shm(_)) {
 +                continue;
 +            }
-+            let backing = base::fstat(region.shm)?;
++            let backing = base::linux::fstat(region.shm)?;
 +            if source.st_dev != backing.st_dev || source.st_ino != backing.st_ino {
 +                continue;
 +            }
