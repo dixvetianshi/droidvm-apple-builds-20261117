@@ -2242,7 +2242,7 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
 -                                        qcom_trusted_vm_pas_id,
 -                                        cfg, components),
 +                               } => {
-+            let leased = cfg.host_memory_policy == vm_memory::HostMemoryPolicy::ReadOnly
++            let leased = cfg.host_memory_policy == hypervisor::HostMemoryPolicy::ReadOnly
 +                && cfg.protection_type.shares_guest_ram();
 +            if !leased {
 +                run_gunyah(device.as_deref(), qcom_trusted_vm_id, qcom_trusted_vm_pas_id, cfg, components)
@@ -2255,7 +2255,7 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
      }
  }
  
-@@ -4464,905 +4517,939 @@
+@@ -4464,905 +4517,941 @@
      }
  
      let (device_ctrl_tube, device_ctrl_resp) = Tube::pair().context("failed to create tube")?;
@@ -2322,8 +2322,8 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
 +    let simplefb_stop = if use_lease_fence {
 +        Some(Arc::new(std::sync::atomic::AtomicBool::new(false)))
 +    } else { None };
-+    let mut irq_worker: Option<(Tube, JoinHandle<()>)> = None;
-+    let mut memory_worker: Option<(Tube, JoinHandle<()>)> = None;
++    let mut irq_worker: Option<(Tube, JoinHandle<Result<()>>)> = None;
++    let mut memory_worker: Option<(Tube, JoinHandle<Result<()>>)> = None;
 +    let mut metrics_thread: Option<JoinHandle<()>> = None;
 +
 +    // Every post-spawn `?` and explicit Err returns to this owned cleanup boundary.
@@ -2361,163 +2361,165 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
 +        // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
 +        // a GPU reader is a real question here, not a formality.
 +        #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
-+        simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
-+            let sfb_cfg = cfg.simplefb.as_ref()?;
-+            let guest_mem = linux.vm.get_memory().clone();
-+            let bpp = arch::simplefb_bpp(sfb_cfg.format.as_str());
-+            // Padded to the alignment the GPU transport needs (see `arch::simplefb_stride`). Taken from
-+            // the same function that sized the region and wrote the device tree's `stride`, because a
-+            // bridge that disagreed with either would hand the sink a sheared picture and report
-+            // nothing -- the failure would look like a wrong image, not like an error.
-+            let stride = arch::simplefb_stride(sfb_cfg.width, sfb_cfg.format.as_str());
-+            // The same DT string the guest reads, resolved once here rather than assumed downstream:
-+            // the bridge hands it to the sink as part of every frame it produces.
-+            let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
++        {
++            simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
++                let sfb_cfg = cfg.simplefb.as_ref()?;
++                let guest_mem = linux.vm.get_memory().clone();
++                let bpp = arch::simplefb_bpp(sfb_cfg.format.as_str());
++                // Padded to the alignment the GPU transport needs (see `arch::simplefb_stride`). Taken from
++                // the same function that sized the region and wrote the device tree's `stride`, because a
++                // bridge that disagreed with either would hand the sink a sheared picture and report
++                // nothing -- the failure would look like a wrong image, not like an error.
++                let stride = arch::simplefb_stride(sfb_cfg.width, sfb_cfg.format.as_str());
++                // The same DT string the guest reads, resolved once here rather than assumed downstream:
++                // the bridge hands it to the sink as part of every frame it produces.
++                let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
 +
-+            #[cfg(target_arch = "aarch64")]
-+            let (fb_size, guest_addr) = {
-+                let region = guest_mem
-+                    .regions()
-+                    .find(|r| {
-+                        r.options.purpose == vm_memory::MemoryRegionPurpose::SharedFramebuffer
-+                    })?;
-+                (region.size as u64, region.guest_addr.offset())
-+            };
-+            #[cfg(not(target_arch = "aarch64"))]
-+            let (fb_size, guest_addr) = {
-+                warn!("simplefb display bridge not supported on this architecture");
-+                return None;
-+            };
++                #[cfg(target_arch = "aarch64")]
++                let (fb_size, guest_addr) = {
++                    let region = guest_mem
++                        .regions()
++                        .find(|r| {
++                            r.options.purpose == vm_memory::MemoryRegionPurpose::SharedFramebuffer
++                        })?;
++                    (region.size as u64, region.guest_addr.offset())
++                };
++                #[cfg(not(target_arch = "aarch64"))]
++                let (fb_size, guest_addr) = {
++                    warn!("simplefb display bridge not supported on this architecture");
++                    return None;
++                };
 +
-+            let params = simplefb_display::SimplefbDisplayParams {
-+                addr: guest_addr,
-+                width: sfb_cfg.width,
-+                height: sfb_cfg.height,
-+                stride,
-+                bpp,
-+                size: fb_size,
-+                fourcc,
-+                // A host-side property: it says how often we look, not anything about the device the
-+                // guest was handed, which is why it goes here and not into the device tree.
-+                poll_hz: sfb_cfg.poll_hz,
-+            };
++                let params = simplefb_display::SimplefbDisplayParams {
++                    addr: guest_addr,
++                    width: sfb_cfg.width,
++                    height: sfb_cfg.height,
++                    stride,
++                    bpp,
++                    size: fb_size,
++                    fourcc,
++                    // A host-side property: it says how often we look, not anything about the device the
++                    // guest was handed, which is why it goes here and not into the device tree.
++                    poll_hz: sfb_cfg.poll_hz,
++                };
 +
-+            // This device provides the `simplefb` screen, so it takes the exporter bound to that
-+            // screen -- and opens it, whether or not this VM also has a GPU device. Which of the two
-+            // screens the user is looking at is the user's answer to give, not something the VMM
-+            // decides by merging them into one display and guessing which source is live.
-+            //
-+            // The app display path still takes precedence over VNC below when both are somehow
-+            // present, but config rejects that pairing outright (one exporter per screen), so the
-+            // ordering is a leftover tie-break rather than a decision anyone can reach.
-+            #[cfg(feature = "android_display")]
-+            let android_service = cfg
-+                .android_display_service_for(DisplayScreen::Simplefb)
-+                .map(|s| (s.name.clone(), s.transport_cap))
-+                // A simplefb screen nobody shows is the boot picture of the GPU screen: the firmware,
-+                // the bootloader and an early kernel console draw into it before any guest driver sets
-+                // a scanout. Its frames go to the GPU screen's window ("#boot": the display service
-+                // shared in-process, CPU path, dropped while the GPU scanout presents), so the window
-+                // shows something from the first firmware frame on.
-+                .or_else(|| {
-+                    cfg.android_display_service_for(DisplayScreen::Gpu0)
-+                        .map(|s| (format!("{}#boot", s.name), s.transport_cap))
-+                });
-+            #[cfg(not(feature = "android_display"))]
-+            let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
++                // This device provides the `simplefb` screen, so it takes the exporter bound to that
++                // screen -- and opens it, whether or not this VM also has a GPU device. Which of the two
++                // screens the user is looking at is the user's answer to give, not something the VMM
++                // decides by merging them into one display and guessing which source is live.
++                //
++                // The app display path still takes precedence over VNC below when both are somehow
++                // present, but config rejects that pairing outright (one exporter per screen), so the
++                // ordering is a leftover tie-break rather than a decision anyone can reach.
++                #[cfg(feature = "android_display")]
++                let android_service = cfg
++                    .android_display_service_for(DisplayScreen::Simplefb)
++                    .map(|s| (s.name.clone(), s.transport_cap))
++                    // A simplefb screen nobody shows is the boot picture of the GPU screen: the firmware,
++                    // the bootloader and an early kernel console draw into it before any guest driver sets
++                    // a scanout. Its frames go to the GPU screen's window ("#boot": the display service
++                    // shared in-process, CPU path, dropped while the GPU scanout presents), so the window
++                    // shows something from the first firmware frame on.
++                    .or_else(|| {
++                        cfg.android_display_service_for(DisplayScreen::Gpu0)
++                            .map(|s| (format!("{}#boot", s.name), s.transport_cap))
++                    });
++                #[cfg(not(feature = "android_display"))]
++                let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
 +
-+            // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
-+            // and there is no longer anywhere for its frames to go by default: they used to be handed
-+            // to the GPU device's display, which is what the exporter bindings replace. (The step-5
-+            // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
-+            // client -- not for one nothing has bound at all.)
-+            // The transport ceiling travels with the binding, not with the screen: it says how far this
-+            // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
-+            // the bridge alongside the target it describes.
-+            let (target, transport_cap) = match android_service {
-+                Some((service_name, transport_cap)) => (
-+                    simplefb_display::SimplefbDisplayTarget::Android { service_name },
++                // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
++                // and there is no longer anywhere for its frames to go by default: they used to be handed
++                // to the GPU device's display, which is what the exporter bindings replace. (The step-5
++                // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
++                // client -- not for one nothing has bound at all.)
++                // The transport ceiling travels with the binding, not with the screen: it says how far this
++                // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
++                // the bridge alongside the target it describes.
++                let (target, transport_cap) = match android_service {
++                    Some((service_name, transport_cap)) => (
++                        simplefb_display::SimplefbDisplayTarget::Android { service_name },
++                        transport_cap,
++                    ),
++                    None => {
++                        #[cfg(feature = "webrtc")]
++                        if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Simplefb) {
++                            (
++                                simplefb_display::SimplefbDisplayTarget::WebRtc {
++                                    addr: rtc_cfg.addr(),
++                                    token: rtc_cfg.token.clone(),
++                                    stun: rtc_cfg.stun.clone(),
++                                    allow_h265: rtc_cfg.allow_h265(),
++                                    bitrate_bps: rtc_cfg.bitrate_bps(),
++                                    adapt: rtc_cfg.adapt,
++                                    input: simplefb_vnc_input,
++                                },
++                                rtc_cfg.transport_cap,
++                            )
++                        } else {
++                            let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
++                            let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
++                            let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
++                            (
++                                simplefb_display::SimplefbDisplayTarget::Vnc {
++                                    addr: format!("{}:{}", host, port),
++                                    password: vnc_cfg.password.clone(),
++                                    hw_encode: vnc_cfg.h264_enabled(),
++                                    input: simplefb_vnc_input,
++                                },
++                                vnc_cfg.transport_cap,
++                            )
++                        }
++                        #[cfg(all(feature = "vnc", not(feature = "webrtc")))]
++                        {
++                            let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
++                            let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
++                            let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
++                            (
++                                simplefb_display::SimplefbDisplayTarget::Vnc {
++                                    addr: format!("{}:{}", host, port),
++                                    password: vnc_cfg.password.clone(),
++                                    hw_encode: vnc_cfg.h264_enabled(),
++                                    // This screen's own tablet and keyboard, built during device creation
++                                    // beside the guest halves they are paired with. Empty on a
++                                    // `view-only=true` binding.
++                                    input: simplefb_vnc_input,
++                                },
++                                vnc_cfg.transport_cap,
++                            )
++                        }
++                        #[cfg(not(feature = "vnc"))]
++                        return None;
++                    }
++                };
++
++                // The bridge opens the exporter on its own thread, so this is the only way it can tell
++                // the VM that the address it was given is unusable; see start_simplefb_display_thread.
++                let vm_evt = match vm_evt_wrtube.try_clone() {
++                    Ok(tube) => tube,
++                    Err(e) => {
++                        error!("simplefb: failed to clone VM event tube: {}", e);
++                        return None;
++                    }
++                };
++                match simplefb_display::start_simplefb_display_thread(
++                    guest_mem,
++                    params,
++                    target,
 +                    transport_cap,
-+                ),
-+                None => {
-+                    #[cfg(feature = "webrtc")]
-+                    if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Simplefb) {
-+                        (
-+                            simplefb_display::SimplefbDisplayTarget::WebRtc {
-+                                addr: rtc_cfg.addr(),
-+                                token: rtc_cfg.token.clone(),
-+                                stun: rtc_cfg.stun.clone(),
-+                                allow_h265: rtc_cfg.allow_h265(),
-+                                bitrate_bps: rtc_cfg.bitrate_bps(),
-+                                adapt: rtc_cfg.adapt,
-+                                input: simplefb_vnc_input,
-+                            },
-+                            rtc_cfg.transport_cap,
-+                        )
-+                    } else {
-+                        let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
-+                        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
-+                        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
-+                        (
-+                            simplefb_display::SimplefbDisplayTarget::Vnc {
-+                                addr: format!("{}:{}", host, port),
-+                                password: vnc_cfg.password.clone(),
-+                                hw_encode: vnc_cfg.h264_enabled(),
-+                                input: simplefb_vnc_input,
-+                            },
-+                            vnc_cfg.transport_cap,
-+                        )
++                    vm_evt,
++                    simplefb_stop.clone(),
++                ) {
++                    Ok(handle) => {
++                        info!("simplefb display bridge started");
++                        Some(handle)
 +                    }
-+                    #[cfg(all(feature = "vnc", not(feature = "webrtc")))]
-+                    {
-+                        let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
-+                        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
-+                        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
-+                        (
-+                            simplefb_display::SimplefbDisplayTarget::Vnc {
-+                                addr: format!("{}:{}", host, port),
-+                                password: vnc_cfg.password.clone(),
-+                                hw_encode: vnc_cfg.h264_enabled(),
-+                                // This screen's own tablet and keyboard, built during device creation
-+                                // beside the guest halves they are paired with. Empty on a
-+                                // `view-only=true` binding.
-+                                input: simplefb_vnc_input,
-+                            },
-+                            vnc_cfg.transport_cap,
-+                        )
++                    Err(e) => {
++                        error!("failed to start simplefb display bridge: {:?}", e);
++                        None
 +                    }
-+                    #[cfg(not(feature = "vnc"))]
-+                    return None;
 +                }
-+            };
-+
-+            // The bridge opens the exporter on its own thread, so this is the only way it can tell
-+            // the VM that the address it was given is unusable; see start_simplefb_display_thread.
-+            let vm_evt = match vm_evt_wrtube.try_clone() {
-+                Ok(tube) => tube,
-+                Err(e) => {
-+                    error!("simplefb: failed to clone VM event tube: {}", e);
-+                    return None;
-+                }
-+            };
-+            match simplefb_display::start_simplefb_display_thread(
-+                guest_mem,
-+                params,
-+                target,
-+                transport_cap,
-+                vm_evt,
-+                simplefb_stop.clone(),
-+            ) {
-+                Ok(handle) => {
-+                    info!("simplefb display bridge started");
-+                    Some(handle)
-+                }
-+                Err(e) => {
-+                    error!("failed to start simplefb display bridge: {:?}", e);
-+                    None
-+                }
-+            }
-+        })();
++            })();
++        }
 +
 +
 +        if !linux
@@ -4045,7 +4047,7 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
  }
  
  #[derive(EventToken)]
-@@ -6383,3 +6470,34 @@
+@@ -6383,3 +6472,34 @@
          assert_eq!(ratios, vec![(0, 102), (1, 20)]);
      }
  }

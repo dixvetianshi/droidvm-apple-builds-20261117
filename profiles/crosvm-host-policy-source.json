@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "base_commit": "c69de01daf50ee8a24adf07e994adf8bcd5825cf",
-  "patch_sha256": "71d4f98af0117b12687b655a11c6e6dd5070710bd5aa44beee05bb84648bc9f4",
+  "patch_sha256": "92d101b43a5f17d620e21d607321a13d502ce460abf2f976852b888b66977186",
   "files": [
     {
       "file": "hypervisor/src/gunyah/lease.rs",
@@ -54,7 +54,7 @@
     {
       "file": "src/crosvm/sys/linux.rs",
       "pinned_sha256": "d56f75fe8031d360dbe2da572536665ddfc7a1ba9e669e5baf4d83752118f192",
-      "final_lf_sha256": "dc45595d9d1cd43f4236ea8df8c3f3b6102cedb0b81eef8c971b2db6125b255b",
+      "final_lf_sha256": "9db70dda516e117e06b79bba091719936573545692f3c33d38e008dcc9f08107",
       "new_file": false
     },
     {
