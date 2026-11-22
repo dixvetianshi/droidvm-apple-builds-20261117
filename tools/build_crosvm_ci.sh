@@ -241,6 +241,37 @@ retained_patch.write_bytes(patch_bytes)
 print('Applied the reviewed native display patch and verified exact before/after source bytes.')
 PY
 
+# Apply only the reviewed VMM source changes to the pinned crosvm tree.
+# This worker builds an app runtime; it never contacts or configures a phone.
+python3 - <<'PYCODE'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+repo = Path(os.environ['META']) / 'crosvm_build/external/crosvm'
+root = Path(os.environ['ROOT'])
+out = Path(os.environ['OUT'])
+manifest = json.loads((root / 'profiles/crosvm-host-policy-source.json').read_text())
+patch = root / 'patches/crosvm-host-read-only.patch'
+if subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip() != manifest['base_commit']:
+    raise SystemExit('The crosvm patch base is not the reviewed commit.')
+if hashlib.sha256(patch.read_bytes()).hexdigest() != manifest['patch_sha256']:
+    raise SystemExit('The crosvm host policy patch digest differs.')
+for row in manifest['files']:
+    if hashlib.sha256((repo / row['file']).read_bytes()).hexdigest() != row['pinned_sha256']:
+        raise SystemExit('Unexpected unpatched crosvm source: ' + row['file'])
+cmd = ['git', '-c', 'core.autocrlf=false', '-C', str(repo), 'apply', '--whitespace=error']
+subprocess.run([*cmd, '--check', str(patch)], check=True)
+subprocess.run([*cmd, str(patch)], check=True)
+for row in manifest['files']:
+    if hashlib.sha256((repo / row['file']).read_bytes()).hexdigest() != row['final_lf_sha256']:
+        raise SystemExit('Unexpected patched crosvm source: ' + row['file'])
+(out / 'diagnostics/crosvm-host-read-only.patch').write_bytes(patch.read_bytes())
+(out / 'host-policy-source.json').write_text(json.dumps(manifest, indent=2) + '\n')
+print('Verified and applied the reviewed VMM host read-only policy.')
+PYCODE
+
 # The shim is a separate bare-metal crate; Soong uses its own Rust prebuilts.
 rustup toolchain install "$SHIM_RUST_TOOLCHAIN" --profile minimal --target aarch64-unknown-none-softfloat
 export RUSTUP_TOOLCHAIN="$SHIM_RUST_TOOLCHAIN"
@@ -301,7 +332,7 @@ shim_sha256 = hashlib.sha256(shim_bytes).hexdigest()
 if shim_sha256 != os.environ['SHIM_SHA256']:
     raise SystemExit('The rebuilt shim bytes differ from the original verified Apple/Gunyah shim.')
 markers = inspect_embedded_flags(binary)
-additional = {'mbi-spis': b'mbi-spis', 'embedded-shim': shim_bytes}
+additional = {'mbi-spis': b'mbi-spis', 'host-memory-policy': b'host-memory-policy', 'embedded-shim': shim_bytes}
 observed = {name: False for name in additional}
 overlap = max(map(len, additional.values())) - 1
 tail = b''
@@ -312,6 +343,7 @@ with binary.open('rb') as stream:
             observed[name] |= value in data
         tail = data[-overlap:] if overlap else b''
 markers['mbi-spis'] = observed['mbi-spis']
+markers['host-memory-policy'] = observed['host-memory-policy']
 (out / 'static-options.json').write_text(json.dumps(markers, indent=2) + '\n')
 missing = [name for name, found in markers.items() if not found]
 if missing:
@@ -350,6 +382,7 @@ report = {
     'source_lock_reused_without_ref_resolution': True,
     'synchronized_manifest': 'source-manifest.xml',
     'native_display_patch': json.loads((out / 'native-display-patch.json').read_text()),
+    'host_policy_source': json.loads((out / 'host-policy-source.json').read_text()),
     'platform_library_policy_source': 'droidvm-meta-repo/6_build_apk_prepare.sh at the meta_commit',
     'local_runtime_policy_source': RUNTIME_PAYLOAD_POLICY_SOURCE,
     'excluded_link_stubs': sorted(path.name for path in complete.glob('*.so')
