@@ -1,51 +1,127 @@
 {
+  "schema_version": 2,
   "base_commit": "c69de01daf50ee8a24adf07e994adf8bcd5825cf",
-  "patch_sha256": "f01ceb49a8babeba74d5773598e0656d32cda51dcac5a26bee8700d012ef9862",
+  "patch_sha256": "71d4f98af0117b12687b655a11c6e6dd5070710bd5aa44beee05bb84648bc9f4",
   "files": [
+    {
+      "file": "hypervisor/src/gunyah/lease.rs",
+      "pinned_sha256": null,
+      "final_lf_sha256": "74f6ded2f69dba31201c2a14e6dc5da124b0fdceb942aa0de7ebed6599210fd0",
+      "new_file": true
+    },
+    {
+      "file": "hypervisor/src/gunyah/lease_state.rs",
+      "pinned_sha256": null,
+      "final_lf_sha256": "97112286b3dbba21d5c23f4562554cfe2fbbe4b6da753a806e74ebb3973e664b",
+      "new_file": true
+    },
     {
       "file": "hypervisor/src/gunyah/mod.rs",
       "pinned_sha256": "048480dc8a5d494d886d4000403eee041651c52967b808d5b23b9353029310ae",
-      "final_lf_sha256": "7517ae1625a99007803020b7d506f3414ecb2fe0b7b5a572e489fd2a8c92bbb7"
+      "final_lf_sha256": "3fd1083a8cd203440a93bec13c1239a582bc8b5964bce4880b7df6d02441ee87",
+      "new_file": false
     },
     {
       "file": "hypervisor/src/gunyah/mthp.rs",
       "pinned_sha256": "6cf00574b1f11cb74484403ccabbf85a1533b4dd45196e2c331716907debb459",
-      "final_lf_sha256": "f03a69149c11c97289cad66f225e3ccf2a2c44993faf81234b16fd13aeff7188"
-    },
-    {
-      "file": "hypervisor/src/lib.rs",
-      "pinned_sha256": "3052441c2bbfbba8d6b834c3c73e70fb2fd141f450e510378624470b91ca56d8",
-      "final_lf_sha256": "09beb72561ab384aff87aa85d5e37f5836b20c37f224a6657ae0581113fe88dd"
-    },
-    {
-      "file": "src/crosvm/cmdline.rs",
-      "pinned_sha256": "3760aaf61679095f363c27f82c827e8eb3128f908d4d109351b560f76782871a",
-      "final_lf_sha256": "f1af53ce1b18c4041fead66d549c5f772496f9416ed2e1580597411138b3534f"
-    },
-    {
-      "file": "src/crosvm/config.rs",
-      "pinned_sha256": "89c2fa2874a2d15946dab3eecf5d5fecc1befaae43fd96258e7fd6375a6235f8",
-      "final_lf_sha256": "22a795b545a65618b35dfea971006b71cc8974c8dabf6978a623885de080a1d7"
-    },
-    {
-      "file": "src/crosvm/sys/linux.rs",
-      "pinned_sha256": "d56f75fe8031d360dbe2da572536665ddfc7a1ba9e669e5baf4d83752118f192",
-      "final_lf_sha256": "7647b64320cdfb2539a4ceae228fa23ce993016634f5d0471b5a7cd6fadad56b"
-    },
-    {
-      "file": "src/crosvm/sys/linux/device_helpers.rs",
-      "pinned_sha256": "7844b1887d1455bb7cd37fed0ea2df65fc9cf49b6b3dfa807e5a5057001e739d",
-      "final_lf_sha256": "377bcab621742b49057a6b34f19b3fb7db33f93fdc264eeb46a015b3407fc6a3"
-    },
-    {
-      "file": "src/sys/windows.rs",
-      "pinned_sha256": "fda15d1b7ff6ff505766a8b2bc18196caf8998db30416159282fc004fdd44c6f",
-      "final_lf_sha256": "26e1fcdcbf1bff85cb045c4a37f68ce7535fa852aa19f27252a12f0e763adc87"
+      "final_lf_sha256": "f03a69149c11c97289cad66f225e3ccf2a2c44993faf81234b16fd13aeff7188",
+      "new_file": false
     },
     {
       "file": "hypervisor/src/gunyah/pin.rs",
       "pinned_sha256": "78330d7a86788fcf50d7186b436ccdc6b76abd92196cd7484019d0d96f9ef15c",
-      "final_lf_sha256": "a00ab1a961dc84dc6d9c03664a009962902018e85318479a93997950d1586c19"
+      "final_lf_sha256": "a00ab1a961dc84dc6d9c03664a009962902018e85318479a93997950d1586c19",
+      "new_file": false
+    },
+    {
+      "file": "hypervisor/src/lib.rs",
+      "pinned_sha256": "3052441c2bbfbba8d6b834c3c73e70fb2fd141f450e510378624470b91ca56d8",
+      "final_lf_sha256": "fc6b735edf120e3e4fe7f5ccbf0a3d3bb02bccffd5f6319b22fa63d966cd6fd2",
+      "new_file": false
+    },
+    {
+      "file": "src/crosvm/cmdline.rs",
+      "pinned_sha256": "3760aaf61679095f363c27f82c827e8eb3128f908d4d109351b560f76782871a",
+      "final_lf_sha256": "f1af53ce1b18c4041fead66d549c5f772496f9416ed2e1580597411138b3534f",
+      "new_file": false
+    },
+    {
+      "file": "src/crosvm/config.rs",
+      "pinned_sha256": "89c2fa2874a2d15946dab3eecf5d5fecc1befaae43fd96258e7fd6375a6235f8",
+      "final_lf_sha256": "22a795b545a65618b35dfea971006b71cc8974c8dabf6978a623885de080a1d7",
+      "new_file": false
+    },
+    {
+      "file": "src/crosvm/sys/linux.rs",
+      "pinned_sha256": "d56f75fe8031d360dbe2da572536665ddfc7a1ba9e669e5baf4d83752118f192",
+      "final_lf_sha256": "dc45595d9d1cd43f4236ea8df8c3f3b6102cedb0b81eef8c971b2db6125b255b",
+      "new_file": false
+    },
+    {
+      "file": "src/crosvm/sys/linux/device_helpers.rs",
+      "pinned_sha256": "7844b1887d1455bb7cd37fed0ea2df65fc9cf49b6b3dfa807e5a5057001e739d",
+      "final_lf_sha256": "377bcab621742b49057a6b34f19b3fb7db33f93fdc264eeb46a015b3407fc6a3",
+      "new_file": false
+    },
+    {
+      "file": "src/crosvm/sys/linux/run_control_lifecycle.rs",
+      "pinned_sha256": null,
+      "final_lf_sha256": "e7484842d1d77c668780ff03d5ce26f24e7add9b985558320ceae9ab3bcb0bcb",
+      "new_file": true
+    },
+    {
+      "file": "src/crosvm/sys/linux/simplefb_display.rs",
+      "pinned_sha256": "a4f803d394f6c89535ad3c96c0b2af49eaa71a0aef9abb8b8b2de7df06aba99e",
+      "final_lf_sha256": "9d2c60b32822e1a6cda5f36eba6408b142232c67c0c493dc12ca369d8631aa64",
+      "new_file": false
+    },
+    {
+      "file": "src/crosvm/sys/linux/vcpu.rs",
+      "pinned_sha256": "01dd99a13c88a1e4ac67924cdca1a4300d8acf24b67bdc54d46ed0ea6ccf9330",
+      "final_lf_sha256": "8f9ba751a431d32fcde19cdc4c9c44d276fa918c2a5a7e73372276f576fa4901",
+      "new_file": false
+    },
+    {
+      "file": "src/sys/windows.rs",
+      "pinned_sha256": "fda15d1b7ff6ff505766a8b2bc18196caf8998db30416159282fc004fdd44c6f",
+      "final_lf_sha256": "26e1fcdcbf1bff85cb045c4a37f68ce7535fa852aa19f27252a12f0e763adc87",
+      "new_file": false
     }
-  ]
+  ],
+  "scope": "App-private native ReadOnly + pseudo/shared-guest-RAM lease lifecycle; legacy wire API/provider identity preserved",
+  "source_provenance": {
+    "repository": "https://github.com/Droid-VM/crosvm",
+    "commit": "c69de01daf50ee8a24adf07e994adf8bcd5825cf",
+    "base_archive_sha256": "a729fc5389883668c88738500d32377795eb7fa82ff6200b5fa8164e7c34df8a",
+    "base_archive_scope": "Only 14 target paths examined; 11 regular file inputs and 3 proven absent new paths",
+    "reviewed_layers": [
+      {
+        "name": "Apple8 existing host-policy",
+        "patch_sha256": "f01ceb49a8babeba74d5773598e0656d32cda51dcac5a26bee8700d012ef9862"
+      },
+      {
+        "name": "Rust lease owner fence",
+        "patch_sha256": "60c0a6694e2b827da0a2fa37d3b41403656f02abbda986a887e0c9b56fb26506"
+      },
+      {
+        "name": "Production outer-fence smoke",
+        "patch_sha256": "3170ab5480415b50eece63f88de9a404d3137435361cbc0c6e2d37d9be707d9b"
+      }
+    ]
+  },
+  "lifecycle": {
+    "provider": "/dev/gunyah_share",
+    "lease_abi_version": 1,
+    "required_features": 15,
+    "opt_in": "host_memory_policy ReadOnly and protection_type.shares_guest_ram(), Gunyah only; no new CLI/env",
+    "completion": "Same native owner PID waits for fresh same-generation COMPLETE after real reclaim/resource release; elapsed waits and ENOENT do not acknowledge completion",
+    "legacy_enoent": "Native backing retained on unknown/deferred legacy ENOENT; wire numbers/provider identity unchanged"
+  },
+  "verification": {
+    "memory_boundary_count": 9,
+    "lease_production_helper_count": 9,
+    "host_fragment_smoke": "Verbatim production outer-fence body with host adapters and empty registry; control flow only, no real VM/RM",
+    "architecture_gated_production_smoke": "Source contains ARM/Gunyah real-function test with empty registry; execution on actual supported target remains separate",
+    "device_panic_or_rm_verification": "Not established by host tests"
+  }
 }

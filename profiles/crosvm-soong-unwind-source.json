@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "project_path": "build/soong",
+  "repository": "https://github.com/Crosvm-Android/soong",
+  "base_commit": "c2db5181e9e1b6a383f6e858fb39b3db26aba7e7",
+  "patch_sha256": "be7c43b7704ebfd969d2552528a561d8c47d5d2b116ed1c655ff7ba0461e9894",
+  "files": [
+    {
+      "file": "rust/config/global.go",
+      "pinned_sha256": "3099eb5c80da40aaf16ce7529a500971788d0f2c06320fae0bba4d82cf02ae6a",
+      "final_lf_sha256": "c5249045d602d021a60e5e380bb8bcdfd10e2fb9a0ebf6c1017dbc2fce5ccbd5"
+    }
+  ],
+  "rust_version": "1.88.0",
+  "device_panic_strategy_selected": "unwind",
+  "scope": "Dedicated CI crosvm build tree only; all Android device Rust crates built for the selected crosvm target inherit this default, including transitive Rust/stdlib dependencies",
+  "runtime_examples": [
+    "crosvm_device_only_bin",
+    "libhypervisor",
+    "libdevices",
+    "libvm_memory",
+    "libvm_control",
+    "libbase_rust",
+    "libstd",
+    "transitive Rust dependencies"
+  ],
+  "system_or_phone_changes": false,
+  "source_lock_snapshot_sha256": "fe63a6eec0ec48abd7a9551a93e1b60b976ee0171b9a18c1a52f93b9ffccb610",
+  "limits": [
+    "Source configuration is not a device panic/RM execution result",
+    "Soong device rust_test still adds -Z panic_abort_tests; portable smoke uses explicit host unwind and does not establish device behavior",
+    "Fatal C signals, direct _exit, non-unwinding FFI panic, OOM abort and SIGKILL remain outside unwind guarantees"
+  ]
+}

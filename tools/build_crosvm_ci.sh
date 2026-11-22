@@ -7,15 +7,21 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 META_PIN=4261ef27261763c4eaa505a0ec03019963b52f92
 MANIFEST_PIN=8143624b0ff2c37095d296c0f993c64f936a68a9
 CROSVM_PIN=c69de01daf50ee8a24adf07e994adf8bcd5825cf
+SOONG_PIN=c2db5181e9e1b6a383f6e858fb39b3db26aba7e7
+SOONG_UNWIND_SOURCE="$ROOT/profiles/crosvm-soong-unwind-source.json"
+SOONG_UNWIND_PATCH="$ROOT/patches/crosvm-soong-device-unwind.patch"
+SOONG_RUST_TOOLCHAIN=1.88.0
 REPO_PIN=e71a8c6dd85026c8861e675ed7ff468fc611df44
 SOURCE_LOCK="$ROOT/profiles/crosvm-display-source-lock.json"
 SOURCE_LOCK_SHA256=fe63a6eec0ec48abd7a9551a93e1b60b976ee0171b9a18c1a52f93b9ffccb610
 UPSTREAM_MANIFEST_SHA256=ffa1c625ef1bc6fc0a49070436207425d556488cf4a84a4b33a6ee3087846082
 VIRTUALIZATION_PIN=c8c132c55d7d5932966e8b2f262e2f86d676cbb1
 NATIVE_DISPLAY_PATCH="$ROOT/patches/android-display-owner.patch"
-NATIVE_DISPLAY_PATCH_SHA256=508c025223e29868eb3e9b1f4638d7f41b869221cfb6802c79949e5a6452fbcc
+NATIVE_DISPLAY_PATCH_SHA256=f274fc8217f8d87f27647904bc78d38bd4b31f9df9510957377ed69812134c8f
+NATIVE_DISPLAY_MANIFEST="$ROOT/profiles/native-display-owner-source.json"
+NATIVE_DISPLAY_MANIFEST_SHA256=5487c83259944829d82a31804938cb2692692cd3613349ae2cd30cf1c2d5ece5
 NATIVE_DISPLAY_SOURCE_SHA256=47d833cf2832ce6c63e4f6e28e6458dd66a3b8d7b2880ca02f7f6e15159e6e61
-NATIVE_DISPLAY_FIXED_SHA256=df3a45d4dede4cac0b0d944a04069fad1d374c8da7b4fd0d721d54405fab5986
+NATIVE_DISPLAY_FIXED_SHA256=9926b7c320362a2351998bdd6629ac4fb41976e841d78fd1347446396b43874d
 SHIM_RUST_TOOLCHAIN=1.100.0
 SHIM_SHA256=3db0af7122198f1dde9f7fe1ef9794411b519fe153abcc427755f7280078ecad
 OUT="$ROOT/output/crosvm"
@@ -33,7 +39,9 @@ REPO_SOURCE="$WORK/git-repo"
 export OUT ROOT META META_PIN MANIFEST_PIN CROSVM_PIN REPO_PIN LOCKED_MANIFEST MANIFEST_SOURCE
 export SOURCE_LOCK SOURCE_LOCK_SHA256 UPSTREAM_MANIFEST_SHA256 VIRTUALIZATION_PIN
 export NATIVE_DISPLAY_PATCH NATIVE_DISPLAY_PATCH_SHA256 NATIVE_DISPLAY_SOURCE_SHA256 NATIVE_DISPLAY_FIXED_SHA256
+export NATIVE_DISPLAY_MANIFEST NATIVE_DISPLAY_MANIFEST_SHA256
 export SHIM_RUST_TOOLCHAIN SHIM_SHA256
+export SOONG_PIN SOONG_UNWIND_SOURCE SOONG_UNWIND_PATCH SOONG_RUST_TOOLCHAIN
 export JOBS=${JOBS:-4}
 export REPO_JOBS=${REPO_JOBS:-4}
 export GOMEMLIMIT=${GOMEMLIMIT:-8GiB}
@@ -192,7 +200,7 @@ PY
 
 # The display owner is a cc_library_static linked into crosvm. Apply the
 # reviewed source-only patch before the complete Soong build and retain its
-# exact patch and before/after source identities with the resulting VMM.
+# exact patch and all three before/after source identities with the resulting VMM.
 python3 - <<'PY'
 import hashlib
 import json
@@ -201,44 +209,91 @@ from pathlib import Path
 import subprocess
 
 out = Path(os.environ['OUT'])
+manifest_path = Path(os.environ['NATIVE_DISPLAY_MANIFEST'])
+manifest_bytes = manifest_path.read_bytes()
+manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+if manifest_sha256 != os.environ['NATIVE_DISPLAY_MANIFEST_SHA256']:
+    raise SystemExit('The native display source manifest differs from the reviewed bytes.')
+manifest = json.loads(manifest_bytes)
+project_path = 'packages/modules/Virtualization'
+if manifest['project_path'] != project_path:
+    raise SystemExit('The native display manifest selects a different source project.')
+lock = json.loads((out / 'source-lock.json').read_bytes())
+selected = [item['commit'] for item in lock['projects'] if item['path'] == project_path]
+if selected != [os.environ['VIRTUALIZATION_PIN']] or manifest['base_commit'] != selected[0]:
+    raise SystemExit('The fixed source lock and reviewed native display patch base disagree.')
 repository = Path(os.environ['META']) / 'crosvm_build/packages/modules/Virtualization'
 commit = subprocess.check_output(['git', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
 if commit != os.environ['VIRTUALIZATION_PIN']:
     raise SystemExit('The synchronized Virtualization checkout differs from the reviewed patch base.')
 source_path = 'libs/android_display_backend/crosvm_android_display_client.cpp'
-source = repository / source_path
-before = hashlib.sha256(source.read_bytes()).hexdigest()
-if before != os.environ['NATIVE_DISPLAY_SOURCE_SHA256']:
-    raise SystemExit('The native display source differs from the reviewed unpatched bytes.')
+aidl_path = 'libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl'
+header_path = 'libs/android_display_backend/surface_attachment_owner.h'
+files = manifest['files']
+if len(files) != 3 or {row['file'] for row in files} != {source_path, aidl_path, header_path}:
+    raise SystemExit('The native display manifest must retain exactly the reviewed C++/AIDL/header files.')
+cpp = next(row for row in files if row['file'] == source_path)
+if cpp['pinned_sha256'] != os.environ['NATIVE_DISPLAY_SOURCE_SHA256'] or cpp['final_lf_sha256'] != os.environ['NATIVE_DISPLAY_FIXED_SHA256']:
+    raise SystemExit('The native display C++ identity differs from the retained exact pins.')
+aidl = next(row for row in files if row['file'] == aidl_path)
+if aidl['final_lf_sha256'] != manifest['paired_aidl_sha256']:
+    raise SystemExit('The native display AIDL differs from the paired App API identity.')
+verified_files = []
+for row in files:
+    source = repository / row['file']
+    before = None
+    if row['pinned_sha256'] is None:
+        # Null is a proven absent base path, including dangling links.
+        if os.path.lexists(source):
+            raise SystemExit('New native display source already exists: ' + row['file'])
+    else:
+        before = hashlib.sha256(source.read_bytes()).hexdigest()
+        if before != row['pinned_sha256']:
+            raise SystemExit('Unexpected unpatched native display source: ' + row['file'])
+    verified_files.append({'file': row['file'], 'source_sha256_before': before})
 patch = Path(os.environ['NATIVE_DISPLAY_PATCH'])
 patch_bytes = patch.read_bytes()
 patch_sha256 = hashlib.sha256(patch_bytes).hexdigest()
-if patch_sha256 != os.environ['NATIVE_DISPLAY_PATCH_SHA256']:
+if patch_sha256 != os.environ['NATIVE_DISPLAY_PATCH_SHA256'] or patch_sha256 != manifest['patch_sha256']:
     raise SystemExit('The native display patch differs from the reviewed final patch.')
 command = ['git', '-c', 'core.autocrlf=false', '-C', str(repository), 'apply', '--whitespace=error']
 subprocess.run([*command, '--check', str(patch)], check=True)
 subprocess.run([*command, str(patch)], check=True)
-after = hashlib.sha256(source.read_bytes()).hexdigest()
-if after != os.environ['NATIVE_DISPLAY_FIXED_SHA256']:
-    raise SystemExit('The patched native display source differs from the reviewed final bytes.')
+for row, verified in zip(files, verified_files):
+    after = hashlib.sha256((repository / row['file']).read_bytes()).hexdigest()
+    if after != row['final_lf_sha256']:
+        raise SystemExit('Unexpected patched native display source: ' + row['file'])
+    verified['source_sha256_after'] = after
 retained_patch = out / 'diagnostics/android-display-owner.patch'
 retained_patch.write_bytes(patch_bytes)
+(out / 'native-display-source.json').write_bytes(manifest_bytes)
 (out / 'native-display-patch.json').write_text(json.dumps({
-    'project_path': 'packages/modules/Virtualization',
-    'project_url': 'https://github.com/Droid-VM/Virtualization',
+    'schema_version': 2,
+    'project_path': project_path,
+    'project_url': manifest['repository'],
     'upstream_commit': commit,
     'source_path': source_path,
-    'source_sha256_before': before,
-    'source_sha256_after': after,
+    'source_sha256_before': cpp['pinned_sha256'],
+    'source_sha256_after': cpp['final_lf_sha256'],
+    'source_manifest': 'native-display-source.json',
+    'source_manifest_snapshot': 'profiles/native-display-owner-source.json',
+    'source_manifest_sha256': manifest_sha256,
+    'files': files,
+    'verified_files': verified_files,
+    'source_provenance': manifest['source_provenance'],
+    'stages': manifest['stages'],
+    'paired_aidl_sha256': manifest['paired_aidl_sha256'],
+    'verification_scope': manifest['verification_scope'],
     'patch': retained_patch.relative_to(out).as_posix(),
     'patch_sha256': patch_sha256,
     'source_lock_snapshot': 'profiles/crosvm-display-source-lock.json',
     'source_lock_snapshot_sha256': os.environ['SOURCE_LOCK_SHA256'],
     'build_linkage': 'libcrosvm_android_display_client (cc_library_static) linked into crosvm',
+    'app_api_compatibility_verification': 'not performed by this build; App must ship the same paired AIDL identity',
     'real_android_surface_vulkan_verification': 'not performed by this build',
     'phone_apple_guest_boot_verification': 'not performed by this build',
 }, indent=2) + '\n')
-print('Applied the reviewed native display patch and verified exact before/after source bytes.')
+print('Applied the reviewed native display patch and verified all three exact before/after source identities.')
 PY
 
 # Apply only the reviewed VMM source changes to the pinned crosvm tree.
@@ -259,7 +314,12 @@ if subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=T
 if hashlib.sha256(patch.read_bytes()).hexdigest() != manifest['patch_sha256']:
     raise SystemExit('The crosvm host policy patch digest differs.')
 for row in manifest['files']:
-    if hashlib.sha256((repo / row['file']).read_bytes()).hexdigest() != row['pinned_sha256']:
+    source = repo / row['file']
+    if row['pinned_sha256'] is None:
+        # Null means proven absent in the c69 base, never an unchecked existing input.
+        if os.path.lexists(source):
+            raise SystemExit('New crosvm source already exists: ' + row['file'])
+    elif hashlib.sha256(source.read_bytes()).hexdigest() != row['pinned_sha256']:
         raise SystemExit('Unexpected unpatched crosvm source: ' + row['file'])
 cmd = ['git', '-c', 'core.autocrlf=false', '-C', str(repo), 'apply', '--whitespace=error']
 subprocess.run([*cmd, '--check', str(patch)], check=True)
@@ -269,8 +329,56 @@ for row in manifest['files']:
         raise SystemExit('Unexpected patched crosvm source: ' + row['file'])
 (out / 'diagnostics/crosvm-host-read-only.patch').write_bytes(patch.read_bytes())
 (out / 'host-policy-source.json').write_text(json.dumps(manifest, indent=2) + '\n')
-print('Verified and applied the reviewed VMM host read-only policy.')
+(out / 'native-lifecycle-source.json').write_text(json.dumps({
+    'source_manifest_sha256': hashlib.sha256((root / 'profiles/crosvm-host-policy-source.json').read_bytes()).hexdigest(),
+    'lifecycle': manifest['lifecycle'],
+    'source_provenance': manifest['source_provenance'],
+    'verification_scope': manifest['verification'],
+}, indent=2) + '\n')
+print('Verified and applied the reviewed composite VMM source and lifecycle policy.')
 PYCODE
+
+
+# This exact Soong patch affects this disposable build tree only. The 96 source commits
+# remain unchanged; no installed Android file, phone, module or other App is modified.
+python3 - <<'PYSOONG'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+root = Path(os.environ['ROOT'])
+out = Path(os.environ['OUT'])
+repo = Path(os.environ['META']) / 'crosvm_build/build/soong'
+manifest_path = Path(os.environ['SOONG_UNWIND_SOURCE'])
+manifest = json.loads(manifest_path.read_bytes())
+lock = json.loads((out / 'source-lock.json').read_bytes())
+selected = next(item['commit'] for item in lock['projects'] if item['path'] == 'build/soong')
+if selected != os.environ['SOONG_PIN'] or selected != manifest['base_commit']:
+    raise SystemExit('The fixed source lock and reviewed Soong patch base disagree.')
+if subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip() != selected:
+    raise SystemExit('The synchronized Soong checkout differs from the retained exact pin.')
+patch = Path(os.environ['SOONG_UNWIND_PATCH'])
+patch_bytes = patch.read_bytes()
+if hashlib.sha256(patch_bytes).hexdigest() != manifest['patch_sha256']:
+    raise SystemExit('The reviewed Soong unwind patch bytes differ.')
+for row in manifest['files']:
+    if hashlib.sha256((repo / row['file']).read_bytes()).hexdigest() != row['pinned_sha256']:
+        raise SystemExit('Unexpected unpatched Soong source: ' + row['file'])
+command = ['git', '-c', 'core.autocrlf=false', '-C', str(repo), 'apply', '--whitespace=error']
+subprocess.run([*command, '--check', str(patch)], check=True)
+subprocess.run([*command, str(patch)], check=True)
+for row in manifest['files']:
+    if hashlib.sha256((repo / row['file']).read_bytes()).hexdigest() != row['final_lf_sha256']:
+        raise SystemExit('Unexpected patched Soong source: ' + row['file'])
+(out / 'diagnostics/soong-device-unwind.patch').write_bytes(patch_bytes)
+(out / 'soong-unwind-source.json').write_text(json.dumps({
+    **manifest, 'source_manifest_sha256': hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    'applied_only_to_ci_build_tree': True, 'device_panic_execution_verified': False,
+    'source_lock_commits_changed': False,
+}, indent=2) + '\n')
+print('Verified and applied the pinned CI-only Soong unwind default; runtime execution remains separate.')
+PYSOONG
 
 # The shim is a separate bare-metal crate; Soong uses its own Rust prebuilts.
 rustup toolchain install "$SHIM_RUST_TOOLCHAIN" --profile minimal --target aarch64-unknown-none-softfloat
@@ -283,6 +391,17 @@ python3 "$ROOT/tools/run_gunyah_host_boundary_tests.py" \
   --source "$META/crosvm_build/external/crosvm" \
   --manifest "$ROOT/profiles/crosvm-host-policy-source.json" \
   --output "$OUT/diagnostics/gunyah-host-boundary-tests" --rustc rustc
+# Execute the nine exact production lease helpers with the fixed Soong host compiler.
+# The additional labelled fragment smoke uses host adapters/empty registry; it is not an
+# Android-device panic, real VM, RM or kernel-module execution result.
+SOONG_RUSTC="$META/crosvm_build/prebuilts/rust/linux-x86/$SOONG_RUST_TOOLCHAIN/bin/rustc"
+test -x "$SOONG_RUSTC" || { echo 'Pinned Soong Rust compiler missing; no fallback or installer.' >&2; exit 1; }
+python3 "$ROOT/tools/run_gunyah_lease_boundary_tests.py" \
+  --source "$META/crosvm_build/external/crosvm" \
+  --manifest "$ROOT/profiles/crosvm-host-policy-source.json" \
+  --output "$OUT/diagnostics/gunyah-lease-boundary-tests" \
+  --rustc "$SOONG_RUSTC" --expected-rust-version "$SOONG_RUST_TOOLCHAIN" \
+  | tee "$OUT/diagnostics/gunyah-lease-boundary-summary.log"
 space_report before-build
 (
   cd "$META"
@@ -389,6 +508,11 @@ report = {
     'synchronized_manifest': 'source-manifest.xml',
     'native_display_patch': json.loads((out / 'native-display-patch.json').read_text()),
     'host_policy_source': json.loads((out / 'host-policy-source.json').read_text()),
+    'native_lifecycle_source': json.loads((out / 'native-lifecycle-source.json').read_text()),
+    'soong_unwind_source': json.loads((out / 'soong-unwind-source.json').read_text()),
+    'host_memory_boundary_tests': json.loads((out / 'diagnostics/gunyah-host-boundary-tests/host-boundary-test-receipt.json').read_text()),
+    'lease_production_helper_tests': json.loads((out / 'diagnostics/gunyah-lease-boundary-tests/lease-boundary-test-receipt.json').read_text()),
+    'panic_verification_scope': 'CI source selects device unwind; host production helpers and labelled host fragment pass independently. Architecture-gated full-source/device panic and actual RM reclaim are not established by these host tests.',
     'platform_library_policy_source': 'droidvm-meta-repo/6_build_apk_prepare.sh at the meta_commit',
     'local_runtime_policy_source': RUNTIME_PAYLOAD_POLICY_SOURCE,
     'excluded_link_stubs': sorted(path.name for path in complete.glob('*.so')

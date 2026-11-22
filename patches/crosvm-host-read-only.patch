@@ -1,7 +1,434 @@
+diff --git a/hypervisor/src/gunyah/lease.rs b/hypervisor/src/gunyah/lease.rs
+new file mode 100644
+--- /dev/null
++++ b/hypervisor/src/gunyah/lease.rs
+@@ -0,0 +1,266 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! App-private HostShare lease client. The owner fence keeps monitor fds only;
++//! VM/IRQ/device/memory owners must leave their scopes before completion is read.
++
++#[path = "lease_state.rs"]
++mod lease_state;
++
++use std::cell::RefCell;
++use std::fs::File;
++use std::fs::OpenOptions;
++use std::os::fd::AsRawFd;
++use std::os::fd::FromRawFd;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++
++use base::ioctl;
++use base::ioctl_with_mut_ref;
++use base::ioctl_with_ref;
++use base::Error;
++use base::Result;
++
++use super::gunyah_sys::ghsm_share_blob;
++use super::gunyah_sys::ghsm_share_dmabuf;
++use lease_state::Completion;
++use lease_state::CompletionTracker;
++use lease_state::LeaseCaps;
++use lease_state::LeaseStatus;
++
++pub const PROVIDER: &str = "/dev/gunyah_share";
++
++// Frozen owner header ghsm_lease_uapi.h SHA256
++// b2f34317da73b49867263bd664c969be1ce74bd33dad693a13ddaeb615c07a48.
++// Existing 0x14/0x15/0x16 structs above remain owned by gunyah_sys.
++#[repr(C)]
++struct OpenLease { vm_fd: i32, flags: u32 }
++#[repr(C)]
++struct ShareBlobLease { blob: ghsm_share_blob, lease_fd: i32, reserved: u32, parcel_id: u64 }
++#[repr(C)]
++struct ShareDmabufLease { blob: ghsm_share_dmabuf, lease_fd: i32, reserved: u32, parcel_id: u64 }
++#[repr(C)]
++struct UnshareParcel { parcel_id: u64 }
++
++base::ioctl_ior_nr!(GET_CAPS, 0x47, 0x20, LeaseCaps);
++base::ioctl_iow_nr!(OPEN_LEASE, 0x47, 0x21, OpenLease);
++base::ioctl_iowr_nr!(SHARE_BLOB, 0x47, 0x22, ShareBlobLease);
++base::ioctl_iowr_nr!(SHARE_DMABUF, 0x47, 0x23, ShareDmabufLease);
++base::ioctl_io_nr!(SEAL, 0x47, 0x24);
++base::ioctl_ior_nr!(QUERY, 0x47, 0x25, LeaseStatus);
++base::ioctl_iow_nr!(UNSHARE_PARCEL, 0x47, 0x26, UnshareParcel);
++
++fn error_from_io(error: std::io::Error) -> Error {
++    Error::new(error.raw_os_error().unwrap_or(libc::EIO))
++}
++
++fn checked_zero(ret: i32) -> Result<()> {
++    if ret == 0 { Ok(()) } else if ret < 0 { Err(Error::last()) }
++    else { Err(Error::new(libc::EPROTO)) }
++}
++
++fn query(fd: &File) -> Result<LeaseStatus> {
++    let mut status = LeaseStatus::default();
++    // SAFETY: repr(C), the owner header defines exactly this output layout.
++    checked_zero(unsafe { ioctl_with_mut_ref(fd, QUERY, &mut status) })?;
++    Ok(status)
++}
++
++fn seal(fd: &File) -> Result<()> {
++    // SAFETY: fd is an owned anonymous lease descriptor; no pointer argument.
++    checked_zero(unsafe { ioctl(fd, SEAL) })
++}
++
++struct Monitor { fd: File, generation: Option<u64>, identity_error: Option<String> }
++#[derive(Default)]
++struct Registry { monitors: Vec<Monitor> }
++
++thread_local! {
++    static ACTIVE: RefCell<Option<Arc<Mutex<Registry>>>> = const { RefCell::new(None) };
++}
++
++pub struct LeaseClient { provider: File, fd: File }
++
++impl LeaseClient {
++    pub fn open(vm_fd: i32) -> Result<Self> {
++        let registry = ACTIVE.with(|active| active.borrow().clone())
++            .ok_or_else(|| {
++                base::error!("private HostShare lease requires the outer owner close fence");
++                Error::new(libc::EPROTO)
++            })?;
++        let provider = OpenOptions::new().read(true).write(true).open(PROVIDER)
++            .map_err(error_from_io)?;
++        let mut caps = LeaseCaps::default();
++        // SAFETY: fixed header layout; the provider must advertise all required capabilities.
++        checked_zero(unsafe { ioctl_with_mut_ref(&provider, GET_CAPS, &mut caps) })?;
++        if !caps.supports_owner_fence() {
++            base::error!("private HostShare lacks required lease capabilities: {:?}", caps);
++            return Err(Error::new(libc::ENOTSUP));
++        }
++        let open = OpenLease { vm_fd, flags: 0 };
++        // SAFETY: caller retains the exact VM fd; OPEN returns a new CLOEXEC fd, including fd 0.
++        let ret = unsafe { ioctl_with_ref(&provider, OPEN_LEASE, &open) };
++        if ret < 0 { return Err(Error::last()); }
++        let monitor_fd = unsafe { File::from_raw_fd(ret) };
++        // Register the owned descriptor BEFORE any fallible duplicate/query and BEFORE SHARE.
++        // A failed boot can therefore seal a context even if no LeaseClient was returned.
++        let (index, fd) = {
++            let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
++            let index = registry.monitors.len();
++            registry.monitors.push(Monitor { fd: monitor_fd, generation: None, identity_error: None });
++            let fd = registry.monitors[index].fd.try_clone().map_err(error_from_io)?;
++            (index, fd)
++        };
++        let status = query(&fd)?;
++        if status.version != lease_state::ABI_VERSION || status.generation == 0
++            || status.state != lease_state::OPEN || status.owned_maps != 0
++            || status.inflight_shares != 0 {
++            base::error!("new private HostShare lease returned unexpected identity/state: {:?}", status);
++            registry.lock().unwrap_or_else(|e| e.into_inner()).monitors[index].identity_error =
++                Some(format!("new lease identity/state was invalid: {:?}", status));
++            return Err(Error::new(libc::EPROTO));
++        }
++        registry.lock().unwrap_or_else(|e| e.into_inner()).monitors[index].generation =
++            Some(status.generation);
++        Ok(Self { provider, fd })
++    }
++
++    pub fn share_blob(&self, blob: &mut ghsm_share_blob) -> Result<u64> {
++        let mut request = ShareBlobLease {
++            blob: *blob, lease_fd: self.fd.as_raw_fd(), reserved: 0, parcel_id: 0,
++        };
++        // SAFETY: fixed owner header; the returned parcel id belongs to this exact lease fd.
++        checked_zero(unsafe { ioctl_with_mut_ref(&self.provider, SHARE_BLOB, &mut request) })?;
++        *blob = request.blob;
++        Ok(request.parcel_id)
++    }
++
++    pub fn share_dmabuf(&self, blob: &mut ghsm_share_dmabuf) -> Result<u64> {
++        let mut request = ShareDmabufLease {
++            blob: *blob, lease_fd: self.fd.as_raw_fd(), reserved: 0, parcel_id: 0,
++        };
++        checked_zero(unsafe { ioctl_with_mut_ref(&self.provider, SHARE_DMABUF, &mut request) })?;
++        *blob = request.blob;
++        Ok(request.parcel_id)
++    }
++
++    pub fn unshare(&self, parcel_id: u64) -> Result<()> {
++        let request = UnshareParcel { parcel_id };
++        // 0 is the only exact-token reclaim/free ack. EAGAIN, ENOENT and every error remain unknown.
++        checked_zero(unsafe { ioctl_with_ref(&self.fd, UNSHARE_PARCEL, &request) })
++    }
++
++    pub fn seal(&self) -> Result<()> { seal(&self.fd) }
++}
++
++#[derive(Debug, Default)]
++pub struct CloseReport {
++    pub completed_generations: Vec<u64>,
++    pub errors: Vec<String>,
++}
++
++impl CloseReport {
++    pub fn is_clean(&self) -> bool { self.errors.is_empty() }
++}
++
++/// Lives OUTSIDE run_gunyah. Its registry owns lease fds and scalar identity only.
++/// Hard abort/_exit/SIGKILL do not unwind this guard and remain explicitly unsupported.
++pub struct OwnerFence { registry: Arc<Mutex<Registry>>, closed: bool, owner_pid: u32 }
++
++impl OwnerFence {
++    pub fn begin() -> Result<Self> {
++        let registry = Arc::new(Mutex::new(Registry::default()));
++        ACTIVE.with(|active| {
++            let mut active = active.borrow_mut();
++            if active.is_some() { return Err(Error::new(libc::EBUSY)); }
++            *active = Some(registry.clone());
++            Ok(())
++        })?;
++        Ok(Self { registry, closed: false, owner_pid: std::process::id() })
++    }
++
++    /// Returns only after actual COMPLETE for EVERY opened lease. Failures are reported while
++    /// the same owner PID stays alive; no deadline, elapsed wait, poll flag or ENOENT is an ack.
++    pub fn finish(&mut self) -> CloseReport {
++        let monitors = {
++            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
++            std::mem::take(&mut registry.monitors)
++        };
++        let mut report = CloseReport::default();
++        for monitor in monitors {
++            let mut tracker = CompletionTracker::new(monitor.generation);
++            if let Some(error) = monitor.identity_error { tracker.reject_identity(error); }
++            tracker.requested_close();
++            let mut reported = std::collections::BTreeSet::new();
++            let mut last_status = None;
++            let mut record = |operation: &'static str, error: String| {
++                if reported.insert(operation) {
++                    base::error!("owner PID {} retained: lease {}: {}", self.owner_pid, operation, error);
++                    report.errors.push(format!("{}: {}", operation, error));
++                }
++            };
++            loop {
++                if let Err(error) = seal(&monitor.fd) {
++                    if error.errno() != libc::EAGAIN && error.errno() != libc::EINTR {
++                        record("seal", error.to_string());
++                    }
++                }
++                let mut paced = false;
++                match query(&monitor.fd) {
++                    Ok(status) => {
++                        if last_status != Some(status) {
++                            base::info!("owner PID {} HostShare close: {:?}", self.owner_pid, status);
++                            last_status = Some(status);
++                        }
++                        match tracker.observe(status) {
++                            Completion::Complete => {
++                                report.completed_generations.push(status.generation);
++                                break;
++                            }
++                            Completion::Hold(error) => { record("state", error); paced = true; }
++                            Completion::Pending => {}
++                        }
++                    }
++                    Err(error) => { record("query", error.to_string()); paced = true; }
++                }
++                if paced {
++                    // Error backoff only. This delay acknowledges NOTHING; a fresh QUERY follows.
++                    // STALLED's persistent POLLERR must not turn retention into a busy loop.
++                    std::thread::park_timeout(Duration::from_secs(1));
++                    continue;
++                }
++                let mut pollfd = libc::pollfd {
++                    fd: monitor.fd.as_raw_fd(), events: libc::POLLIN, revents: 0,
++                };
++                // Notification/timeout only wake the next QUERY; neither proves completion.
++                let ret = unsafe { libc::poll(&mut pollfd, 1, 1000) };
++                if ret < 0 {
++                    let error = Error::last();
++                    if error.errno() != libc::EINTR { record("poll", error.to_string()); }
++                } else if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
++                    record("poll", format!("notification is not completion: revents={:#x}", pollfd.revents));
++                    std::thread::park_timeout(Duration::from_secs(1));
++                }
++            }
++        }
++        self.closed = true;
++        report
++    }
++}
++
++impl Drop for OwnerFence {
++    fn drop(&mut self) {
++        if !self.closed {
++            let report = self.finish();
++            if !report.is_clean() { base::error!("HostShare close fence errors: {:?}", report); }
++        }
++        ACTIVE.with(|active| {
++            let mut active = active.borrow_mut();
++            if active.as_ref().map_or(false, |current| Arc::ptr_eq(current, &self.registry)) {
++                *active = None;
++            }
++        });
++    }
++}
+diff --git a/hypervisor/src/gunyah/lease_state.rs b/hypervisor/src/gunyah/lease_state.rs
+new file mode 100644
+--- /dev/null
++++ b/hypervisor/src/gunyah/lease_state.rs
+@@ -0,0 +1,143 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! Facts from the frozen ghsm_lease_uapi.h, plus the completion boundary.
++//! No VM, GuestMemory, mapping or host process object is retained here.
++
++pub const ABI_VERSION: u32 = 1;
++pub const REQUIRED_FEATURES: u64 = 0xf;
++pub const OPEN: u32 = 1;
++pub const CLOSING: u32 = 2;
++pub const COMPLETE: u32 = 3;
++pub const STALLED: u32 = 4;
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug, Default)]
++pub struct LeaseCaps {
++    pub version: u32,
++    pub reserved: u32,
++    pub features: u64,
++}
++
++impl LeaseCaps {
++    pub fn supports_owner_fence(&self) -> bool {
++        self.version == ABI_VERSION && self.reserved == 0
++            && self.features & REQUIRED_FEATURES == REQUIRED_FEATURES
++    }
++}
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
++pub struct LeaseStatus {
++    pub version: u32,
++    pub state: u32,
++    pub generation: u64,
++    pub owned_maps: u64,
++    pub inflight_shares: u32,
++    pub last_errno: i32,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++pub enum Completion {
++    Pending,
++    Complete,
++    Hold(String),
++}
++
++pub struct CompletionTracker {
++    generation: Option<u64>,
++    close_requested: bool,
++    identity_error: Option<String>,
++}
++
++impl CompletionTracker {
++    pub fn new(generation: Option<u64>) -> Self {
++        Self { generation, close_requested: false, identity_error: None }
++    }
++
++    pub fn requested_close(&mut self) { self.close_requested = true; }
++
++    pub fn reject_identity(&mut self, error: String) { self.identity_error = Some(error); }
++
++    pub fn observe(&mut self, status: LeaseStatus) -> Completion {
++        if let Some(error) = &self.identity_error {
++            return Completion::Hold(error.clone());
++        }
++        let malformed = if status.version != ABI_VERSION || status.generation == 0 {
++            Some(format!("unrecognized lease identity: {:?}", status))
++        } else if self.generation.map_or(false, |expected| expected != status.generation) {
++            Some(format!("lease generation changed: expected {:?}, got {:?}",
++                         self.generation, status))
++        } else if !matches!(status.state, OPEN | CLOSING | COMPLETE | STALLED) {
++            Some(format!("unrecognized lease state: {:?}", status))
++        } else if status.state == COMPLETE
++            && (!self.close_requested || status.owned_maps != 0 || status.inflight_shares != 0) {
++            Some(format!("contradictory completion: {:?}", status))
++        } else { None };
++        if let Some(error) = malformed {
++            self.identity_error = Some(error.clone());
++            return Completion::Hold(error);
++        }
++        self.generation.get_or_insert(status.generation);
++        match status.state {
++            COMPLETE => Completion::Complete,
++            STALLED => Completion::Hold(format!("reclaim stalled; resources still owned: {:?}", status)),
++            _ => Completion::Pending,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn status(state: u32, maps: u64, inflight: u32) -> LeaseStatus {
++        LeaseStatus { version: ABI_VERSION, state, generation: 7,
++                      owned_maps: maps, inflight_shares: inflight, last_errno: 0 }
++    }
++
++    #[test]
++    fn legacy_caps_and_partial_features_are_refused_before_share() {
++        for bits in 0..REQUIRED_FEATURES {
++            assert!(!LeaseCaps { version: 1, reserved: 0, features: bits }.supports_owner_fence());
++        }
++        assert!(LeaseCaps { version: 1, reserved: 0, features: 0x1f }.supports_owner_fence());
++        assert!(!LeaseCaps { version: 2, reserved: 0, features: 0xf }.supports_owner_fence());
++    }
++
++    #[test]
++    fn zero_maps_and_elapsed_wait_do_not_complete_a_closing_lease() {
++        let mut tracker = CompletionTracker::new(Some(7));
++        tracker.requested_close();
++        for _ in 0..100 { assert_eq!(tracker.observe(status(CLOSING, 0, 0)), Completion::Pending); }
++    }
++
++    #[test]
++    fn only_complete_after_all_owned_resources_and_inflight_shares_finish() {
++        let mut tracker = CompletionTracker::new(Some(7));
++        tracker.requested_close();
++        assert_eq!(tracker.observe(status(CLOSING, 1, 0)), Completion::Pending);
++        assert_eq!(tracker.observe(status(CLOSING, 0, 1)), Completion::Pending);
++        assert_eq!(tracker.observe(status(COMPLETE, 0, 0)), Completion::Complete);
++    }
++
++    #[test]
++    fn stalled_and_unknown_identity_never_acknowledge_completion() {
++        let mut tracker = CompletionTracker::new(Some(7));
++        tracker.requested_close();
++        assert!(matches!(tracker.observe(status(STALLED, 1, 0)), Completion::Hold(_)));
++        let mut wrong = status(COMPLETE, 0, 0);
++        wrong.generation = 8;
++        assert!(matches!(tracker.observe(wrong), Completion::Hold(_)));
++        assert!(matches!(tracker.observe(status(COMPLETE, 0, 0)), Completion::Hold(_)));
++    }
++
++    #[test]
++    fn misleading_complete_with_an_owned_map_is_a_permanent_contract_failure() {
++        let mut tracker = CompletionTracker::new(Some(7));
++        tracker.requested_close();
++        assert!(matches!(tracker.observe(status(COMPLETE, 1, 0)), Completion::Hold(_)));
++        assert!(matches!(tracker.observe(status(COMPLETE, 0, 0)), Completion::Hold(_)));
++    }
++}
 diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
 --- a/hypervisor/src/gunyah/mod.rs
 +++ b/hypervisor/src/gunyah/mod.rs
-@@ -63,128 +63,86 @@
+@@ -6,6 +6,7 @@
+ mod aarch64;
+ 
+ mod gunyah_sys;
++pub mod lease;
+ mod mthp;
+ pub mod shim_abi;
+ mod pin;
+@@ -63,128 +64,86 @@
  
  use crate::*;
  
@@ -198,7 +625,35 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
  }
  
  pub struct Gunyah {
-@@ -499,7 +457,9 @@
+@@ -403,6 +362,8 @@
+     /// Long-term pins held over runtime-shared blobs between the SHARE ioctl and the guest's
+     /// accept, keyed by the same label as `blob_regions`. See `pin.rs`.
+     blob_pins: Arc<Mutex<BTreeMap<u32, pin::LongtermPin>>>,
++    lease: Option<Arc<lease::LeaseClient>>,
++    blob_lease_ids: Arc<Mutex<BTreeMap<u32, u64>>>,
+     routes: Arc<Mutex<HashSet<GunyahIrqRoute>>>,
+     hv_cfg: crate::Config,
+ }
+@@ -426,6 +387,18 @@
+         // SAFETY:
+         // Safe because we verify that ret is valid and we own the fd.
+         let vm_descriptor = unsafe { SafeDescriptor::from_raw_descriptor(ret) };
++        // This opt-in selects ONLY the App-private ReadOnly pseudo/shared-RAM path.
++        // Probe/open the existing node before the first memory SHARE. Insufficient
++        // capabilities fail here; never fall back to the old ABI or replace its provider.
++        let lease = if cfg.host_memory_policy == HostMemoryPolicy::ReadOnly
++            && cfg.protection_type.shares_guest_ram() {
++            if std::env::var_os("GH_NO_UNSHARE").is_some()
++                || std::env::var_os("GH_SHARE_PROBE").is_some() {
++                error!("private lease mode refuses diagnostic legacy SHARE/unshare bypasses");
++                return Err(Error::new(EINVAL));
++            }
++            Some(Arc::new(lease::LeaseClient::open(vm_descriptor.as_raw_descriptor())?))
++        } else { None };
+         // Slot counter for chunked LEND: starts after the last region index.
+         let mut next_lend_slot = guest_mem.num_regions() as usize;
+         for region in guest_mem.regions() {
+@@ -499,7 +472,9 @@
                      // Full preparation: drop caches, populate in batches,
                      // MADV_COLLAPSE to 2 MiB (leave the rest at 4 KiB), mlock.
                      // SAFETY: host_ptr is a valid mapping of region_size bytes.
@@ -209,7 +664,7 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
                      if !prep.populated {
                          error!(
                              "GH: guest RAM region gpa={:#x} size={:#x} failed to populate \
-@@ -656,8 +616,9 @@
+@@ -656,8 +631,9 @@
                          mthp::prepare_lend_region(
                              region.host_addr as *mut u8,
                              boot_share_len,
@@ -220,7 +675,7 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
                      if !prep.populated {
                          // Host-alloc must fail loudly: proceeding to SHARE an unbacked
                          // pool means the guest eventually SIGBUSes deep inside its GPU
-@@ -703,8 +664,12 @@
+@@ -703,8 +679,12 @@
                  if region.options.purpose == MemoryRegionPurpose::SharedGuestRam {
                      // SAFETY: host_addr is a valid mapping of region.size bytes.
                      let prep = unsafe {
@@ -235,7 +690,7 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
                      if !prep.populated || !prep.mlocked {
                          error!(
                              "GH-SHIM: window gpa={:#x} size={:#x} could not be populated and \
-@@ -749,8 +714,17 @@
+@@ -749,8 +729,17 @@
                  // one thing that reads it is the GPU transport that cannot survive being wrong.
                  #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                  if region.options.purpose == MemoryRegionPurpose::SharedFramebuffer {
@@ -255,7 +710,25 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
                      guest_mem.set_framebuffer_prep(prep);
                  }
  
-@@ -1177,7 +1151,10 @@
+@@ -872,6 +861,8 @@
+             pinned_regions: Arc::new(Mutex::new(Vec::new())),
+             blob_regions: Arc::new(Mutex::new(BTreeMap::new())),
+             blob_pins: Arc::new(Mutex::new(BTreeMap::new())),
++            lease,
++            blob_lease_ids: Arc::new(Mutex::new(BTreeMap::new())),
+             routes: Arc::new(Mutex::new(HashSet::new())),
+             hv_cfg: cfg,
+         })
+@@ -1010,6 +1001,8 @@
+             pinned_regions: self.pinned_regions.clone(),
+             blob_regions: self.blob_regions.clone(),
+             blob_pins: self.blob_pins.clone(),
++            lease: self.lease.clone(),
++            blob_lease_ids: self.blob_lease_ids.clone(),
+             routes: self.routes.clone(),
+             hv_cfg: self.hv_cfg,
+         })
+@@ -1177,7 +1170,10 @@
                          Error::new(EINVAL)
                      })?;
                  // exec: the payload runs from here.
@@ -267,7 +740,7 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
                  let parcel = abi::ShimParcel {
                      handle,
                      reserved: 0,
-@@ -1393,6 +1370,40 @@
+@@ -1393,6 +1389,40 @@
          }
      }
  
@@ -308,10 +781,22 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
      /// Runtime-SHARE a host blob to the running guest and return the resource-manager memparcel
      /// handle. Unlike `add_memory_region` (which SHARE's but never reaches a protected guest's
      /// stage-2 -> SIGBUS), this exposes the handle so the guest can `gh_rm_mem_accept` it itself
-@@ -1452,52 +1463,92 @@
-         let share_dev = File::open("/dev/gunyah_share")
-             .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
- 
+@@ -1449,55 +1479,115 @@
+         // The runtime-SHARE ioctl is served by the out-of-tree `gunyah_share_mod` module via its
+         // own `/dev/gunyah_share` char device (the in-tree gh_vm_ioctl has no such case), so the
+         // gunyah VM fd is passed as a request field rather than as the ioctl target.
+-        let share_dev = File::open("/dev/gunyah_share")
+-            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+-
++        let share_dev = if self.lease.is_none() {
++            Some(File::open("/dev/gunyah_share")
++                .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?)
++        } else { None };
++        if self.lease.is_some() && self.blob_regions.lock().contains_key(&label) {
++            // A failed/pending reclaim cannot be hidden by replacing its native backing.
++            return Err(Error::new(libc::EBUSY));
++        }
++
 +        let owned_range = match source_descriptor {
 +            Some(fd) => self.owned_memfd_range(&base::Descriptor(fd), source_offset, size)?,
 +            None => None,
@@ -355,8 +840,19 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
 +                };
 +                // SAFETY: the ioctl synchronously imports descriptors owned by this process and
 +                // writes mem_handle into `dmabuf`. Both fds remain valid for the whole call.
-+                let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_DMABUF, &mut dmabuf) };
++                let leased = match &self.lease {
++                    Some(lease) => Some(lease.share_dmabuf(&mut dmabuf)),
++                    None => None,
++                };
++                let ret = match &leased {
++                    Some(Ok(_)) => 0,
++                    Some(Err(_)) => -1,
++                    None => unsafe { ioctl_with_mut_ref(share_dev.as_ref().unwrap(), GHSM_SHARE_DMABUF, &mut dmabuf) },
++                };
 +                if ret == 0 {
++                    if let Some(Ok(parcel_id)) = leased {
++                        self.blob_lease_ids.lock().insert(label, parcel_id);
++                    }
 +                    self.blob_regions.lock().insert(label, mem_region);
 +                    debug!(
 +                        "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} label={} handle={:#x}",
@@ -368,8 +864,11 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
 +                    );
 +                    return Ok(dmabuf.mem_handle);
 +                }
-+                let err = Error::last();
-+                if err.errno() != libc::ENOTTY {
++                let err = match leased {
++                    Some(Err(error)) => error,
++                    _ => Error::last(),
++                };
++                if self.lease.is_some() || err.errno() != libc::ENOTTY {
 +                    error!(
 +                        "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} FAILED: {}",
 +                        guest_addr.offset(),
@@ -439,7 +938,100 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
  
          let mut blob = ghsm_share_blob {
              vm_fd: self.vm.as_raw_descriptor(),
-@@ -1730,16 +1781,45 @@
+@@ -1524,10 +1614,18 @@
+         // SAFETY: the ioctl reads the request and writes back mem_handle into `blob`; the return
+         // value is checked.
+         let share_started = std::time::Instant::now();
+-        let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_BLOB, &mut blob) };
++        let leased = match &self.lease {
++            Some(lease) => Some(lease.share_blob(&mut blob)),
++            None => None,
++        };
++        let ret = match &leased {
++            Some(Ok(_)) => 0,
++            Some(Err(_)) => -1,
++            None => unsafe { ioctl_with_mut_ref(share_dev.as_ref().unwrap(), GHSM_SHARE_BLOB, &mut blob) },
++        };
+         let share_elapsed = share_started.elapsed();
+         if ret != 0 {
+-            let e = Error::last();
++            let e = match leased { Some(Err(error)) => error, _ => Error::last() };
+             base::error!(
+                 "GUNYAH-SHARE-BLOB: gpa={:#x} size={:#x} flags={:#x} FAILED after {:?}: {}",
+                 guest_addr.offset(),
+@@ -1537,6 +1635,9 @@
+                 e,
+             );
+             return Err(e);
++        }
++        if let Some(Ok(parcel_id)) = leased {
++            self.blob_lease_ids.lock().insert(label, parcel_id);
+         }
+         // One line per share at info level once the range is big enough to be a pool grant rather
+         // than a blob: the cost of a single RM MEM_SHARE as a function of its size is the number
+@@ -1572,6 +1673,17 @@
+     }
+ 
+     fn unshare_blob(&mut self, label: u32) -> Result<()> {
++        if let Some(lease) = &self.lease {
++            let parcel_id = self.blob_lease_ids.lock().get(&label).copied()
++                .ok_or_else(|| Error::new(ENOENT))?;
++            lease.unshare(parcel_id)?;
++            // The exact-token operation returned 0 AFTER real reclaim and resource free.
++            // Every error, including ENOENT/EAGAIN, returns above without removing a backing.
++            self.blob_lease_ids.lock().remove(&label);
++            self.blob_pins.lock().remove(&label);
++            self.blob_regions.lock().remove(&label);
++            return Ok(());
++        }
+         // GH_NO_UNSHARE (diagnostic): skip the RM reclaim entirely. Every rm_mem_reclaim does a
+         // platform unprotect (SCM assign) over the parcel's scattered 4K phys ranges; this flag
+         // exists to A/B-test whether that churn is what transiently kills stage-2 of neighboring
+@@ -1600,17 +1712,10 @@
+         let ret = unsafe { ioctl_with_ref(&share_dev, GHSM_UNSHARE_BLOB, &unshare) };
+         if ret != 0 {
+             let err = Error::last();
+-            // ENOENT just means it was already reclaimed (e.g. by a prior overlap) -- not fatal.
+-            if err.errno() != ENOENT {
+-                warn!(
+-                    "GUNYAH-UNSHARE-BLOB: label={} ioctl ret={} errno={}",
+-                    label,
+-                    ret,
+-                    err.errno()
+-                );
+-                return Err(err);
+-            }
+-            warn!("GUNYAH-UNSHARE-BLOB: label={} already reclaimed", label);
++            // The old provider hides dying maps from lookup. ENOENT is therefore
++            // unknown/deferred, not a reclaim/unpin ack. Retain the native backing.
++            warn!("GUNYAH-UNSHARE-BLOB: label={} completion unconfirmed: {}", label, err);
++            return Err(err);
+         } else {
+             debug!("GUNYAH-UNSHARE-BLOB: label={} reclaimed", label);
+         }
+@@ -1623,6 +1728,12 @@
+ }
+ 
+ impl Vm for GunyahVm {
++    fn runtime_share_lease_enabled(&self) -> bool { self.lease.is_some() }
++
++    fn seal_runtime_share_lease(&self) -> Result<()> {
++        match &self.lease { Some(lease) => lease.seal(), None => Ok(()) }
++    }
++
+     fn try_clone(&self) -> Result<Self>
+     where
+         Self: Sized,
+@@ -1638,6 +1749,8 @@
+             pinned_regions: self.pinned_regions.clone(),
+             blob_regions: self.blob_regions.clone(),
+             blob_pins: self.blob_pins.clone(),
++            lease: self.lease.clone(),
++            blob_lease_ids: self.blob_lease_ids.clone(),
+             routes: self.routes.clone(),
+             hv_cfg: self.hv_cfg,
+         })
+@@ -1730,16 +1843,45 @@
          offset: u64,
          size: u64,
      ) -> Result<()> {
@@ -495,7 +1087,7 @@ diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
      }
  
      fn add_memory_region(
-@@ -2223,3 +2303,24 @@
+@@ -2223,3 +2365,24 @@
          unimplemented!()
      }
  }
@@ -1248,10 +1840,93 @@ diff --git a/hypervisor/src/gunyah/mthp.rs b/hypervisor/src/gunyah/mthp.rs
 +    }
 +
 +}
+diff --git a/hypervisor/src/gunyah/pin.rs b/hypervisor/src/gunyah/pin.rs
+--- a/hypervisor/src/gunyah/pin.rs
++++ b/hypervisor/src/gunyah/pin.rs
+@@ -210,6 +210,10 @@
+         );
+         return None;
+     }
++    if let Err(why) = validate_sample_coverage(size, req.samples, req.sample_bytes) {
++        warn!("GH-PIN: {why}; probe could not verify the requested range");
++        return None;
++    }
+     Some(ProbeVerdict {
+         bad: req.samples_cma + req.samples_isolate + req.samples_movable,
+         samples: req.samples,
+@@ -242,15 +246,13 @@
+ 
+ /// Ask the probe whether `size` bytes at `host_addr` are settled where the host can leave them.
+ ///
+-/// Reads one page per 2 MB through the module's own walk: it takes no reference and migrates
+-/// nothing, so asking is free and cannot itself disturb what it is measuring.
++/// Samples one page per 2 MiB. The module may fault an absent page in while obtaining its
++/// temporary reference, so callers must populate the complete mapping before asking. The
++/// returned stride and sample count must cover the requested range; no migration is requested.
+ pub(crate) fn probe_settled(host_addr: u64, size: u64) -> Settled {
+     let Some(v) = probe_range(host_addr, size) else {
+         return Settled::Unknown;
+     };
+-    if v.samples == 0 {
+-        return Settled::No("the probe sampled nothing".to_string());
+-    }
+     if v.bad == 0 && v.absent == 0 {
+         return Settled::Yes;
+     }
+@@ -259,6 +261,34 @@
+          present, first at +{:#x}; CmaFree {} kB",
+         v.bad, v.samples, v.cma, v.isolate, v.movable, v.absent, v.first_bad_offset, cma_free_kb(),
+     ))
++}
++
++fn validate_sample_coverage(size: u64, samples: u64, sample_bytes: u32) -> std::result::Result<(), String> {
++    const SAMPLE_BYTES: u64 = 2 << 20;
++    let expected = if size == 0 { 0 } else { (size - 1) / SAMPLE_BYTES + 1 };
++    if expected == 0 || sample_bytes as u64 != SAMPLE_BYTES || samples != expected {
++        return Err(format!(
++            "incomplete pin probe coverage: {samples} samples at {sample_bytes} bytes, expected {expected} at {SAMPLE_BYTES} bytes",
++        ));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod sample_coverage_tests {
++    use super::validate_sample_coverage;
++
++    #[test]
++    fn pin_probe_requires_the_entire_requested_sample_grid() {
++        const SAMPLE: u32 = 2 << 20;
++        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 2, SAMPLE).is_ok());
++        assert!(validate_sample_coverage(SAMPLE as u64 + 1, 2, SAMPLE).is_ok());
++        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 1, SAMPLE).is_err());
++        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 3, SAMPLE).is_err());
++        assert!(validate_sample_coverage(SAMPLE as u64, 1, 0).is_err());
++        assert!(validate_sample_coverage(SAMPLE as u64, 1, SAMPLE / 2).is_err());
++        assert!(validate_sample_coverage(0, 0, SAMPLE).is_err());
++    }
+ }
+ 
+ /// Share of sampled 2 MB folios that may be off-pool before migration stops being the cheap
 diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
 --- a/hypervisor/src/lib.rs
 +++ b/hypervisor/src/lib.rs
-@@ -748,8 +748,9 @@
+@@ -244,6 +244,14 @@
+         let _ = (guest_addr, accept);
+         self.remove_memory_region(slot).map(|_| ())
+     }
++
++    /// Whether runtime SHARE owns an App-private completion lease. Other hypervisors retain
++    /// their existing lifetime and ABI; only the selected Gunyah path overrides these hooks.
++    fn runtime_share_lease_enabled(&self) -> bool { false }
++
++    /// Fence admission after producer workers stop, before VM/IRQ/memory owner scopes drop.
++    /// Success means sealed only. Actual reclaim/unpin is checked by the outer monitor-fd fence.
++    fn seal_runtime_share_lease(&self) -> Result<()> { Ok(()) }
+ 
+     /// Releases the long-term pin the VMM took over a runtime-shared region while handing it to
+     /// the hypervisor, once the guest has accepted it -- or failed to.
+@@ -748,8 +756,9 @@
  
  /// How an mTHP-prepared lend region is handed to Gunyah at VM start.
  ///
@@ -1263,7 +1938,7 @@ diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
  /// prepared region is LENT to the hypervisor:
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
  #[serde(rename_all = "lowercase")]
-@@ -776,16 +777,42 @@
+@@ -776,16 +785,42 @@
      }
  }
  
@@ -1308,7 +1983,7 @@ diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
  }
  
  impl Default for Config {
-@@ -795,6 +822,7 @@
+@@ -795,6 +830,7 @@
              mte: false,
              protection_type: ProtectionType::Unprotected,
              prepare_lend_mthp: None,
@@ -1482,7 +2157,15 @@ diff --git a/src/crosvm/config.rs b/src/crosvm/config.rs
 diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
 --- a/src/crosvm/sys/linux.rs
 +++ b/src/crosvm/sys/linux.rs
-@@ -1283,6 +1283,7 @@
+@@ -23,6 +23,7 @@
+ pub(crate) mod kms_takeover;
+ #[cfg(feature = "audio")]
+ mod vcpu;
++mod run_control_lifecycle;
+ 
+ #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
+ use std::arch::asm;
+@@ -1283,6 +1284,7 @@
          for media_cfg in media_devices {
              devs.push(create_virtio_media_device(
                  cfg.protection_type,
@@ -1490,7 +2173,7 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
                  media_cfg,
                  pool.clone(),
                  vm.get_memory(),
-@@ -2187,6 +2188,7 @@
+@@ -2187,6 +2189,7 @@
              mte: cfg.mte,
              protection_type: cfg.protection_type,
              prepare_lend_mthp: cfg.prepare_lend_mthp,
@@ -1498,6 +2181,1905 @@ diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
          },
          vm_image,
          android_fstab: cfg
+@@ -2662,6 +2665,50 @@
+     None
+ }
+ 
++
++#[derive(Debug)]
++struct RunAndCleanupFailure {
++    run: Result<ExitState>,
++    cleanup: Vec<anyhow::Error>,
++}
++
++impl std::fmt::Display for RunAndCleanupFailure {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "run outcome: {:?}; cleanup outcomes:", self.run)?;
++        for error in &self.cleanup { write!(f, " [{:#}]", error)?; }
++        Ok(())
++    }
++}
++
++impl std::error::Error for RunAndCleanupFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        self.run.as_ref().err().map(|error| error.as_ref() as &dyn std::error::Error)
++    }
++}
++
++fn combine_run_cleanup(run: Result<ExitState>, cleanup: Vec<anyhow::Error>) -> Result<ExitState> {
++    if cleanup.is_empty() { run }
++    else { Err(anyhow::Error::new(RunAndCleanupFailure { run, cleanup })) }
++}
++
++
++#[cfg(all(unix, any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
++fn run_gunyah_owner_fenced(run: impl FnOnce() -> Result<ExitState>) -> Result<ExitState> {
++    let mut fence = hypervisor::gunyah::lease::OwnerFence::begin()
++        .context("private HostShare owner close fence")?;
++    // The supplied real run_gunyah stack and its temporary outer IRQ clone drop before finish.
++    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
++    let close = fence.finish();
++    let errors = close.errors.into_iter().map(|error| anyhow!(error)).collect();
++    match run {
++        Ok(run) => combine_run_cleanup(run, errors),
++        Err(payload) => {
++            for error in errors { error!("unwinding run owner close: {:#}", error); }
++            std::panic::resume_unwind(payload)
++        }
++    }
++}
++
+ pub fn run_config(cfg: Config) -> Result<ExitState> {
+     // Every GPU blob a guest makes holds host descriptors (its dma-buf, the renderer object's and the
+     // resource's export): an iPadOS benchmark holding 12,000 buffers at once took crosvm to its 65,536
+@@ -2757,11 +2804,17 @@
+         HypervisorKind::Gunyah { device,
+                                  qcom_trusted_vm_id,
+                                  qcom_trusted_vm_pas_id,
+-                               } => run_gunyah(
+-                                        device.as_deref(),
+-                                        qcom_trusted_vm_id,
+-                                        qcom_trusted_vm_pas_id,
+-                                        cfg, components),
++                               } => {
++            let leased = cfg.host_memory_policy == vm_memory::HostMemoryPolicy::ReadOnly
++                && cfg.protection_type.shares_guest_ram();
++            if !leased {
++                run_gunyah(device.as_deref(), qcom_trusted_vm_id, qcom_trusted_vm_pas_id, cfg, components)
++            } else {
++                run_gunyah_owner_fenced(|| {
++                    run_gunyah(device.as_deref(), qcom_trusted_vm_id, qcom_trusted_vm_pas_id, cfg, components)
++                })
++            }
++        },
+     }
+ }
+ 
+@@ -4464,905 +4517,939 @@
+     }
+ 
+     let (device_ctrl_tube, device_ctrl_resp) = Tube::pair().context("failed to create tube")?;
+-    // Create devices thread, and restore if a restore file exists.
+-    linux.devices_thread = match create_devices_worker_thread(
+-        linux.vm.get_memory().clone(),
+-        linux.io_bus.clone(),
+-        linux.mmio_bus.clone(),
+-        device_ctrl_resp,
+-    ) {
+-        Ok(join_handle) => Some(join_handle),
+-        Err(e) => {
+-            return Err(anyhow!("Failed to start devices thread: {}", e));
+-        }
+-    };
+-
+-    // If simplefb and a display backend are configured, spawn a bridge thread that polls guest
+-    // memory and pushes frames to that display -- VNC, or the Android Surface from the display
+-    // service when one is configured (the bridge itself is backend-agnostic).
+-    // The region is a slice of the guest's own memfd, not a separate buffer. On Gunyah it takes
+-    // the swiotlb sharing path -- lend=false, so set_user_memory_region leaves the host with read
+-    // access, and create_shm_node=true has RM build a memparcel so the guest gets its stage-2
+-    // mapping (see aarch64/src/lib.rs, `SharedFramebuffer`). The bridge therefore reads it
+-    // straight out of the host mmap of guest memory at the region's offset.
+-    //
+-    // Measured on device under --protected-vm-without-firmware: crosvm holds zero dmabuf fds and
+-    // one `memfd:crosvm_guest`, with no separate mapping the size of the framebuffer. An earlier
+-    // version of this comment claimed a DMA-heap DMA-BUF shared via map_cma_region; that is not
+-    // what happens, and it matters because it makes a GPU import look free. Anything wanting an
+-    // importable fd for this region has to build a udmabuf over the memfd first, the way
+-    // `resource_create_blob` already does for the guest pool.
+-    //
+-    // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
+-    // a GPU reader is a real question here, not a formality.
++    let use_lease_fence = linux.vm.runtime_share_lease_enabled();
++    let mut vcpu_handles = Vec::with_capacity(linux.vcpu_count);
++    let vcpu_thread_barrier = Arc::new(Barrier::new(linux.vcpu_count + 1));
++    let lease_start_gate = if use_lease_fence {
++        Some(Arc::new(run_control_lifecycle::StartGate::new()))
++    } else { None };
++    let mut vcpu_signal_registered = false;
+     #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
+-    let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
+-        let sfb_cfg = cfg.simplefb.as_ref()?;
+-        let guest_mem = linux.vm.get_memory().clone();
+-        let bpp = arch::simplefb_bpp(sfb_cfg.format.as_str());
+-        // Padded to the alignment the GPU transport needs (see `arch::simplefb_stride`). Taken from
+-        // the same function that sized the region and wrote the device tree's `stride`, because a
+-        // bridge that disagreed with either would hand the sink a sheared picture and report
+-        // nothing -- the failure would look like a wrong image, not like an error.
+-        let stride = arch::simplefb_stride(sfb_cfg.width, sfb_cfg.format.as_str());
+-        // The same DT string the guest reads, resolved once here rather than assumed downstream:
+-        // the bridge hands it to the sink as part of every frame it produces.
+-        let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
+-
+-        #[cfg(target_arch = "aarch64")]
+-        let (fb_size, guest_addr) = {
+-            let region = guest_mem
+-                .regions()
+-                .find(|r| {
+-                    r.options.purpose == vm_memory::MemoryRegionPurpose::SharedFramebuffer
++    let mut simplefb_display_thread = None;
++    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
++    let simplefb_stop = if use_lease_fence {
++        Some(Arc::new(std::sync::atomic::AtomicBool::new(false)))
++    } else { None };
++    let mut irq_worker: Option<(Tube, JoinHandle<()>)> = None;
++    let mut memory_worker: Option<(Tube, JoinHandle<()>)> = None;
++    let mut metrics_thread: Option<JoinHandle<()>> = None;
++
++    // Every post-spawn `?` and explicit Err returns to this owned cleanup boundary.
++    // Only the opt-in mode catches unwinding; panic=abort/_exit cannot reach it.
++    let execute_control = || -> Result<ExitState> {
++        // Create devices thread, and restore if a restore file exists.
++        linux.devices_thread = match create_devices_worker_thread(
++            linux.vm.get_memory().clone(),
++            linux.io_bus.clone(),
++            linux.mmio_bus.clone(),
++            device_ctrl_resp,
++        ) {
++            Ok(join_handle) => Some(join_handle),
++            Err(e) => {
++                return Err(anyhow!("Failed to start devices thread: {}", e));
++            }
++        };
++
++        // If simplefb and a display backend are configured, spawn a bridge thread that polls guest
++        // memory and pushes frames to that display -- VNC, or the Android Surface from the display
++        // service when one is configured (the bridge itself is backend-agnostic).
++        // The region is a slice of the guest's own memfd, not a separate buffer. On Gunyah it takes
++        // the swiotlb sharing path -- lend=false, so set_user_memory_region leaves the host with read
++        // access, and create_shm_node=true has RM build a memparcel so the guest gets its stage-2
++        // mapping (see aarch64/src/lib.rs, `SharedFramebuffer`). The bridge therefore reads it
++        // straight out of the host mmap of guest memory at the region's offset.
++        //
++        // Measured on device under --protected-vm-without-firmware: crosvm holds zero dmabuf fds and
++        // one `memfd:crosvm_guest`, with no separate mapping the size of the framebuffer. An earlier
++        // version of this comment claimed a DMA-heap DMA-BUF shared via map_cma_region; that is not
++        // what happens, and it matters because it makes a GPU import look free. Anything wanting an
++        // importable fd for this region has to build a udmabuf over the memfd first, the way
++        // `resource_create_blob` already does for the guest pool.
++        //
++        // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
++        // a GPU reader is a real question here, not a formality.
++        #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
++        simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
++            let sfb_cfg = cfg.simplefb.as_ref()?;
++            let guest_mem = linux.vm.get_memory().clone();
++            let bpp = arch::simplefb_bpp(sfb_cfg.format.as_str());
++            // Padded to the alignment the GPU transport needs (see `arch::simplefb_stride`). Taken from
++            // the same function that sized the region and wrote the device tree's `stride`, because a
++            // bridge that disagreed with either would hand the sink a sheared picture and report
++            // nothing -- the failure would look like a wrong image, not like an error.
++            let stride = arch::simplefb_stride(sfb_cfg.width, sfb_cfg.format.as_str());
++            // The same DT string the guest reads, resolved once here rather than assumed downstream:
++            // the bridge hands it to the sink as part of every frame it produces.
++            let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
++
++            #[cfg(target_arch = "aarch64")]
++            let (fb_size, guest_addr) = {
++                let region = guest_mem
++                    .regions()
++                    .find(|r| {
++                        r.options.purpose == vm_memory::MemoryRegionPurpose::SharedFramebuffer
++                    })?;
++                (region.size as u64, region.guest_addr.offset())
++            };
++            #[cfg(not(target_arch = "aarch64"))]
++            let (fb_size, guest_addr) = {
++                warn!("simplefb display bridge not supported on this architecture");
++                return None;
++            };
++
++            let params = simplefb_display::SimplefbDisplayParams {
++                addr: guest_addr,
++                width: sfb_cfg.width,
++                height: sfb_cfg.height,
++                stride,
++                bpp,
++                size: fb_size,
++                fourcc,
++                // A host-side property: it says how often we look, not anything about the device the
++                // guest was handed, which is why it goes here and not into the device tree.
++                poll_hz: sfb_cfg.poll_hz,
++            };
++
++            // This device provides the `simplefb` screen, so it takes the exporter bound to that
++            // screen -- and opens it, whether or not this VM also has a GPU device. Which of the two
++            // screens the user is looking at is the user's answer to give, not something the VMM
++            // decides by merging them into one display and guessing which source is live.
++            //
++            // The app display path still takes precedence over VNC below when both are somehow
++            // present, but config rejects that pairing outright (one exporter per screen), so the
++            // ordering is a leftover tie-break rather than a decision anyone can reach.
++            #[cfg(feature = "android_display")]
++            let android_service = cfg
++                .android_display_service_for(DisplayScreen::Simplefb)
++                .map(|s| (s.name.clone(), s.transport_cap))
++                // A simplefb screen nobody shows is the boot picture of the GPU screen: the firmware,
++                // the bootloader and an early kernel console draw into it before any guest driver sets
++                // a scanout. Its frames go to the GPU screen's window ("#boot": the display service
++                // shared in-process, CPU path, dropped while the GPU scanout presents), so the window
++                // shows something from the first firmware frame on.
++                .or_else(|| {
++                    cfg.android_display_service_for(DisplayScreen::Gpu0)
++                        .map(|s| (format!("{}#boot", s.name), s.transport_cap))
++                });
++            #[cfg(not(feature = "android_display"))]
++            let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
++
++            // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
++            // and there is no longer anywhere for its frames to go by default: they used to be handed
++            // to the GPU device's display, which is what the exporter bindings replace. (The step-5
++            // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
++            // client -- not for one nothing has bound at all.)
++            // The transport ceiling travels with the binding, not with the screen: it says how far this
++            // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
++            // the bridge alongside the target it describes.
++            let (target, transport_cap) = match android_service {
++                Some((service_name, transport_cap)) => (
++                    simplefb_display::SimplefbDisplayTarget::Android { service_name },
++                    transport_cap,
++                ),
++                None => {
++                    #[cfg(feature = "webrtc")]
++                    if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Simplefb) {
++                        (
++                            simplefb_display::SimplefbDisplayTarget::WebRtc {
++                                addr: rtc_cfg.addr(),
++                                token: rtc_cfg.token.clone(),
++                                stun: rtc_cfg.stun.clone(),
++                                allow_h265: rtc_cfg.allow_h265(),
++                                bitrate_bps: rtc_cfg.bitrate_bps(),
++                                adapt: rtc_cfg.adapt,
++                                input: simplefb_vnc_input,
++                            },
++                            rtc_cfg.transport_cap,
++                        )
++                    } else {
++                        let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
++                        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
++                        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
++                        (
++                            simplefb_display::SimplefbDisplayTarget::Vnc {
++                                addr: format!("{}:{}", host, port),
++                                password: vnc_cfg.password.clone(),
++                                hw_encode: vnc_cfg.h264_enabled(),
++                                input: simplefb_vnc_input,
++                            },
++                            vnc_cfg.transport_cap,
++                        )
++                    }
++                    #[cfg(all(feature = "vnc", not(feature = "webrtc")))]
++                    {
++                        let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
++                        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
++                        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
++                        (
++                            simplefb_display::SimplefbDisplayTarget::Vnc {
++                                addr: format!("{}:{}", host, port),
++                                password: vnc_cfg.password.clone(),
++                                hw_encode: vnc_cfg.h264_enabled(),
++                                // This screen's own tablet and keyboard, built during device creation
++                                // beside the guest halves they are paired with. Empty on a
++                                // `view-only=true` binding.
++                                input: simplefb_vnc_input,
++                            },
++                            vnc_cfg.transport_cap,
++                        )
++                    }
++                    #[cfg(not(feature = "vnc"))]
++                    return None;
++                }
++            };
++
++            // The bridge opens the exporter on its own thread, so this is the only way it can tell
++            // the VM that the address it was given is unusable; see start_simplefb_display_thread.
++            let vm_evt = match vm_evt_wrtube.try_clone() {
++                Ok(tube) => tube,
++                Err(e) => {
++                    error!("simplefb: failed to clone VM event tube: {}", e);
++                    return None;
++                }
++            };
++            match simplefb_display::start_simplefb_display_thread(
++                guest_mem,
++                params,
++                target,
++                transport_cap,
++                vm_evt,
++                simplefb_stop.clone(),
++            ) {
++                Ok(handle) => {
++                    info!("simplefb display bridge started");
++                    Some(handle)
++                }
++                Err(e) => {
++                    error!("failed to start simplefb display bridge: {:?}", e);
++                    None
++                }
++            }
++        })();
++
++
++        if !linux
++            .vm
++            .get_hypervisor()
++            .check_capability(HypervisorCap::ImmediateExit)
++        {
++            return Err(anyhow!(
++                "missing required hypervisor capability ImmediateExit"
++            ));
++        }
++
++        vcpu::setup_vcpu_signal_handler()?;
++        vcpu_signal_registered = true;
++
++        let vcpus: Vec<Option<_>> = match linux.vcpus.take() {
++            Some(vec) => vec.into_iter().map(Some).collect(),
++            None => iter::repeat_with(|| None).take(linux.vcpu_count).collect(),
++        };
++        // Enable core scheduling before creating vCPUs so that the cookie will be
++        // shared by all vCPU threads.
++        // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
++        // itself for even better performance. Only vCPUs need the feature.
++        if cfg.core_scheduling && cfg.per_vm_core_scheduling {
++            if let Err(e) = enable_core_scheduling() {
++                error!("Failed to enable core scheduling: {}", e);
++            }
++        }
++
++        // The tasks file only exist on sysfs if CgroupV1 hierachies are enabled
++        let vcpu_cgroup_tasks_file = match &cfg.vcpu_cgroup_path {
++            None => None,
++            Some(cgroup_path) => {
++                // Move main process to cgroup_path
++                match File::create(cgroup_path.join("tasks")) {
++                    Ok(file) => Some(file),
++                    Err(_) => {
++                        info!(
++                            "Unable to open tasks file in cgroup: {}, trying CgroupV2",
++                            cgroup_path.display()
++                        );
++                        None
++                    }
++                }
++            }
++        };
++
++        // vCPU freq domains are currently only supported with CgroupsV2.
++        let mut vcpu_cgroup_v2_files: std::collections::BTreeMap<usize, File> = BTreeMap::new();
++        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
++        for (vcpu_id, vcpu_domain_path) in vcpu_domain_paths.iter() {
++            let vcpu_cgroup_v2_file = File::create(vcpu_domain_path.join("cgroup.threads"))
++                .with_context(|| {
++                    format!(
++                        "failed to create vcpu-cgroup-path {}",
++                        vcpu_domain_path.join("cgroup.threads").display(),
++                    )
+                 })?;
+-            (region.size as u64, region.guest_addr.offset())
++            vcpu_cgroup_v2_files.insert(*vcpu_id, vcpu_cgroup_v2_file);
++        }
++
++        #[cfg(target_arch = "x86_64")]
++        let bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>> = Arc::new(Mutex::new(Ratelimit::new()));
++        #[cfg(target_arch = "x86_64")]
++        if cfg.bus_lock_ratelimit > 0 {
++            let bus_lock_ratelimit = cfg.bus_lock_ratelimit;
++            if linux.vm.check_capability(VmCap::BusLockDetect) {
++                info!("Hypervisor support bus lock detect");
++                linux
++                    .vm
++                    .enable_capability(VmCap::BusLockDetect, 0)
++                    .expect("kvm: Failed to enable bus lock detection cap");
++                info!("Hypervisor enabled bus lock detect");
++                bus_lock_ratelimit_ctrl
++                    .lock()
++                    .ratelimit_set_speed(bus_lock_ratelimit);
++            } else {
++                bail!("Kvm: bus lock detection unsuported");
++            }
++        }
++
++        #[cfg(target_os = "android")]
++        android::set_process_profiles(&cfg.task_profiles)?;
++
++        #[allow(unused_mut)]
++        let mut run_mode = if cfg.suspended {
++            // Sleep devices before creating vcpus.
++            device_ctrl_tube
++                .send(&DeviceControlCommand::SleepDevices)
++                .context("send command to devices control socket")?;
++            match device_ctrl_tube
++                .recv()
++                .context("receive from devices control socket")?
++            {
++                VmResponse::Ok => (),
++                resp => bail!("device sleep failed: {}", resp),
++            }
++            VmRunMode::Suspending
++        } else {
++            VmRunMode::Running
+         };
+-        #[cfg(not(target_arch = "aarch64"))]
+-        let (fb_size, guest_addr) = {
+-            warn!("simplefb display bridge not supported on this architecture");
+-            return None;
++        #[cfg(feature = "gdb")]
++        if to_gdb_channel.is_some() {
++            // Wait until a GDB client attaches
++            run_mode = VmRunMode::Breakpoint;
++        }
++        // If we are restoring from a snapshot, then start suspended.
++        let (run_mode, post_restore_run_mode) = if cfg.restore_path.is_some() {
++            (VmRunMode::Suspending, run_mode)
++        } else {
++            (run_mode, run_mode)
+         };
+ 
+-        let params = simplefb_display::SimplefbDisplayParams {
+-            addr: guest_addr,
+-            width: sfb_cfg.width,
+-            height: sfb_cfg.height,
+-            stride,
+-            bpp,
+-            size: fb_size,
+-            fourcc,
+-            // A host-side property: it says how often we look, not anything about the device the
+-            // guest was handed, which is why it goes here and not into the device tree.
+-            poll_hz: sfb_cfg.poll_hz,
++        // Architecture-specific code must supply a vcpu_init element for each VCPU.
++        assert_eq!(vcpus.len(), linux.vcpu_init.len());
++
++        let (vcpu_pid_tid_sender, vcpu_pid_tid_receiver) = mpsc::channel();
++        for ((cpu_id, vcpu), vcpu_init) in vcpus.into_iter().enumerate().zip(linux.vcpu_init.drain(..))
++        {
++            let vcpu_cgroup_file: Option<File>;
++            if let Some(cgroup_file) = &vcpu_cgroup_tasks_file {
++                vcpu_cgroup_file = Some(cgroup_file.try_clone().unwrap())
++            } else if !cfg.cpu_freq_domains.is_empty() {
++                vcpu_cgroup_file = Some(
++                    (vcpu_cgroup_v2_files.remove(&cpu_id).unwrap())
++                        .try_clone()
++                        .unwrap(),
++                )
++            } else {
++                vcpu_cgroup_file = None
++            };
++
++            let (to_vcpu_channel, from_main_channel) = mpsc::channel();
++            let vcpu_affinity = match linux.vcpu_affinity.clone() {
++                Some(VcpuAffinity::Global(v)) => v,
++                Some(VcpuAffinity::PerVcpu(mut m)) => m.remove(&cpu_id).unwrap_or_default(),
++                None => Default::default(),
++            };
++
++            #[cfg(target_arch = "x86_64")]
++            let vcpu_hybrid_type = if !cfg.vcpu_hybrid_type.is_empty() {
++                Some(*cfg.vcpu_hybrid_type.get(&cpu_id).unwrap())
++            } else {
++                None
++            };
++
++            #[cfg(target_arch = "x86_64")]
++            let cpu_config = Some(CpuConfigX86_64::new(
++                cfg.force_calibrated_tsc_leaf,
++                cfg.host_cpu_topology,
++                cfg.enable_hwp,
++                cfg.no_smt,
++                cfg.itmt,
++                vcpu_hybrid_type,
++            ));
++            #[cfg(target_arch = "x86_64")]
++            let bus_lock_ratelimit_ctrl = Arc::clone(&bus_lock_ratelimit_ctrl);
++
++            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
++            let cpu_config = None;
++
++            #[cfg(target_arch = "riscv64")]
++            let cpu_config = Some(CpuConfigRiscv64::new(vcpu_init.fdt_address));
++
++            let handle = vcpu::run_vcpu(
++                cpu_id,
++                vcpu_ids[cpu_id],
++                vcpu,
++                vcpu_init,
++                linux.vm.try_clone().context("failed to clone vm")?,
++                linux
++                    .irq_chip
++                    .try_box_clone()
++                    .context("failed to clone irqchip")?,
++                linux.vcpu_count,
++                linux.rt_cpus.contains(&cpu_id),
++                vcpu_affinity,
++                linux.delay_rt,
++                vcpu_thread_barrier.clone(),
++                lease_start_gate.clone(),
++                (*linux.io_bus).clone(),
++                (*linux.mmio_bus).clone(),
++                vm_evt_wrtube
++                    .try_clone()
++                    .context("failed to clone vm event tube")?,
++                from_main_channel,
++                #[cfg(feature = "gdb")]
++                to_gdb_channel.clone(),
++                cfg.core_scheduling,
++                cfg.per_vm_core_scheduling,
++                cpu_config,
++                match vcpu_cgroup_file {
++                    None => None,
++                    Some(ref f) => Some(
++                        f.try_clone()
++                            .context("failed to clone vcpu cgroup tasks file")?,
++                    ),
++                },
++                #[cfg(target_arch = "x86_64")]
++                bus_lock_ratelimit_ctrl,
++                run_mode,
++                cfg.boost_uclamp,
++                vcpu_pid_tid_sender.clone(),
++            )?;
++            vcpu_handles.push((handle, to_vcpu_channel));
++        }
++
++        // Each lease-mode vCPU drops its one-shot sender after its PID report.
++        // A thread failing before that report must disconnect collection rather than strand the owner.
++        if use_lease_fence { drop(vcpu_pid_tid_sender); }
++        let mut vcpus_pid_tid = BTreeMap::new();
++        for _ in 0..vcpu_handles.len() {
++            let vcpu_pid_tid: VcpuPidTid = vcpu_pid_tid_receiver
++                .recv()
++                .context("failed receiving vcpu pid/tid")?;
++            if vcpus_pid_tid
++                .insert(
++                    vcpu_pid_tid.vcpu_id,
++                    (vcpu_pid_tid.process_id, vcpu_pid_tid.thread_id),
++                )
++                .is_some()
++            {
++                return Err(anyhow!(
++                    "Vcpu {} returned more than 1 PID and TID",
++                    vcpu_pid_tid.vcpu_id
++                ));
++            }
++        }
++
++        #[cfg(feature = "gdb")]
++        // Spawn GDB thread.
++        if let Some((gdb_port_num, gdb_control_tube, from_vcpu_channel)) = gdb {
++            let to_vcpu_channels = vcpu_handles
++                .iter()
++                .map(|(_handle, channel)| channel.clone())
++                .collect();
++            let target = GdbStub::new(gdb_control_tube, to_vcpu_channels, from_vcpu_channel);
++            std::thread::Builder::new()
++                .name("gdb".to_owned())
++                .spawn(move || gdb_thread(target, gdb_port_num))
++                .context("failed to spawn GDB thread")?;
+         };
+ 
+-        // This device provides the `simplefb` screen, so it takes the exporter bound to that
+-        // screen -- and opens it, whether or not this VM also has a GPU device. Which of the two
+-        // screens the user is looking at is the user's answer to give, not something the VMM
+-        // decides by merging them into one display and guessing which source is live.
+-        //
+-        // The app display path still takes precedence over VNC below when both are somehow
+-        // present, but config rejects that pairing outright (one exporter per screen), so the
+-        // ordering is a leftover tie-break rather than a decision anyone can reach.
+-        #[cfg(feature = "android_display")]
+-        let android_service = cfg
+-            .android_display_service_for(DisplayScreen::Simplefb)
+-            .map(|s| (s.name.clone(), s.transport_cap))
+-            // A simplefb screen nobody shows is the boot picture of the GPU screen: the firmware,
+-            // the bootloader and an early kernel console draw into it before any guest driver sets
+-            // a scanout. Its frames go to the GPU screen's window ("#boot": the display service
+-            // shared in-process, CPU path, dropped while the GPU scanout presents), so the window
+-            // shows something from the first firmware frame on.
+-            .or_else(|| {
+-                cfg.android_display_service_for(DisplayScreen::Gpu0)
+-                    .map(|s| (format!("{}#boot", s.name), s.transport_cap))
+-            });
+-        #[cfg(not(feature = "android_display"))]
+-        let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
+-
+-        // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
+-        // and there is no longer anywhere for its frames to go by default: they used to be handed
+-        // to the GPU device's display, which is what the exporter bindings replace. (The step-5
+-        // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
+-        // client -- not for one nothing has bound at all.)
+-        // The transport ceiling travels with the binding, not with the screen: it says how far this
+-        // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
+-        // the bridge alongside the target it describes.
+-        let (target, transport_cap) = match android_service {
+-            Some((service_name, transport_cap)) => (
+-                simplefb_display::SimplefbDisplayTarget::Android { service_name },
+-                transport_cap,
+-            ),
+-            None => {
+-                #[cfg(feature = "webrtc")]
+-                if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Simplefb) {
+-                    (
+-                        simplefb_display::SimplefbDisplayTarget::WebRtc {
+-                            addr: rtc_cfg.addr(),
+-                            token: rtc_cfg.token.clone(),
+-                            stun: rtc_cfg.stun.clone(),
+-                            allow_h265: rtc_cfg.allow_h265(),
+-                            bitrate_bps: rtc_cfg.bitrate_bps(),
+-                            adapt: rtc_cfg.adapt,
+-                            input: simplefb_vnc_input,
+-                        },
+-                        rtc_cfg.transport_cap,
+-                    )
+-                } else {
+-                    let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
+-                    let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+-                    let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+-                    (
+-                        simplefb_display::SimplefbDisplayTarget::Vnc {
+-                            addr: format!("{}:{}", host, port),
+-                            password: vnc_cfg.password.clone(),
+-                            hw_encode: vnc_cfg.h264_enabled(),
+-                            input: simplefb_vnc_input,
+-                        },
+-                        vnc_cfg.transport_cap,
++        let (irq_handler_control, irq_handler_control_for_thread) = Tube::pair()?;
++        let sys_allocator_for_thread = sys_allocator_mutex.clone();
++        let irq_chip_for_thread = linux.irq_chip.try_box_clone()?;
++        let irq_handler_thread = std::thread::Builder::new()
++            .name("irq_handler_thread".into())
++            .spawn(move || {
++                irq_handler_thread(
++                    irq_control_tubes,
++                    irq_chip_for_thread,
++                    sys_allocator_for_thread,
++                    irq_handler_control_for_thread,
++                )
++            })
++            .context("failed to spawn IRQ handler thread")?;
++        irq_worker = Some((irq_handler_control, irq_handler_thread));
++        let irq_handler_control = &irq_worker.as_ref().unwrap().0;
++
++        let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
++        let vm_memory_handler_thread = std::thread::Builder::new()
++            .name("vm_memory_handler_thread".into())
++            .spawn({
++                let vm = linux.vm.try_clone().context("failed to clone Vm")?;
++                let sys_allocator_mutex = sys_allocator_mutex.clone();
++                let iommu_client = iommu_host_tube
++                    .as_ref()
++                    .map(|t| VmMemoryRequestIommuClient::new(t.clone()));
++                move || {
++                    vm_memory_handler_thread(
++                        vm_memory_control_tubes,
++                        vm,
++                        sys_allocator_mutex,
++                        gralloc,
++                        iommu_client,
++                        vm_memory_handler_control_for_thread,
++                        gunyah_accept_host_tube,
+                     )
+                 }
+-                #[cfg(all(feature = "vnc", not(feature = "webrtc")))]
+-                {
+-                    let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
+-                    let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+-                    let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+-                    (
+-                        simplefb_display::SimplefbDisplayTarget::Vnc {
+-                            addr: format!("{}:{}", host, port),
+-                            password: vnc_cfg.password.clone(),
+-                            hw_encode: vnc_cfg.h264_enabled(),
+-                            // This screen's own tablet and keyboard, built during device creation
+-                            // beside the guest halves they are paired with. Empty on a
+-                            // `view-only=true` binding.
+-                            input: simplefb_vnc_input,
+-                        },
+-                        vnc_cfg.transport_cap,
+-                    )
+-                }
+-                #[cfg(not(feature = "vnc"))]
+-                return None;
+-            }
+-        };
+-
+-        // The bridge opens the exporter on its own thread, so this is the only way it can tell
+-        // the VM that the address it was given is unusable; see start_simplefb_display_thread.
+-        let vm_evt = match vm_evt_wrtube.try_clone() {
+-            Ok(tube) => tube,
+-            Err(e) => {
+-                error!("simplefb: failed to clone VM event tube: {}", e);
+-                return None;
+-            }
+-        };
+-        match simplefb_display::start_simplefb_display_thread(
+-            guest_mem,
+-            params,
+-            target,
+-            transport_cap,
+-            vm_evt,
+-        ) {
+-            Ok(handle) => {
+-                info!("simplefb display bridge started");
+-                Some(handle)
+-            }
+-            Err(e) => {
+-                error!("failed to start simplefb display bridge: {:?}", e);
+-                None
+-            }
+-        }
+-    })();
+-
+-    let mut vcpu_handles = Vec::with_capacity(linux.vcpu_count);
+-    let vcpu_thread_barrier = Arc::new(Barrier::new(linux.vcpu_count + 1));
+-
+-    if !linux
+-        .vm
+-        .get_hypervisor()
+-        .check_capability(HypervisorCap::ImmediateExit)
+-    {
+-        return Err(anyhow!(
+-            "missing required hypervisor capability ImmediateExit"
+-        ));
+-    }
+-
+-    vcpu::setup_vcpu_signal_handler()?;
+-
+-    let vcpus: Vec<Option<_>> = match linux.vcpus.take() {
+-        Some(vec) => vec.into_iter().map(Some).collect(),
+-        None => iter::repeat_with(|| None).take(linux.vcpu_count).collect(),
+-    };
+-    // Enable core scheduling before creating vCPUs so that the cookie will be
+-    // shared by all vCPU threads.
+-    // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process
+-    // itself for even better performance. Only vCPUs need the feature.
+-    if cfg.core_scheduling && cfg.per_vm_core_scheduling {
+-        if let Err(e) = enable_core_scheduling() {
+-            error!("Failed to enable core scheduling: {}", e);
+-        }
+-    }
+-
+-    // The tasks file only exist on sysfs if CgroupV1 hierachies are enabled
+-    let vcpu_cgroup_tasks_file = match &cfg.vcpu_cgroup_path {
+-        None => None,
+-        Some(cgroup_path) => {
+-            // Move main process to cgroup_path
+-            match File::create(cgroup_path.join("tasks")) {
+-                Ok(file) => Some(file),
+-                Err(_) => {
+-                    info!(
+-                        "Unable to open tasks file in cgroup: {}, trying CgroupV2",
+-                        cgroup_path.display()
+-                    );
+-                    None
+-                }
+-            }
+-        }
+-    };
+-
+-    // vCPU freq domains are currently only supported with CgroupsV2.
+-    let mut vcpu_cgroup_v2_files: std::collections::BTreeMap<usize, File> = BTreeMap::new();
+-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+-    for (vcpu_id, vcpu_domain_path) in vcpu_domain_paths.iter() {
+-        let vcpu_cgroup_v2_file = File::create(vcpu_domain_path.join("cgroup.threads"))
+-            .with_context(|| {
+-                format!(
+-                    "failed to create vcpu-cgroup-path {}",
+-                    vcpu_domain_path.join("cgroup.threads").display(),
+-                )
+-            })?;
+-        vcpu_cgroup_v2_files.insert(*vcpu_id, vcpu_cgroup_v2_file);
+-    }
+-
+-    #[cfg(target_arch = "x86_64")]
+-    let bus_lock_ratelimit_ctrl: Arc<Mutex<Ratelimit>> = Arc::new(Mutex::new(Ratelimit::new()));
+-    #[cfg(target_arch = "x86_64")]
+-    if cfg.bus_lock_ratelimit > 0 {
+-        let bus_lock_ratelimit = cfg.bus_lock_ratelimit;
+-        if linux.vm.check_capability(VmCap::BusLockDetect) {
+-            info!("Hypervisor support bus lock detect");
+-            linux
+-                .vm
+-                .enable_capability(VmCap::BusLockDetect, 0)
+-                .expect("kvm: Failed to enable bus lock detection cap");
+-            info!("Hypervisor enabled bus lock detect");
+-            bus_lock_ratelimit_ctrl
+-                .lock()
+-                .ratelimit_set_speed(bus_lock_ratelimit);
+-        } else {
+-            bail!("Kvm: bus lock detection unsuported");
+-        }
+-    }
+-
+-    #[cfg(target_os = "android")]
+-    android::set_process_profiles(&cfg.task_profiles)?;
+-
+-    #[allow(unused_mut)]
+-    let mut run_mode = if cfg.suspended {
+-        // Sleep devices before creating vcpus.
+-        device_ctrl_tube
+-            .send(&DeviceControlCommand::SleepDevices)
+-            .context("send command to devices control socket")?;
+-        match device_ctrl_tube
+-            .recv()
+-            .context("receive from devices control socket")?
+-        {
+-            VmResponse::Ok => (),
+-            resp => bail!("device sleep failed: {}", resp),
+-        }
+-        VmRunMode::Suspending
+-    } else {
+-        VmRunMode::Running
+-    };
+-    #[cfg(feature = "gdb")]
+-    if to_gdb_channel.is_some() {
+-        // Wait until a GDB client attaches
+-        run_mode = VmRunMode::Breakpoint;
+-    }
+-    // If we are restoring from a snapshot, then start suspended.
+-    let (run_mode, post_restore_run_mode) = if cfg.restore_path.is_some() {
+-        (VmRunMode::Suspending, run_mode)
+-    } else {
+-        (run_mode, run_mode)
+-    };
+-
+-    // Architecture-specific code must supply a vcpu_init element for each VCPU.
+-    assert_eq!(vcpus.len(), linux.vcpu_init.len());
+-
+-    let (vcpu_pid_tid_sender, vcpu_pid_tid_receiver) = mpsc::channel();
+-    for ((cpu_id, vcpu), vcpu_init) in vcpus.into_iter().enumerate().zip(linux.vcpu_init.drain(..))
+-    {
+-        let vcpu_cgroup_file: Option<File>;
+-        if let Some(cgroup_file) = &vcpu_cgroup_tasks_file {
+-            vcpu_cgroup_file = Some(cgroup_file.try_clone().unwrap())
+-        } else if !cfg.cpu_freq_domains.is_empty() {
+-            vcpu_cgroup_file = Some(
+-                (vcpu_cgroup_v2_files.remove(&cpu_id).unwrap())
+-                    .try_clone()
+-                    .unwrap(),
++            })
++            .context("failed to spawn VM memory handler thread")?;
++        memory_worker = Some((vm_memory_handler_control, vm_memory_handler_thread));
++
++        if let Some(gate) = &lease_start_gate { gate.release(); }
++        else { vcpu_thread_barrier.wait(); }
++
++        // See comment on `VmRequest::execute`.
++        let mut suspended_pvclock_state: Option<hypervisor::ClockState> = None;
++
++        // Restore VM (if applicable).
++        // Must happen after the vCPU barrier to avoid deadlock.
++        if let Some(path) = &cfg.restore_path {
++            vm_control::do_restore(
++                path,
++                |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
++                |msg, index| {
++                    vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
++                },
++                &irq_handler_control,
++                &device_ctrl_tube,
++                linux.vcpu_count,
++                |image| {
++                    linux
++                        .irq_chip
++                        .try_box_clone()?
++                        .restore(image, linux.vcpu_count)
++                },
++                /* require_encrypted= */ false,
++                &mut suspended_pvclock_state,
++                &linux.vm,
++            )?;
++            // Allow the vCPUs to start for real.
++            vcpu::kick_all_vcpus(
++                &vcpu_handles,
++                linux.irq_chip.as_irq_chip(),
++                VcpuControl::RunState(post_restore_run_mode),
+             )
+-        } else {
+-            vcpu_cgroup_file = None
+-        };
+-
+-        let (to_vcpu_channel, from_main_channel) = mpsc::channel();
+-        let vcpu_affinity = match linux.vcpu_affinity.clone() {
+-            Some(VcpuAffinity::Global(v)) => v,
+-            Some(VcpuAffinity::PerVcpu(mut m)) => m.remove(&cpu_id).unwrap_or_default(),
+-            None => Default::default(),
+-        };
+-
+-        #[cfg(target_arch = "x86_64")]
+-        let vcpu_hybrid_type = if !cfg.vcpu_hybrid_type.is_empty() {
+-            Some(*cfg.vcpu_hybrid_type.get(&cpu_id).unwrap())
++        }
++
++        #[cfg(feature = "swap")]
++        if let Some(swap_controller) = &swap_controller {
++            swap_controller
++                .on_static_devices_setup_complete()
++                .context("static device setup complete")?;
++        }
++
++        metrics_thread = if metrics::is_initialized() {
++            Some(
++                std::thread::Builder::new()
++                    .name("metrics_thread".into())
++                    .spawn(move || {
++                        if let Err(e) = MetricsController::new(vec![metrics_tube]).run() {
++                            error!("Metrics controller error: {:?}", e);
++                        }
++                    })
++                    .context("metrics thread failed")?,
++            )
+         } else {
+             None
+         };
+ 
+-        #[cfg(target_arch = "x86_64")]
+-        let cpu_config = Some(CpuConfigX86_64::new(
+-            cfg.force_calibrated_tsc_leaf,
+-            cfg.host_cpu_topology,
+-            cfg.enable_hwp,
+-            cfg.no_smt,
+-            cfg.itmt,
+-            vcpu_hybrid_type,
+-        ));
+-        #[cfg(target_arch = "x86_64")]
+-        let bus_lock_ratelimit_ctrl = Arc::clone(&bus_lock_ratelimit_ctrl);
+-
+-        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+-        let cpu_config = None;
+-
+-        #[cfg(target_arch = "riscv64")]
+-        let cpu_config = Some(CpuConfigRiscv64::new(vcpu_init.fdt_address));
+-
+-        let handle = vcpu::run_vcpu(
+-            cpu_id,
+-            vcpu_ids[cpu_id],
+-            vcpu,
+-            vcpu_init,
+-            linux.vm.try_clone().context("failed to clone vm")?,
+-            linux
+-                .irq_chip
+-                .try_box_clone()
+-                .context("failed to clone irqchip")?,
+-            linux.vcpu_count,
+-            linux.rt_cpus.contains(&cpu_id),
+-            vcpu_affinity,
+-            linux.delay_rt,
+-            vcpu_thread_barrier.clone(),
+-            (*linux.io_bus).clone(),
+-            (*linux.mmio_bus).clone(),
+-            vm_evt_wrtube
+-                .try_clone()
+-                .context("failed to clone vm event tube")?,
+-            from_main_channel,
+-            #[cfg(feature = "gdb")]
+-            to_gdb_channel.clone(),
+-            cfg.core_scheduling,
+-            cfg.per_vm_core_scheduling,
+-            cpu_config,
+-            match vcpu_cgroup_file {
+-                None => None,
+-                Some(ref f) => Some(
+-                    f.try_clone()
+-                        .context("failed to clone vcpu cgroup tasks file")?,
+-                ),
+-            },
+-            #[cfg(target_arch = "x86_64")]
+-            bus_lock_ratelimit_ctrl,
+-            run_mode,
+-            cfg.boost_uclamp,
+-            vcpu_pid_tid_sender.clone(),
+-        )?;
+-        vcpu_handles.push((handle, to_vcpu_channel));
+-    }
+-
+-    let mut vcpus_pid_tid = BTreeMap::new();
+-    for _ in 0..vcpu_handles.len() {
+-        let vcpu_pid_tid: VcpuPidTid = vcpu_pid_tid_receiver
+-            .recv()
+-            .context("failed receiving vcpu pid/tid")?;
+-        if vcpus_pid_tid
+-            .insert(
+-                vcpu_pid_tid.vcpu_id,
+-                (vcpu_pid_tid.process_id, vcpu_pid_tid.thread_id),
+-            )
+-            .is_some()
+-        {
+-            return Err(anyhow!(
+-                "Vcpu {} returned more than 1 PID and TID",
+-                vcpu_pid_tid.vcpu_id
+-            ));
+-        }
+-    }
+-
+-    #[cfg(feature = "gdb")]
+-    // Spawn GDB thread.
+-    if let Some((gdb_port_num, gdb_control_tube, from_vcpu_channel)) = gdb {
+-        let to_vcpu_channels = vcpu_handles
+-            .iter()
+-            .map(|(_handle, channel)| channel.clone())
+-            .collect();
+-        let target = GdbStub::new(gdb_control_tube, to_vcpu_channels, from_vcpu_channel);
+-        std::thread::Builder::new()
+-            .name("gdb".to_owned())
+-            .spawn(move || gdb_thread(target, gdb_port_num))
+-            .context("failed to spawn GDB thread")?;
+-    };
+-
+-    let (irq_handler_control, irq_handler_control_for_thread) = Tube::pair()?;
+-    let sys_allocator_for_thread = sys_allocator_mutex.clone();
+-    let irq_chip_for_thread = linux.irq_chip.try_box_clone()?;
+-    let irq_handler_thread = std::thread::Builder::new()
+-        .name("irq_handler_thread".into())
+-        .spawn(move || {
+-            irq_handler_thread(
+-                irq_control_tubes,
+-                irq_chip_for_thread,
+-                sys_allocator_for_thread,
+-                irq_handler_control_for_thread,
+-            )
+-        })
+-        .unwrap();
+-
+-    let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
+-    let vm_memory_handler_thread = std::thread::Builder::new()
+-        .name("vm_memory_handler_thread".into())
+-        .spawn({
+-            let vm = linux.vm.try_clone().context("failed to clone Vm")?;
+-            let sys_allocator_mutex = sys_allocator_mutex.clone();
+-            let iommu_client = iommu_host_tube
+-                .as_ref()
+-                .map(|t| VmMemoryRequestIommuClient::new(t.clone()));
+-            move || {
+-                vm_memory_handler_thread(
+-                    vm_memory_control_tubes,
+-                    vm,
+-                    sys_allocator_mutex,
+-                    gralloc,
+-                    iommu_client,
+-                    vm_memory_handler_control_for_thread,
+-                    gunyah_accept_host_tube,
+-                )
+-            }
+-        })
+-        .unwrap();
+-
+-    vcpu_thread_barrier.wait();
+-
+-    // See comment on `VmRequest::execute`.
+-    let mut suspended_pvclock_state: Option<hypervisor::ClockState> = None;
+-
+-    // Restore VM (if applicable).
+-    // Must happen after the vCPU barrier to avoid deadlock.
+-    if let Some(path) = &cfg.restore_path {
+-        vm_control::do_restore(
+-            path,
+-            |msg| vcpu::kick_all_vcpus(&vcpu_handles, linux.irq_chip.as_irq_chip(), msg),
+-            |msg, index| {
+-                vcpu::kick_vcpu(&vcpu_handles.get(index), linux.irq_chip.as_irq_chip(), msg)
+-            },
+-            &irq_handler_control,
+-            &device_ctrl_tube,
+-            linux.vcpu_count,
+-            |image| {
+-                linux
+-                    .irq_chip
+-                    .try_box_clone()?
+-                    .restore(image, linux.vcpu_count)
+-            },
+-            /* require_encrypted= */ false,
+-            &mut suspended_pvclock_state,
+-            &linux.vm,
+-        )?;
+-        // Allow the vCPUs to start for real.
+-        vcpu::kick_all_vcpus(
+-            &vcpu_handles,
+-            linux.irq_chip.as_irq_chip(),
+-            VcpuControl::RunState(post_restore_run_mode),
+-        )
+-    }
+-
+-    #[cfg(feature = "swap")]
+-    if let Some(swap_controller) = &swap_controller {
+-        swap_controller
+-            .on_static_devices_setup_complete()
+-            .context("static device setup complete")?;
+-    }
+-
+-    let metrics_thread = if metrics::is_initialized() {
+-        Some(
+-            std::thread::Builder::new()
+-                .name("metrics_thread".into())
+-                .spawn(move || {
+-                    if let Err(e) = MetricsController::new(vec![metrics_tube]).run() {
+-                        error!("Metrics controller error: {:?}", e);
++        let mut exit_state = ExitState::Stop;
++        let mut pvpanic_code = PvPanicCode::Unknown;
++        #[cfg(feature = "registered_events")]
++        let mut registered_evt_tubes: HashMap<RegisteredEvent, HashSet<AddressedProtoTube>> =
++            HashMap::new();
++
++        'wait: loop {
++            let events = {
++                match wait_ctx.wait() {
++                    Ok(v) => v,
++                    Err(e) => {
++                        error!("failed to poll: {}", e);
++                        break;
+                     }
+-                })
+-                .context("metrics thread failed")?,
+-        )
+-    } else {
+-        None
+-    };
+-
+-    let mut exit_state = ExitState::Stop;
+-    let mut pvpanic_code = PvPanicCode::Unknown;
+-    #[cfg(feature = "registered_events")]
+-    let mut registered_evt_tubes: HashMap<RegisteredEvent, HashSet<AddressedProtoTube>> =
+-        HashMap::new();
+-
+-    'wait: loop {
+-        let events = {
+-            match wait_ctx.wait() {
+-                Ok(v) => v,
+-                Err(e) => {
+-                    error!("failed to poll: {}", e);
+-                    break;
+                 }
+-            }
+-        };
+-
+-        let mut vm_control_ids_to_remove = Vec::new();
+-        for event in events.iter().filter(|e| e.is_readable) {
+-            match event.token {
+-                #[cfg(feature = "registered_events")]
+-                Token::RegisteredEvent => match reg_evt_rdtube.recv::<RegisteredEventWithData>() {
+-                    Ok(reg_evt) => {
+-                        let evt = reg_evt.into_event();
+-                        let mut tubes_to_remove: Vec<String> = Vec::new();
+-                        if let Some(tubes) = registered_evt_tubes.get_mut(&evt) {
+-                            for tube in tubes.iter() {
+-                                if let Err(e) = tube.send(&reg_evt.into_proto()) {
+-                                    warn!(
+-                                        "failed to send registered event {:?} to {}, removing from \
+-                                         registrations: {}",
+-                                        reg_evt, tube.socket_addr, e
+-                                    );
+-                                    tubes_to_remove.push(tube.socket_addr.clone());
++            };
++
++            let mut vm_control_ids_to_remove = Vec::new();
++            for event in events.iter().filter(|e| e.is_readable) {
++                match event.token {
++                    #[cfg(feature = "registered_events")]
++                    Token::RegisteredEvent => match reg_evt_rdtube.recv::<RegisteredEventWithData>() {
++                        Ok(reg_evt) => {
++                            let evt = reg_evt.into_event();
++                            let mut tubes_to_remove: Vec<String> = Vec::new();
++                            if let Some(tubes) = registered_evt_tubes.get_mut(&evt) {
++                                for tube in tubes.iter() {
++                                    if let Err(e) = tube.send(&reg_evt.into_proto()) {
++                                        warn!(
++                                            "failed to send registered event {:?} to {}, removing from \
++                                             registrations: {}",
++                                            reg_evt, tube.socket_addr, e
++                                        );
++                                        tubes_to_remove.push(tube.socket_addr.clone());
++                                    }
+                                 }
+                             }
++                            for tube_addr in tubes_to_remove {
++                                for tubes in registered_evt_tubes.values_mut() {
++                                    tubes.retain(|t| t.socket_addr != tube_addr);
++                                }
++                            }
++                            registered_evt_tubes.retain(|_, tubes| !tubes.is_empty());
+                         }
+-                        for tube_addr in tubes_to_remove {
+-                            for tubes in registered_evt_tubes.values_mut() {
+-                                tubes.retain(|t| t.socket_addr != tube_addr);
++                        Err(e) => {
++                            warn!("failed to recv RegisteredEvent: {}", e);
++                        }
++                    },
++                    Token::VmEvent => {
++                        let mut break_to_wait: bool = true;
++                        match vm_evt_rdtube.recv::<VmEventType>() {
++                            Ok(vm_event) => match vm_event {
++                                VmEventType::Exit => {
++                                    info!("vcpu requested shutdown");
++                                    exit_state = ExitState::Stop;
++                                }
++                                VmEventType::Reset => {
++                                    info!("vcpu requested reset");
++                                    exit_state = ExitState::Reset;
++                                }
++                                VmEventType::Crash => {
++                                    info!("vcpu crashed");
++                                    exit_state = ExitState::Crash;
++                                }
++                                VmEventType::Panic(panic_code) => {
++                                    pvpanic_code = PvPanicCode::from_u8(panic_code);
++                                    info!("Guest reported panic [Code: {}]", pvpanic_code);
++                                    break_to_wait = false;
++                                }
++                                VmEventType::WatchdogReset => {
++                                    info!("vcpu stall detected");
++                                    exit_state = ExitState::WatchdogReset;
++                                }
++                            },
++                            Err(e) => {
++                                warn!("failed to recv VmEvent: {}", e);
+                             }
+                         }
+-                        registered_evt_tubes.retain(|_, tubes| !tubes.is_empty());
+-                    }
+-                    Err(e) => {
+-                        warn!("failed to recv RegisteredEvent: {}", e);
+-                    }
+-                },
+-                Token::VmEvent => {
+-                    let mut break_to_wait: bool = true;
+-                    match vm_evt_rdtube.recv::<VmEventType>() {
+-                        Ok(vm_event) => match vm_event {
+-                            VmEventType::Exit => {
+-                                info!("vcpu requested shutdown");
+-                                exit_state = ExitState::Stop;
++                        if break_to_wait {
++                            if pvpanic_code == PvPanicCode::Panicked {
++                                exit_state = ExitState::GuestPanic;
+                             }
+-                            VmEventType::Reset => {
+-                                info!("vcpu requested reset");
+-                                exit_state = ExitState::Reset;
+-                            }
+-                            VmEventType::Crash => {
+-                                info!("vcpu crashed");
+-                                exit_state = ExitState::Crash;
+-                            }
+-                            VmEventType::Panic(panic_code) => {
+-                                pvpanic_code = PvPanicCode::from_u8(panic_code);
+-                                info!("Guest reported panic [Code: {}]", pvpanic_code);
+-                                break_to_wait = false;
+-                            }
+-                            VmEventType::WatchdogReset => {
+-                                info!("vcpu stall detected");
+-                                exit_state = ExitState::WatchdogReset;
+-                            }
+-                        },
+-                        Err(e) => {
+-                            warn!("failed to recv VmEvent: {}", e);
++                            break 'wait;
+                         }
+                     }
+-                    if break_to_wait {
+-                        if pvpanic_code == PvPanicCode::Panicked {
+-                            exit_state = ExitState::GuestPanic;
++                    Token::Suspend => match linux.suspend_tube.1.recv::<bool>() {
++                        Ok(is_suspend_request) => {
++                            let mode = if is_suspend_request {
++                                VmRunMode::Suspending
++                            } else {
++                                for dev in &linux.resume_notify_devices {
++                                    dev.lock().resume_imminent();
++                                }
++                                VmRunMode::Running
++                            };
++                            info!("VM requested {}", mode);
++                            vcpu::kick_all_vcpus(
++                                &vcpu_handles,
++                                linux.irq_chip.as_irq_chip(),
++                                VcpuControl::RunState(mode),
++                            );
+                         }
+-                        break 'wait;
++                        Err(err) => {
++                            warn!("Failed to read suspend tube {:?}", err);
++                        }
++                    },
++                    Token::ChildSignal => {
++                        // Print all available siginfo structs, then exit the loop if child process has
++                        // been exited except CLD_STOPPED and CLD_CONTINUED. the two should be ignored
++                        // here since they are used by the vmm-swap feature.
++                        let mut do_exit = false;
++                        while let Some(siginfo) =
++                            sigchld_fd.read().context("failed to read signalfd")?
++                        {
++                            let pid = siginfo.ssi_pid;
++                            let pid_label = match linux.pid_debug_label_map.get(&pid) {
++                                Some(label) => format!("{} (pid {})", label, pid),
++                                None => format!("pid {}", pid),
++                            };
++
++                            // TODO(kawasin): this is a temporary exception until device suspension.
++                            #[cfg(feature = "swap")]
++                            if siginfo.ssi_code == libc::CLD_STOPPED
++                                || siginfo.ssi_code == libc::CLD_CONTINUED
++                            {
++                                continue;
++                            }
++
++                            // Ignore clean exits of non-tracked child processes when running without
++                            // sandboxing. The virtio gpu process launches a render server for
++                            // pass-through graphics. Host GPU drivers have been observed to fork
++                            // child processes that exit cleanly which should not be considered a
++                            // crash. When running with sandboxing, this should be handled by the
++                            // device's process handler.
++                            // Some vendor GPU driver builds (observed: OPPO sm8650 / Android 14
++                            // Adreno stack) fork helpers that exit with a NON-zero status during
++                            // normal operation; only crosvm's own (tracked) children are evidence
++                            // of a crash. Accept any exit code from untracked children.
++                            if cfg.jail_config.is_none()
++                                && !linux.pid_debug_label_map.contains_key(&pid)
++                                && siginfo.ssi_signo == libc::SIGCHLD as u32
++                                && siginfo.ssi_code == libc::CLD_EXITED
++                            {
++                                continue;
++                            }
++
++                            // Allow clean exits of a child process in `worker_process_pids`.
++                            if siginfo.ssi_signo == libc::SIGCHLD as u32
++                                && siginfo.ssi_code == libc::CLD_EXITED
++                                && siginfo.ssi_status == 0
++                                && worker_process_pids.remove(&(pid as Pid))
++                            {
++                                info!("child {pid} exited successfully");
++                                continue;
++                            }
++
++                            error!(
++                                "child {} exited: signo {}, status {}, code {}",
++                                pid_label, siginfo.ssi_signo, siginfo.ssi_status, siginfo.ssi_code
++                            );
++                            do_exit = true;
++                        }
++                        if do_exit {
++                            exit_state = ExitState::Crash;
++                            break 'wait;
++                        }
+                     }
+-                }
+-                Token::Suspend => match linux.suspend_tube.1.recv::<bool>() {
+-                    Ok(is_suspend_request) => {
+-                        let mode = if is_suspend_request {
+-                            VmRunMode::Suspending
+-                        } else {
+-                            for dev in &linux.resume_notify_devices {
+-                                dev.lock().resume_imminent();
++                    Token::VmControlServer => {
++                        if let Some(socket_server) = &control_server_socket {
++                            match socket_server.accept() {
++                                Ok(socket) => {
++                                    let id = next_control_id;
++                                    next_control_id += 1;
++                                    wait_ctx
++                                        .add(&socket, Token::VmControl { id })
++                                        .context("failed to add descriptor to wait context")?;
++                                    control_tubes
++                                        .insert(id, TaggedControlTube::Vm(Tube::try_from(socket)?));
++                                }
++                                Err(e) => error!("failed to accept socket: {}", e),
+                             }
+-                            VmRunMode::Running
+-                        };
+-                        info!("VM requested {}", mode);
+-                        vcpu::kick_all_vcpus(
+-                            &vcpu_handles,
+-                            linux.irq_chip.as_irq_chip(),
+-                            VcpuControl::RunState(mode),
+-                        );
++                        }
+                     }
+-                    Err(err) => {
+-                        warn!("Failed to read suspend tube {:?}", err);
+-                    }
+-                },
+-                Token::ChildSignal => {
+-                    // Print all available siginfo structs, then exit the loop if child process has
+-                    // been exited except CLD_STOPPED and CLD_CONTINUED. the two should be ignored
+-                    // here since they are used by the vmm-swap feature.
+-                    let mut do_exit = false;
+-                    while let Some(siginfo) =
+-                        sigchld_fd.read().context("failed to read signalfd")?
+-                    {
+-                        let pid = siginfo.ssi_pid;
+-                        let pid_label = match linux.pid_debug_label_map.get(&pid) {
+-                            Some(label) => format!("{} (pid {})", label, pid),
+-                            None => format!("pid {}", pid),
+-                        };
+-
+-                        // TODO(kawasin): this is a temporary exception until device suspension.
+-                        #[cfg(feature = "swap")]
+-                        if siginfo.ssi_code == libc::CLD_STOPPED
+-                            || siginfo.ssi_code == libc::CLD_CONTINUED
+-                        {
+-                            continue;
+-                        }
+-
+-                        // Ignore clean exits of non-tracked child processes when running without
+-                        // sandboxing. The virtio gpu process launches a render server for
+-                        // pass-through graphics. Host GPU drivers have been observed to fork
+-                        // child processes that exit cleanly which should not be considered a
+-                        // crash. When running with sandboxing, this should be handled by the
+-                        // device's process handler.
+-                        // Some vendor GPU driver builds (observed: OPPO sm8650 / Android 14
+-                        // Adreno stack) fork helpers that exit with a NON-zero status during
+-                        // normal operation; only crosvm's own (tracked) children are evidence
+-                        // of a crash. Accept any exit code from untracked children.
+-                        if cfg.jail_config.is_none()
+-                            && !linux.pid_debug_label_map.contains_key(&pid)
+-                            && siginfo.ssi_signo == libc::SIGCHLD as u32
+-                            && siginfo.ssi_code == libc::CLD_EXITED
+-                        {
+-                            continue;
+-                        }
+-
+-                        // Allow clean exits of a child process in `worker_process_pids`.
+-                        if siginfo.ssi_signo == libc::SIGCHLD as u32
+-                            && siginfo.ssi_code == libc::CLD_EXITED
+-                            && siginfo.ssi_status == 0
+-                            && worker_process_pids.remove(&(pid as Pid))
+-                        {
+-                            info!("child {pid} exited successfully");
+-                            continue;
+-                        }
+-
+-                        error!(
+-                            "child {} exited: signo {}, status {}, code {}",
+-                            pid_label, siginfo.ssi_signo, siginfo.ssi_status, siginfo.ssi_code
+-                        );
+-                        do_exit = true;
+-                    }
+-                    if do_exit {
+-                        exit_state = ExitState::Crash;
+-                        break 'wait;
+-                    }
+-                }
+-                Token::VmControlServer => {
+-                    if let Some(socket_server) = &control_server_socket {
+-                        match socket_server.accept() {
+-                            Ok(socket) => {
++                    Token::VmControl { id } => {
++                        if let Some(socket) = control_tubes.get(&id) {
++                            let mut state = ControlLoopState {
++                                linux: &mut linux,
++                                cfg: &cfg,
++                                sys_allocator: &sys_allocator_mutex,
++                                control_tubes: &control_tubes,
++                                disk_host_tubes: &disk_host_tubes[..],
++                                #[cfg(feature = "audio")]
++                                snd_host_tubes: &snd_host_tubes[..],
++                                #[cfg(feature = "gpu")]
++                                gpu_control_tube: gpu_control_tube.as_ref(),
++                                #[cfg(feature = "usb")]
++                                usb_control_tube: &usb_control_tube,
++                                #[cfg(target_arch = "x86_64")]
++                                iommu_host_tube: &iommu_host_tube,
++                                #[cfg(target_arch = "x86_64")]
++                                hp_control_tube: &hp_control_tube,
++                                guest_suspended_cvar: &guest_suspended_cvar,
++                                #[cfg(feature = "pci-hotplug")]
++                                hotplug_manager: &mut hotplug_manager,
++                                #[cfg(feature = "swap")]
++                                swap_controller: &mut swap_controller,
++                                vcpu_handles: &vcpu_handles,
++                                #[cfg(feature = "balloon")]
++                                balloon_tube: balloon_tube.as_mut(),
++                                device_ctrl_tube: &device_ctrl_tube,
++                                irq_handler_control: &irq_handler_control,
++                                #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
++                                vm_memory_handler_control: &vm_memory_handler_control,
++                                #[cfg(feature = "registered_events")]
++                                registered_evt_tubes: &mut registered_evt_tubes,
++                                #[cfg(feature = "pvclock")]
++                                pvclock_host_tube: pvclock_host_tube.clone(),
++                                vfio_container_manager: &mut vfio_container_manager,
++                                suspended_pvclock_state: &mut suspended_pvclock_state,
++                                vcpus_pid_tid: &vcpus_pid_tid,
++                            };
++                            let (exit_requested, mut ids_to_remove, add_tubes) =
++                                process_vm_control_event(&mut state, id, socket)?;
++                            if exit_requested {
++                                break 'wait;
++                            }
++                            vm_control_ids_to_remove.append(&mut ids_to_remove);
++                            for socket in add_tubes {
+                                 let id = next_control_id;
+                                 next_control_id += 1;
+                                 wait_ctx
+-                                    .add(&socket, Token::VmControl { id })
+-                                    .context("failed to add descriptor to wait context")?;
+-                                control_tubes
+-                                    .insert(id, TaggedControlTube::Vm(Tube::try_from(socket)?));
++                                    .add(socket.as_ref(), Token::VmControl { id })
++                                    .context(
++                                        "failed to add hotplug vfio-pci descriptor to wait context",
++                                    )?;
++                                control_tubes.insert(id, socket);
+                             }
+-                            Err(e) => error!("failed to accept socket: {}", e),
++                        }
++                    }
++                    #[cfg(feature = "balloon")]
++                    Token::BalloonTube => {
++                        match balloon_tube.as_mut().expect("missing balloon tube").recv() {
++                            Ok(resp) => {
++                                for (resp, idx) in resp {
++                                    if let Some(TaggedControlTube::Vm(tube)) = control_tubes.get(&idx) {
++                                        if let Err(e) = tube.send(&resp) {
++                                            error!("failed to send VmResponse: {}", e);
++                                        }
++                                    } else {
++                                        error!("Bad tube index {}", idx);
++                                    }
++                                }
++                            }
++                            Err(err) => {
++                                error!("Error processing balloon tube {:?}", err)
++                            }
+                         }
+                     }
+                 }
+-                Token::VmControl { id } => {
+-                    if let Some(socket) = control_tubes.get(&id) {
+-                        let mut state = ControlLoopState {
+-                            linux: &mut linux,
+-                            cfg: &cfg,
+-                            sys_allocator: &sys_allocator_mutex,
+-                            control_tubes: &control_tubes,
+-                            disk_host_tubes: &disk_host_tubes[..],
+-                            #[cfg(feature = "audio")]
+-                            snd_host_tubes: &snd_host_tubes[..],
+-                            #[cfg(feature = "gpu")]
+-                            gpu_control_tube: gpu_control_tube.as_ref(),
+-                            #[cfg(feature = "usb")]
+-                            usb_control_tube: &usb_control_tube,
+-                            #[cfg(target_arch = "x86_64")]
+-                            iommu_host_tube: &iommu_host_tube,
+-                            #[cfg(target_arch = "x86_64")]
+-                            hp_control_tube: &hp_control_tube,
+-                            guest_suspended_cvar: &guest_suspended_cvar,
+-                            #[cfg(feature = "pci-hotplug")]
+-                            hotplug_manager: &mut hotplug_manager,
+-                            #[cfg(feature = "swap")]
+-                            swap_controller: &mut swap_controller,
+-                            vcpu_handles: &vcpu_handles,
+-                            #[cfg(feature = "balloon")]
+-                            balloon_tube: balloon_tube.as_mut(),
+-                            device_ctrl_tube: &device_ctrl_tube,
+-                            irq_handler_control: &irq_handler_control,
+-                            #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
+-                            vm_memory_handler_control: &vm_memory_handler_control,
+-                            #[cfg(feature = "registered_events")]
+-                            registered_evt_tubes: &mut registered_evt_tubes,
+-                            #[cfg(feature = "pvclock")]
+-                            pvclock_host_tube: pvclock_host_tube.clone(),
+-                            vfio_container_manager: &mut vfio_container_manager,
+-                            suspended_pvclock_state: &mut suspended_pvclock_state,
+-                            vcpus_pid_tid: &vcpus_pid_tid,
+-                        };
+-                        let (exit_requested, mut ids_to_remove, add_tubes) =
+-                            process_vm_control_event(&mut state, id, socket)?;
+-                        if exit_requested {
+-                            break 'wait;
+-                        }
+-                        vm_control_ids_to_remove.append(&mut ids_to_remove);
+-                        for socket in add_tubes {
+-                            let id = next_control_id;
+-                            next_control_id += 1;
+-                            wait_ctx
+-                                .add(socket.as_ref(), Token::VmControl { id })
+-                                .context(
+-                                    "failed to add hotplug vfio-pci descriptor to wait context",
+-                                )?;
+-                            control_tubes.insert(id, socket);
+-                        }
++            }
++
++            remove_hungup_and_drained_tubes(
++                &events,
++                &wait_ctx,
++                &mut control_tubes,
++                vm_control_ids_to_remove,
++                |token: &Token| {
++                    if let Token::VmControl { id } = token {
++                        return Some(*id);
+                     }
+-                }
+-                #[cfg(feature = "balloon")]
+-                Token::BalloonTube => {
+-                    match balloon_tube.as_mut().expect("missing balloon tube").recv() {
+-                        Ok(resp) => {
+-                            for (resp, idx) in resp {
+-                                if let Some(TaggedControlTube::Vm(tube)) = control_tubes.get(&idx) {
+-                                    if let Err(e) = tube.send(&resp) {
+-                                        error!("failed to send VmResponse: {}", e);
+-                                    }
+-                                } else {
+-                                    error!("Bad tube index {}", idx);
+-                                }
+-                            }
+-                        }
+-                        Err(err) => {
+-                            error!("Error processing balloon tube {:?}", err)
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        remove_hungup_and_drained_tubes(
+-            &events,
+-            &wait_ctx,
+-            &mut control_tubes,
+-            vm_control_ids_to_remove,
+-            |token: &Token| {
+-                if let Token::VmControl { id } = token {
+-                    return Some(*id);
+-                }
+-                None
+-            },
+-        )?;
+-    }
+-
++                    None
++                },
++            )?;
++        }
++
++        Ok(exit_state)
++    };
++    let run_outcome = if use_lease_fence {
++        std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute_control))
++    } else { Ok(execute_control()) };
++    let (run_result, panic_payload) = match run_outcome {
++        Ok(result) => (result, None),
++        Err(payload) => (Err(anyhow!("run_control unwound")), Some(payload)),
++    };
++    // Preserve legacy error teardown semantics; the lease owner must instead join its workers.
++    if !use_lease_fence && run_result.is_err() { return run_result; }
++    let mut cleanup_errors = Vec::new();
++    if let Some(gate) = &lease_start_gate { gate.cancel(); }
+     vcpu::kick_all_vcpus(
+-        &vcpu_handles,
+-        linux.irq_chip.as_irq_chip(),
+-        VcpuControl::RunState(VmRunMode::Exiting),
++        &vcpu_handles, linux.irq_chip.as_irq_chip(), VcpuControl::RunState(VmRunMode::Exiting),
+     );
+     for (handle, _) in vcpu_handles {
+         if let Err(e) = handle.join() {
+-            error!("failed to join vcpu thread: {:?}", e);
+-        }
+-    }
+-
+-    // After joining all vcpu threads, unregister the process-wide signal handler.
+-    if let Err(e) = vcpu::remove_vcpu_signal_handler() {
+-        error!("failed to remove vcpu thread signal handler: {:#}", e);
+-    }
+-
+-    // Stop the vmm-swap monitor process.
++            cleanup_errors.push(anyhow!("failed to join vCPU thread: {:?}", e));
++        }
++    }
++    if vcpu_signal_registered {
++        if let Err(e) = vcpu::remove_vcpu_signal_handler() {
++            cleanup_errors.push(anyhow!("failed to remove vCPU signal handler: {:#}", e));
++        }
++    }
+     #[cfg(feature = "swap")]
+     drop(swap_controller);
+-
+-    // Stop pci root worker thread
+     #[cfg(target_arch = "x86_64")]
+     {
+         let _ = hp_control_tube.send(PciRootCommand::Kill);
+         if let Err(e) = hp_thread.join() {
+-            error!("failed to join hotplug thread: {:?}", e);
+-        }
+-    }
+-
+-    if linux.devices_thread.is_some() {
++            cleanup_errors.push(anyhow!("failed to join hotplug thread: {:?}", e));
++        }
++    }
++    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
++    if use_lease_fence {
++        if let Some(stop) = &simplefb_stop {
++            stop.store(true, std::sync::atomic::Ordering::Release);
++        }
++        if let Some(thread) = simplefb_display_thread.take() {
++            if let Err(e) = thread.join() {
++                cleanup_errors.push(anyhow!("failed to join simplefb display thread: {:?}", e));
++            }
++        }
++    }
++    if let Some(thread) = linux.devices_thread.take() {
+         if let Err(e) = device_ctrl_tube.send(&DeviceControlCommand::Exit) {
+-            error!("failed to stop device control loop: {}", e);
+-        };
+-        if let Some(thread) = linux.devices_thread.take() {
+-            if let Err(e) = thread.join() {
+-                error!("failed to exit devices thread: {:?}", e);
+-            }
+-        }
+-    }
+-
+-    // Shut down the VM Memory handler thread.
+-    if let Err(e) = vm_memory_handler_control.send(&VmMemoryHandlerRequest::Exit) {
+-        error!(
+-            "failed to request exit from VM Memory handler thread: {}",
+-            e
+-        );
+-    }
+-    if let Err(e) = vm_memory_handler_thread.join() {
+-        error!("failed to exit VM Memory handler thread: {:?}", e);
+-    }
+-
+-    // Shut down the IRQ handler thread.
+-    if let Err(e) = irq_handler_control.send(&IrqHandlerRequest::Exit) {
+-        error!("failed to request exit from IRQ handler thread: {}", e);
+-    }
+-    if let Err(e) = irq_handler_thread.join() {
+-        error!("failed to exit irq handler thread: {:?}", e);
+-    }
+-
+-    // At this point, the only remaining `Arc` references to the `Bus` objects should be the ones
+-    // inside `linux`. If the checks below fail, then some other thread is probably still running
+-    // and needs to be explicitly stopped before dropping `linux` to ensure devices actually get
+-    // cleaned up.
+-    match Arc::try_unwrap(std::mem::replace(
+-        &mut linux.mmio_bus,
+-        Arc::new(Bus::new(BusType::Mmio)),
+-    )) {
+-        Ok(_) => {}
+-        Err(_) => panic!("internal error: mmio_bus had more than one reference at shutdown"),
+-    }
+-    match Arc::try_unwrap(std::mem::replace(
+-        &mut linux.io_bus,
+-        Arc::new(Bus::new(BusType::Io)),
+-    )) {
+-        Ok(_) => {}
+-        Err(_) => panic!("internal error: io_bus had more than one reference at shutdown"),
+-    }
+-
+-    // Explicitly drop the VM structure here to allow the devices to clean up before the
+-    // control sockets are closed when this function exits.
+-    mem::drop(linux);
+-
+-    // Drop the hotplug manager to tell the warden process to exit before we try to join
+-    // the metrics thread.
++            cleanup_errors.push(anyhow!("failed to stop devices thread: {}", e));
++        }
++        if let Err(e) = thread.join() {
++            cleanup_errors.push(anyhow!("failed to join devices thread: {:?}", e));
++        }
++    }
++    if let Some((control, thread)) = memory_worker.take() {
++        if let Err(e) = control.send(&VmMemoryHandlerRequest::Exit) {
++            cleanup_errors.push(anyhow!("failed to stop VM memory worker: {}", e));
++        }
++        if let Err(e) = thread.join() {
++            cleanup_errors.push(anyhow!("failed to join VM memory worker: {:?}", e));
++        }
++    }
++    if let Some((control, thread)) = irq_worker.take() {
++        if let Err(e) = control.send(&IrqHandlerRequest::Exit) {
++            cleanup_errors.push(anyhow!("failed to stop IRQ worker: {}", e));
++        }
++        if let Err(e) = thread.join() {
++            cleanup_errors.push(anyhow!("failed to join IRQ worker: {:?}", e));
++        }
++    }
++    // Dropping owned Bus/device objects joins their renderer/device workers before sealing.
++    // Retained external owners remain an error; neither an error nor Arc removal is completion.
++    let mmio = Arc::try_unwrap(std::mem::replace(&mut linux.mmio_bus, Arc::new(Bus::new(BusType::Mmio))));
++    match mmio {
++        Ok(bus) => drop(bus),
++        Err(bus) => {
++            if !use_lease_fence { panic!("internal error: mmio_bus had more than one reference at shutdown"); }
++            cleanup_errors.push(anyhow!("mmio_bus still has {} owners", Arc::strong_count(&bus)));
++        }
++    }
++    let io = Arc::try_unwrap(std::mem::replace(&mut linux.io_bus, Arc::new(Bus::new(BusType::Io))));
++    match io {
++        Ok(bus) => drop(bus),
++        Err(bus) => {
++            if !use_lease_fence { panic!("internal error: io_bus had more than one reference at shutdown"); }
++            cleanup_errors.push(anyhow!("io_bus still has {} owners", Arc::strong_count(&bus)));
++        }
++    }
++    if let Err(e) = linux.vm.seal_runtime_share_lease() {
++        cleanup_errors.push(anyhow!("runtime SHARE admission/ref fence failed: {}", e));
++    }
++    drop(linux);
+     #[cfg(feature = "pci-hotplug")]
+-    mem::drop(hotplug_manager);
+-
+-    // All our children should have exited by now, so closing our fd should
+-    // terminate metrics. Then join so that everything gets flushed.
++    drop(hotplug_manager);
+     metrics::get_destructor().cleanup();
+-    if let Some(metrics_thread) = metrics_thread {
+-        if let Err(e) = metrics_thread.join() {
+-            error!("failed to exit irq handler thread: {:?}", e);
+-        }
+-    }
+-
+-    stdin()
+-        .set_canon_mode()
+-        .expect("failed to restore canonical mode for terminal");
+-
+-    Ok(exit_state)
++    if let Some(thread) = metrics_thread.take() {
++        if let Err(e) = thread.join() {
++            cleanup_errors.push(anyhow!("failed to join metrics thread: {:?}", e));
++        }
++    }
++    if let Err(e) = stdin().set_canon_mode() {
++        cleanup_errors.push(anyhow!("failed to restore canonical terminal mode: {}", e));
++    }
++    for error in &cleanup_errors { error!("run_control cleanup: {:#}", error); }
++    if let Some(payload) = panic_payload { std::panic::resume_unwind(payload); }
++    if use_lease_fence { combine_run_cleanup(run_result, cleanup_errors) }
++    else { run_result }
+ }
+ 
+ #[derive(EventToken)]
+@@ -6383,3 +6470,34 @@
+         assert_eq!(ratios, vec![(0, 102), (1, 20)]);
+     }
+ }
++
++#[cfg(all(test, unix, any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
++mod owner_fence_unwind_tests {
++    use super::run_gunyah_owner_fenced;
++    use std::sync::atomic::AtomicBool;
++    use std::sync::atomic::Ordering;
++    use std::sync::Arc;
++
++    struct RunScope(Arc<AtomicBool>);
++    impl Drop for RunScope {
++        fn drop(&mut self) { self.0.store(true, Ordering::Release); }
++    }
++
++    #[test]
++    fn production_owner_fence_catches_real_panic_after_run_scope_unwinds() {
++        let dropped = Arc::new(AtomicBool::new(false));
++        let in_run = dropped.clone();
++        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            run_gunyah_owner_fenced(|| {
++                let _run_owner = RunScope(in_run);
++                panic!("owner-close-production-unwind-smoke");
++            })
++        }));
++        assert!(caught.is_err());
++        assert!(dropped.load(Ordering::Acquire));
++        // The ACTUAL OwnerFence Drop cleared the production registry after its finish.
++        // This test deliberately opens no VM/device and has an empty lease registry.
++        let mut next = hypervisor::gunyah::lease::OwnerFence::begin().unwrap();
++        assert!(next.finish().is_clean());
++    }
++}
 diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
 --- a/src/crosvm/sys/linux/device_helpers.rs
 +++ b/src/crosvm/sys/linux/device_helpers.rs
@@ -1652,6 +4234,200 @@ diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/devic
 +        assert!(validate_direct_decoder_host_params(16384, "").is_err());
 +    }
 +}
+diff --git a/src/crosvm/sys/linux/run_control_lifecycle.rs b/src/crosvm/sys/linux/run_control_lifecycle.rs
+new file mode 100644
+--- /dev/null
++++ b/src/crosvm/sys/linux/run_control_lifecycle.rs
+@@ -0,0 +1,121 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! The start gate for owner-fenced VMs. A partial vCPU spawn must be cancellable:
++//! a fixed Barrier cannot release the threads whose missing peers never started.
++
++use std::sync::Condvar;
++use std::sync::Mutex;
++
++#[derive(Copy, Clone, Eq, PartialEq)]
++enum GateState {
++    Waiting,
++    Released,
++    Cancelled,
++}
++
++pub struct StartGate {
++    state: Mutex<GateState>,
++    changed: Condvar,
++}
++
++impl StartGate {
++    pub fn new() -> Self {
++        Self { state: Mutex::new(GateState::Waiting), changed: Condvar::new() }
++    }
++
++    pub fn wait(&self) -> bool {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        while *state == GateState::Waiting {
++            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
++        }
++        *state == GateState::Released
++    }
++
++    pub fn release(&self) {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        if *state == GateState::Waiting {
++            *state = GateState::Released;
++            self.changed.notify_all();
++        }
++    }
++
++    pub fn cancel(&self) {
++        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
++        if *state == GateState::Waiting {
++            *state = GateState::Cancelled;
++            self.changed.notify_all();
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::StartGate;
++    use std::sync::mpsc;
++    use std::sync::Arc;
++    use std::thread;
++    use std::time::Duration;
++
++    #[test]
++    fn partial_spawn_cancellation_joins_actual_waiting_threads() {
++        let gate = Arc::new(StartGate::new());
++        let (ready, receiver) = mpsc::channel();
++        let mut handles = Vec::new();
++        for _ in 0..2 {
++            let gate = gate.clone();
++            let ready = ready.clone();
++            handles.push(thread::spawn(move || {
++                ready.send(()).unwrap();
++                assert!(!gate.wait());
++            }));
++        }
++        for _ in 0..2 {
++            receiver.recv_timeout(Duration::from_secs(1)).unwrap();
++        }
++        // The third spawn failed: cancellation needs no third participant.
++        gate.cancel();
++        for handle in handles { handle.join().unwrap(); }
++        gate.release();
++        assert!(!gate.wait());
++    }
++
++    #[test]
++    fn release_before_arrival_does_not_leave_late_threads_waiting() {
++        let gate = Arc::new(StartGate::new());
++        gate.release();
++        let handle = thread::spawn(move || assert!(gate.wait()));
++        handle.join().unwrap();
++    }
++
++    #[test]
++    fn cancel_after_release_does_not_revoke_a_started_vcpu() {
++        let gate = StartGate::new();
++        gate.release();
++        gate.cancel();
++        assert!(gate.wait());
++    }
++
++    #[test]
++    fn missing_one_shot_handshake_cancels_peers_without_waiting_for_a_missing_vcpu() {
++        let gate = Arc::new(StartGate::new());
++        let (sender, receiver) = mpsc::channel();
++        let failed_sender = sender.clone();
++        let failed = thread::spawn(move || drop(failed_sender));
++        let peer_sender = sender.clone();
++        let peer_gate = gate.clone();
++        let peer = thread::spawn(move || {
++            peer_sender.send(1).unwrap();
++            drop(peer_sender);
++            assert!(!peer_gate.wait());
++        });
++        drop(sender);
++        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
++        assert!(matches!(receiver.recv_timeout(Duration::from_secs(1)),
++                         Err(mpsc::RecvTimeoutError::Disconnected)));
++        gate.cancel();
++        failed.join().unwrap();
++        peer.join().unwrap();
++    }
++}
+diff --git a/src/crosvm/sys/linux/simplefb_display.rs b/src/crosvm/sys/linux/simplefb_display.rs
+--- a/src/crosvm/sys/linux/simplefb_display.rs
++++ b/src/crosvm/sys/linux/simplefb_display.rs
+@@ -133,6 +133,7 @@
+     target: SimplefbDisplayTarget,
+     transport_cap: TransportCap,
+     vm_evt_wrtube: SendTube,
++    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+ ) -> Result<thread::JoinHandle<()>> {
+     thread::Builder::new()
+         .name("simplefb_display".into())
+@@ -231,6 +232,7 @@
+                 &mut display,
+                 transport_cap,
+                 unconditional_present_is_cheap,
++                stop,
+             ) {
+                 error!("simplefb display thread exited with error: {:?}", e);
+             }
+@@ -970,6 +972,7 @@
+     display: &mut GpuDisplay,
+     transport_cap: TransportCap,
+     unconditional_present_is_cheap: bool,
++    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+ ) -> Result<()> {
+     let display_params = DisplayParameters::default_with_mode(DisplayMode::Windowed(
+         params.width,
+@@ -1025,6 +1028,9 @@
+     let debug = SimplefbDebug::from_env(unconditional_present_is_cheap);
+ 
+     loop {
++        if stop.as_ref().map_or(false, |stop| stop.load(std::sync::atomic::Ordering::Acquire)) {
++            return Ok(());
++        }
+         let frame_start = Instant::now();
+ 
+         // Process any pending VNC input events and route to EventDevices.
+diff --git a/src/crosvm/sys/linux/vcpu.rs b/src/crosvm/sys/linux/vcpu.rs
+--- a/src/crosvm/sys/linux/vcpu.rs
++++ b/src/crosvm/sys/linux/vcpu.rs
+@@ -543,6 +543,7 @@
+     vcpu_affinity: CpuSet,
+     delay_rt: bool,
+     start_barrier: Arc<Barrier>,
++    start_gate: Option<Arc<super::run_control_lifecycle::StartGate>>,
+     mut io_bus: Bus,
+     mut mmio_bus: Bus,
+     vm_evt_wrtube: SendTube,
+@@ -588,6 +589,8 @@
+                     return ExitState::Crash;
+                 }
+ 
++                if start_gate.is_some() { drop(vcpu_pid_tid_tube); }
++
+                 #[cfg(feature = "gdb")]
+                 let guest_mem = vm.get_memory().clone();
+ 
+@@ -602,7 +605,9 @@
+                     cpu_config,
+                 );
+ 
+-                start_barrier.wait();
++                if let Some(gate) = &start_gate {
++                    if !gate.wait() { return ExitState::Stop; }
++                } else { start_barrier.wait(); }
+ 
+                 let vcpu = match runnable_vcpu {
+                     Ok(v) => v,
 diff --git a/src/sys/windows.rs b/src/sys/windows.rs
 --- a/src/sys/windows.rs
 +++ b/src/sys/windows.rs
@@ -1663,71 +4439,3 @@ diff --git a/src/sys/windows.rs b/src/sys/windows.rs
          },
          vm_image,
          android_fstab: cfg
-diff --git a/hypervisor/src/gunyah/pin.rs b/hypervisor/src/gunyah/pin.rs
---- a/hypervisor/src/gunyah/pin.rs
-+++ b/hypervisor/src/gunyah/pin.rs
-@@ -210,6 +210,10 @@
-         );
-         return None;
-     }
-+    if let Err(why) = validate_sample_coverage(size, req.samples, req.sample_bytes) {
-+        warn!("GH-PIN: {why}; probe could not verify the requested range");
-+        return None;
-+    }
-     Some(ProbeVerdict {
-         bad: req.samples_cma + req.samples_isolate + req.samples_movable,
-         samples: req.samples,
-@@ -242,15 +246,13 @@
- 
- /// Ask the probe whether `size` bytes at `host_addr` are settled where the host can leave them.
- ///
--/// Reads one page per 2 MB through the module's own walk: it takes no reference and migrates
--/// nothing, so asking is free and cannot itself disturb what it is measuring.
-+/// Samples one page per 2 MiB. The module may fault an absent page in while obtaining its
-+/// temporary reference, so callers must populate the complete mapping before asking. The
-+/// returned stride and sample count must cover the requested range; no migration is requested.
- pub(crate) fn probe_settled(host_addr: u64, size: u64) -> Settled {
-     let Some(v) = probe_range(host_addr, size) else {
-         return Settled::Unknown;
-     };
--    if v.samples == 0 {
--        return Settled::No("the probe sampled nothing".to_string());
--    }
-     if v.bad == 0 && v.absent == 0 {
-         return Settled::Yes;
-     }
-@@ -259,6 +261,34 @@
-          present, first at +{:#x}; CmaFree {} kB",
-         v.bad, v.samples, v.cma, v.isolate, v.movable, v.absent, v.first_bad_offset, cma_free_kb(),
-     ))
-+}
-+
-+fn validate_sample_coverage(size: u64, samples: u64, sample_bytes: u32) -> std::result::Result<(), String> {
-+    const SAMPLE_BYTES: u64 = 2 << 20;
-+    let expected = if size == 0 { 0 } else { (size - 1) / SAMPLE_BYTES + 1 };
-+    if expected == 0 || sample_bytes as u64 != SAMPLE_BYTES || samples != expected {
-+        return Err(format!(
-+            "incomplete pin probe coverage: {samples} samples at {sample_bytes} bytes, expected {expected} at {SAMPLE_BYTES} bytes",
-+        ));
-+    }
-+    Ok(())
-+}
-+
-+#[cfg(test)]
-+mod sample_coverage_tests {
-+    use super::validate_sample_coverage;
-+
-+    #[test]
-+    fn pin_probe_requires_the_entire_requested_sample_grid() {
-+        const SAMPLE: u32 = 2 << 20;
-+        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 2, SAMPLE).is_ok());
-+        assert!(validate_sample_coverage(SAMPLE as u64 + 1, 2, SAMPLE).is_ok());
-+        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 1, SAMPLE).is_err());
-+        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 3, SAMPLE).is_err());
-+        assert!(validate_sample_coverage(SAMPLE as u64, 1, 0).is_err());
-+        assert!(validate_sample_coverage(SAMPLE as u64, 1, SAMPLE / 2).is_err());
-+        assert!(validate_sample_coverage(0, 0, SAMPLE).is_err());
-+    }
- }
- 
- /// Share of sampled 2 MB folios that may be off-pool before migration stops being the cheap
