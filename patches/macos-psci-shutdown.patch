@@ -1,0 +1,74 @@
+diff --git a/k27/build-platform-rtc.sh b/k27/build-platform-rtc.sh
+--- a/k27/build-platform-rtc.sh
++++ b/k27/build-platform-rtc.sh
+@@ -1,10 +1,11 @@
+ #!/usr/bin/env bash
+-# Build ArmDTPlatform with the PL030 RTC and bus power hierarchy patches.
++# Build ArmDTPlatform with RTC, power hierarchy and DroidVM PSCI shutdown.
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
+ platform=out/x12377/un/build/platform-12377-arm64e/ArmDTPlatform
+ cp out/x12377/un/drivers/ArmDTPlatform/ArmDTPlatform.cpp "$platform/ArmDTPlatform.cpp"
+ git apply --directory="$platform" patches/drivers/ArmDTPlatform-pl030-rtc.patch
+ git apply --directory="$platform" patches/drivers/ArmDTPlatform-power-hierarchy.patch
++git apply --directory="$platform" patches/drivers/ArmDTPlatform-droidvm-psci.patch
+ python3 scripts/build-native-kext.py ArmDTPlatform "$platform/ArmDTPlatform.cpp" --obj k27-obj
+ /usr/lib/llvm-21/bin/llvm-ar rcs "$platform/libArmDTPlatform.a" out/x12377/native-kexts/ArmDTPlatform/ArmDTPlatform.o
+diff --git a/patches/drivers/ArmDTPlatform-droidvm-psci.patch b/patches/drivers/ArmDTPlatform-droidvm-psci.patch
+new file mode 100644
+--- /dev/null
++++ b/patches/drivers/ArmDTPlatform-droidvm-psci.patch
+@@ -0,0 +1,53 @@
++--- a/ArmDTPlatform.cpp
+++++ b/ArmDTPlatform.cpp
++@@ -18,6 +18,7 @@
++ #include <libkern/c++/OSData.h>
++ #include <libkern/c++/OSIterator.h>
++ #include <pexpert/pexpert.h>
+++#include <pexpert/device_tree.h>
++
++ // Observation counters describe actual published nubs, not started drivers.
++ extern "C" {
++@@ -34,6 +35,7 @@
++   OSDeclareDefaultStructors (ArmDTPlatform)
++ public:
++   bool configure (IOService *provider) override;
+++  int haltRestart (unsigned int type) override;
++   void PMRegisterDevice (IOService *nub, IOService *device) override;
++   const char *deleteList (void) override;
++   const char *excludeList (void) override;
++@@ -69,6 +71,34 @@
++     }
++   }
++   IODTPlatformExpert::PMRegisterDevice (nub, device);
+++}
+++
+++int ArmDTPlatform::haltRestart (unsigned int type)
+++{
+++  // Normal OS shutdown/restart must reach the VMM. Panic and sync requests
+++  // retain the inherited diagnostic behavior.
+++  if (type != kPEHaltCPU && type != kPERestartCPU) {
+++    return IODTPlatformExpert::haltRestart (type);
+++  }
+++  DTEntry psci = nullptr;
+++  const void *method = nullptr;
+++  unsigned int size = 0;
+++  bool useSMC = SecureDTLookupEntry (nullptr, "/psci", &psci) == kSuccess &&
+++                SecureDTGetProperty (psci, "method", &method, &size) == kSuccess &&
+++                size >= 3 && memcmp (method, "smc", 3) == 0;
+++  // DroidVM's generated PSCI node selects HVC; preserve an explicit SMC.
+++  register uint64_t x0 __asm__ ("x0") = type == kPEHaltCPU ? 0x84000008 : 0x84000009;
+++  register uint64_t x1 __asm__ ("x1") = 0;
+++  register uint64_t x2 __asm__ ("x2") = 0;
+++  register uint64_t x3 __asm__ ("x3") = 0;
+++  if (useSMC) {
+++    __asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : : "memory");
+++  } else {
+++    __asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : : "memory");
+++  }
+++  IOLog ("ArmDTPlatform: PSCI %s unexpectedly returned 0x%llx\n",
+++         type == kPEHaltCPU ? "SYSTEM_OFF" : "SYSTEM_RESET", (unsigned long long)x0);
+++  return -1;
++ }
++
++ bool ArmDTPlatform::hasNVRAMProxy (IOService *provider)

@@ -1,0 +1,103 @@
+name: macOS PSCI kernel update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-kernel-update-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  MACOS_CCACHE: /usr/bin/ccache
+  CCACHE_MAXSIZE: 2G
+  TAG: '27.2'
+
+jobs:
+  kernel_update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ws/.ccache
+    steps:
+      - name: Workspace
+        run: |
+          [ -n "$ARTIFACT_KEY" ] || { echo "::error::ARTIFACT_KEY is not set"; exit 1; }
+          sudo mkdir -p /mnt/ws
+          sudo chown "$(id -u):$(id -g)" /mnt/ws
+          mkdir -p ws
+          sudo mount --bind /mnt/ws ws
+      - name: Build instructions
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: instructions
+      - name: Pinned macOS source
+        uses: actions/checkout@v4
+        with:
+          repository: Droid-VM/macOS-DroidVM
+          ref: 524d27bf57ae92375aa39e3a81e11727c08973ff
+          persist-credentials: false
+          path: ws
+      - name: Apply PSCI shutdown source patch
+        working-directory: ws
+        run: |
+          patch="$GITHUB_WORKSPACE/instructions/patches/macos-psci-shutdown.patch"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 "$GITHUB_WORKSPACE/instructions/tools/verify_macos_kernel_update.py" --root . --source-only
+      - uses: ./ws/.github/actions/host
+      - uses: actions/cache@v4
+        with:
+          path: ws/toolchains
+          key: toolchains-${{ env.TOOLCHAIN_KEY }}
+      - uses: actions/cache@v4
+        with:
+          path: ws/.ccache
+          key: ccache-kernel-update-${{ github.run_id }}
+          restore-keys: ccache-kernel-
+      - uses: actions/cache@v4
+        with:
+          path: ws/out/x12377/kdk
+          key: kdk-${{ env.KDK_KEY }}
+      - name: Build environment
+        working-directory: ws
+        run: |
+          python3 scripts/setup-env.py toolchain
+          python3 scripts/setup-env.py x12377
+          python3 scripts/setup-env.py sources --part kernel
+      - name: Reuse encrypted kernel inputs
+        working-directory: ws
+        run: scripts/ci-blob.sh fetch "inputs-$TAG-$INPUTS_KEY" small.tar.zst.enc .
+      - name: Compile kernel, kexts and collection
+        working-directory: ws
+        run: |
+          python3 scripts/product.py kernel
+          python3 scripts/product.py kexts
+          python3 scripts/product.py kc
+          python3 "$GITHUB_WORKSPACE/instructions/tools/verify_macos_kernel_update.py" --root . --output "$RUNNER_TEMP/kernel-update/plain/verification.json"
+          CI_BLOB_CHUNK=100G scripts/ci-blob.sh pack "$RUNNER_TEMP/kernel-update/kc.tar.zst.enc" . out/k27/kc-k27.bin
+          cp "$RUNNER_TEMP/kernel-update/kc.tar.zst.enc.sha256" "$RUNNER_TEMP/kernel-update/plain/"
+          ccache -s
+      - name: Upload encrypted kernel collection
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-kernel-update-${{ github.run_number }}-encrypted
+          path: ${{ runner.temp }}/kernel-update/kc.tar.zst.enc.[0-9][0-9][0-9]
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload source and hash verification
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-kernel-update-${{ github.run_number }}-verification
+          path: ${{ runner.temp }}/kernel-update/plain/
+          if-no-files-found: ignore
+          retention-days: 14
