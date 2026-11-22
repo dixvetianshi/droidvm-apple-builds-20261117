@@ -2,6 +2,13 @@ name: macOS PSCI kernel update
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/apple-host-isolation
+    paths:
+      - .github/workflows/macos-kernel-update.yml
+      - patches/macos-psci-shutdown.patch
+      - tools/verify_macos_kernel_update.py
 
 permissions:
   contents: read
