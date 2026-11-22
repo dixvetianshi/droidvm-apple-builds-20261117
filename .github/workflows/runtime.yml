@@ -10,6 +10,7 @@ on:
         options:
           - runtime
           - hostshare-only
+          - hostshare-lease
           - reserve-repair
 
 permissions:
@@ -66,6 +67,32 @@ jobs:
           name: apple-hostshare-component-${{ github.run_id }}
           path: output/hostshare-component/
           if-no-files-found: error
+          retention-days: 14
+  hostshare-lease:
+    if: inputs.component == 'hostshare-lease'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify existing tools and build-command process cleanup
+        run: |
+          command -v python3 git cc make docker bash
+          mkdir -p output
+          python3 tools/test_build_command_lifecycle.py 2>&1 | tee output/hostshare-lease-lifecycle.log
+      - name: Test and compile only the App HostShare lease component
+        run: python3 tools/build_hostshare_lease_component_ci.py
+      - name: Retain the component, exact source and complete test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-hostshare-lease-${{ github.run_id }}
+          path: |
+            output/hostshare-lease-component/
+            output/hostshare-lease-lifecycle.log
+          if-no-files-found: error
+          compression-level: 0
           retention-days: 14
   reserve:
     if: inputs.component == 'reserve-repair'
