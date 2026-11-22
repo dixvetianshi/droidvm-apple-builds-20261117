@@ -11,6 +11,7 @@ SOONG_PIN=c2db5181e9e1b6a383f6e858fb39b3db26aba7e7
 SOONG_UNWIND_SOURCE="$ROOT/profiles/crosvm-soong-unwind-source.json"
 SOONG_UNWIND_PATCH="$ROOT/patches/crosvm-soong-device-unwind.patch"
 SOONG_RUST_TOOLCHAIN=1.88.0
+RUST_SYSROOT_PIN=06a4f29f8512c6b77bdce81dd036a3e39954803b
 REPO_PIN=e71a8c6dd85026c8861e675ed7ff468fc611df44
 SOURCE_LOCK="$ROOT/profiles/crosvm-display-source-lock.json"
 SOURCE_LOCK_SHA256=fe63a6eec0ec48abd7a9551a93e1b60b976ee0171b9a18c1a52f93b9ffccb610
@@ -41,7 +42,7 @@ export SOURCE_LOCK SOURCE_LOCK_SHA256 UPSTREAM_MANIFEST_SHA256 VIRTUALIZATION_PI
 export NATIVE_DISPLAY_PATCH NATIVE_DISPLAY_PATCH_SHA256 NATIVE_DISPLAY_SOURCE_SHA256 NATIVE_DISPLAY_FIXED_SHA256
 export NATIVE_DISPLAY_MANIFEST NATIVE_DISPLAY_MANIFEST_SHA256
 export SHIM_RUST_TOOLCHAIN SHIM_SHA256
-export SOONG_PIN SOONG_UNWIND_SOURCE SOONG_UNWIND_PATCH SOONG_RUST_TOOLCHAIN
+export SOONG_PIN SOONG_UNWIND_SOURCE SOONG_UNWIND_PATCH SOONG_RUST_TOOLCHAIN RUST_SYSROOT_PIN
 export JOBS=${JOBS:-4}
 export REPO_JOBS=${REPO_JOBS:-4}
 export GOMEMLIMIT=${GOMEMLIMIT:-8GiB}
@@ -339,7 +340,7 @@ print('Verified and applied the reviewed composite VMM source and lifecycle poli
 PYCODE
 
 
-# This exact Soong patch affects this disposable build tree only. The 96 source commits
+# The paired Soong/sysroot patches affect this disposable build tree only. The 96 source commits
 # remain unchanged; no installed Android file, phone, module or other App is modified.
 python3 - <<'PYSOONG'
 import hashlib
@@ -371,13 +372,45 @@ subprocess.run([*command, str(patch)], check=True)
 for row in manifest['files']:
     if hashlib.sha256((repo / row['file']).read_bytes()).hexdigest() != row['final_lf_sha256']:
         raise SystemExit('Unexpected patched Soong source: ' + row['file'])
+
+# Soong uses --sysroot=/dev/null and obtains every compiler runtime from its
+# declared rlib dependency graph. The device default alone cannot supply panic_unwind.
+sysroot = manifest['sysroot_companion']
+if sysroot['project_path'] != 'prebuilts/rust':
+    raise SystemExit('The runtime companion selects a different source project.')
+runtime_commit = [item['commit'] for item in lock['projects'] if item['path'] == sysroot['project_path']]
+if runtime_commit != [os.environ['RUST_SYSROOT_PIN']] or sysroot['base_commit'] != runtime_commit[0]:
+    raise SystemExit('The fixed source lock and reviewed Rust sysroot companion base disagree.')
+runtime_repo = Path(os.environ['META']) / 'crosvm_build/prebuilts/rust'
+if subprocess.check_output(['git', '-C', str(runtime_repo), 'rev-parse', 'HEAD'], text=True).strip() != runtime_commit[0]:
+    raise SystemExit('The synchronized Rust sysroot checkout differs from the retained exact pin.')
+runtime_patch = root / sysroot['patch']
+runtime_patch_bytes = runtime_patch.read_bytes()
+if hashlib.sha256(runtime_patch_bytes).hexdigest() != sysroot['patch_sha256']:
+    raise SystemExit('The reviewed Rust sysroot companion patch bytes differ.')
+for row in sysroot['files']:
+    if hashlib.sha256((runtime_repo / row['file']).read_bytes()).hexdigest() != row['pinned_sha256']:
+        raise SystemExit('Unexpected unpatched Rust sysroot source: ' + row['file'])
+for row in sysroot['unchanged_runtime_source_identities']:
+    if hashlib.sha256((runtime_repo / row['file']).read_bytes()).hexdigest() != row['sha256']:
+        raise SystemExit('Unexpected pinned Rust panic runtime input: ' + row['file'])
+runtime_command = ['git', '-c', 'core.autocrlf=false', '-C', str(runtime_repo), 'apply', '--whitespace=error']
+subprocess.run([*runtime_command, '--check', str(runtime_patch)], check=True)
+subprocess.run([*runtime_command, str(runtime_patch)], check=True)
+for row in sysroot['files']:
+    if hashlib.sha256((runtime_repo / row['file']).read_bytes()).hexdigest() != row['final_lf_sha256']:
+        raise SystemExit('Unexpected patched Rust sysroot source: ' + row['file'])
 (out / 'diagnostics/soong-device-unwind.patch').write_bytes(patch_bytes)
+(out / 'diagnostics/rust-sysroot-unwind.patch').write_bytes(runtime_patch_bytes)
 (out / 'soong-unwind-source.json').write_text(json.dumps({
     **manifest, 'source_manifest_sha256': hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     'applied_only_to_ci_build_tree': True, 'device_panic_execution_verified': False,
     'source_lock_commits_changed': False,
+    'sysroot_companion_retained_patch': 'diagnostics/rust-sysroot-unwind.patch',
+    'sysroot_companion_patch_sha256': hashlib.sha256(runtime_patch_bytes).hexdigest(),
+    'sysroot_companion_applied': True, 'sysroot_source_bytes_verified': True,
 }, indent=2) + '\n')
-print('Verified and applied the pinned CI-only Soong unwind default; runtime execution remains separate.')
+print('Verified and applied the pinned CI-only Soong unwind default and Android panic runtime dependencies; runtime execution remains separate.')
 PYSOONG
 
 # The shim is a separate bare-metal crate; Soong uses its own Rust prebuilts.

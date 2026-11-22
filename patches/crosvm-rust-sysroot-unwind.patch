@@ -1,0 +1,15 @@
+diff --git a/Android.bp b/Android.bp
+--- a/Android.bp
++++ b/Android.bp
+@@ -433,7 +433,10 @@
+             rlibs: ["libpanic_unwind.rust_sysroot"],
+         },
+         android: {
+-            rlibs: ["libpanic_abort.rust_sysroot"],
++            rlibs: [
++                "libpanic_abort.rust_sysroot",
++                "libpanic_unwind.rust_sysroot",
++            ],
+         },
+     },
+     toolchain_crate_root: stdlibs_src_path + "/library/std/src/lib.rs",
