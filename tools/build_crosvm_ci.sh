@@ -277,6 +277,12 @@ rustup toolchain install "$SHIM_RUST_TOOLCHAIN" --profile minimal --target aarch
 export RUSTUP_TOOLCHAIN="$SHIM_RUST_TOOLCHAIN"
 rustc --version | tee "$OUT/diagnostics/shim-rustc-version.txt"
 cargo --version | tee "$OUT/diagnostics/shim-cargo-version.txt"
+# Exercise the exact reviewed memory boundary before the complete runtime build.
+# The Linux harness uses real local VMA syscalls; phone Gunyah is verified separately.
+python3 "$ROOT/tools/run_gunyah_host_boundary_tests.py" \
+  --source "$META/crosvm_build/external/crosvm" \
+  --manifest "$ROOT/profiles/crosvm-host-policy-source.json" \
+  --output "$OUT/diagnostics/gunyah-host-boundary-tests" --rustc rustc
 space_report before-build
 (
   cd "$META"

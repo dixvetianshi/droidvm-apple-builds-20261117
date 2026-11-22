@@ -1,16 +1,16 @@
 {
   "base_commit": "c69de01daf50ee8a24adf07e994adf8bcd5825cf",
-  "patch_sha256": "9aa201a5657b64feea4736a229e6e34683911cca699debd4bf58efd8687a9359",
+  "patch_sha256": "817ee5fa89ca175eabeb13db95f1d7aa0c8a34470d6c4fcb4a76292254a33dd9",
   "files": [
     {
       "file": "hypervisor/src/gunyah/mod.rs",
       "pinned_sha256": "048480dc8a5d494d886d4000403eee041651c52967b808d5b23b9353029310ae",
-      "final_lf_sha256": "68a44aba339408442e347ffe4e56ae3180ccf26d9ed7df95433e54802c6ce49e"
+      "final_lf_sha256": "63d798541cdea2660ea182b97b181ec1515b2bdb79837a32e3a8ff1ea86e4d38"
     },
     {
       "file": "hypervisor/src/gunyah/mthp.rs",
       "pinned_sha256": "6cf00574b1f11cb74484403ccabbf85a1533b4dd45196e2c331716907debb459",
-      "final_lf_sha256": "cc5539ff3796e2570bfd746bd78c9acaabd28ef8d80889ed779ad08b02a49aa0"
+      "final_lf_sha256": "f03a69149c11c97289cad66f225e3ccf2a2c44993faf81234b16fd13aeff7188"
     },
     {
       "file": "hypervisor/src/lib.rs",
@@ -41,6 +41,11 @@
       "file": "src/sys/windows.rs",
       "pinned_sha256": "fda15d1b7ff6ff505766a8b2bc18196caf8998db30416159282fc004fdd44c6f",
       "final_lf_sha256": "26e1fcdcbf1bff85cb045c4a37f68ce7535fa852aa19f27252a12f0e763adc87"
+    },
+    {
+      "file": "hypervisor/src/gunyah/pin.rs",
+      "pinned_sha256": "78330d7a86788fcf50d7186b436ccdc6b76abd92196cd7484019d0d96f9ef15c",
+      "final_lf_sha256": "a00ab1a961dc84dc6d9c03664a009962902018e85318479a93997950d1586c19"
     }
   ]
 }
