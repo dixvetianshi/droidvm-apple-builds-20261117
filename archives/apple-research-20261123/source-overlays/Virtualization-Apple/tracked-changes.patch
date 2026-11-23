@@ -1,0 +1,602 @@
+diff --git a/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl b/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl
+index 2a6dc8084..d0b2771b3 100644
+--- a/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl
++++ b/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl
+@@ -47,4 +47,17 @@ interface ICrosvmAndroidDisplayService {
+      * It holds across setSurface. A backend without it fails the call (unknown transaction).
+      */
+     void setSurfaceTransform(int transform, boolean forCursor);
++
++    /** session=0 claims a new foreground binding; positive sessions only update their own binding. */
++    long setSurfaceForSession(in Surface surface, long session, boolean forCursor);
++
++    /** Detach only this binding. Keep the session for surface recreation unless endSession=true. */
++    boolean removeSurfaceForSession(long session, boolean forCursor, boolean endSession);
++
++    /** Replay only if this binding still owns the destination plane. */
++    void drawSavedFrameForSession(long session, boolean forCursor);
++
++    /** Cursor pipe belongs to the current scanout binding. */
++    boolean setCursorStreamForSession(in ParcelFileDescriptor stream, long session);
++    void clearCursorStreamForSession(long session);
+ }
+diff --git a/libs/android_display_backend/crosvm_android_display_client.cpp b/libs/android_display_backend/crosvm_android_display_client.cpp
+index b75889500..be93e002a 100644
+--- a/libs/android_display_backend/crosvm_android_display_client.cpp
++++ b/libs/android_display_backend/crosvm_android_display_client.cpp
+@@ -47,6 +47,7 @@
+ #include <functional>
+ #include <mutex>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ #if defined(__aarch64__)
+@@ -55,6 +56,7 @@
+ 
+ #include "media_codec_dl.h"
+ #include "surface_control_dl.h"
++#include "surface_attachment_owner.h"
+ 
+ using aidl::android::crosvm::BnCrosvmAndroidDisplayService;
+ using aidl::android::view::Surface;
+@@ -64,6 +66,8 @@ using android::base::Result;
+ 
+ namespace {
+ 
++android_display::SurfaceAttachmentIds gSurfaceAttachmentIds;
++
+ class ScopedTrace {
+ public:
+     explicit ScopedTrace(const char* name) { ATRACE_BEGIN(name); }
+@@ -2397,13 +2401,13 @@ static void logFrameHash(const std::string& surfaceName, const ANativeWindow_Buf
+               << fnv1a64VisiblePixels(buf) << std::dec;
+ }
+ 
+-static Result<void> copyBuffer(ANativeWindow_Buffer& from, ANativeWindow_Buffer& to) {
++static Result<void> copyBuffer(const ANativeWindow_Buffer& from, ANativeWindow_Buffer& to) {
+     if (from.width != to.width || from.height != to.height) {
+         return Error() << "dimension mismatch. from=(" << from.width << ", " << from.height << ") "
+                        << "to=(" << to.width << ", " << to.height << ")";
+     }
+     uint32_t* dst = reinterpret_cast<uint32_t*>(to.bits);
+-    uint32_t* src = reinterpret_cast<uint32_t*>(from.bits);
++    const uint32_t* src = reinterpret_cast<const uint32_t*>(from.bits);
+     size_t bytes_on_line = to.width * 4; // 4 bytes per pixel
+     for (int32_t h = 0; h < to.height; h++) {
+         memcpy(dst + (h * to.stride), src + (h * from.stride), bytes_on_line);
+@@ -2422,6 +2426,7 @@ public:
+         {
+             std::lock_guard lk(mSurfaceMutex);
+             LOG(INFO) << "display surface " << mName << " native window attached";
++            mAttachmentOwner.release();
+             clearNativeSurfaceLocked(true);
+             mNativeSurface = std::make_unique<Surface>(surface->release());
+             mNativeSurfaceNeedsConfiguring = true;
+@@ -2445,11 +2450,57 @@ public:
+     void removeSurface() {
+         {
+             std::lock_guard lk(mSurfaceMutex);
++            mAttachmentOwner.release();
+             clearNativeSurfaceLocked(true);
+         }
+         mNativeSurfaceReady.notify_one();
+     }
+ 
++    // session=0 is an explicit new foreground binding. A positive session can
++    // only update the native window belonging to that existing binding.
++    Result<int64_t> setNativeSurfaceForSession(const Surface& source, int64_t session) {
++        if (session < 0 || source.get() == nullptr) return Error() << "invalid surface session";
++        int64_t accepted;
++        {
++            std::lock_guard lk(mSurfaceMutex);
++            if (session > 0 && !mAttachmentOwner.matches(session)) return int64_t{0};
++            accepted = session > 0 ? session : gSurfaceAttachmentIds.allocate();
++            if (accepted == 0) return Error() << "surface session identities exhausted";
++            // NativeWindow's constructor acquires its own reference. Do not
++            // release or mutate the input AIDL Parcelable, and do not acquire twice.
++            auto window = std::make_unique<Surface>(source.get());
++            clearNativeSurfaceLocked(true);
++            mNativeSurface = std::move(window);
++            mAttachmentOwner.claim(accepted);
++            mNativeSurfaceNeedsConfiguring = true;
++            ++mNativeSurfaceGeneration;
++            auto& sc = SurfaceControl::GetInstance();
++            if (sc.IsSupported())
++                mSurfaceControl = sc.ASurfaceControl_createFromWindow(mNativeSurface->get(), mName.c_str());
++        }
++        mNativeSurfaceReady.notify_one();
++        return accepted;
++    }
++
++    bool removeSurfaceForSession(int64_t session, bool endSession) {
++        {
++            std::lock_guard lk(mSurfaceMutex);
++            if (!mAttachmentOwner.matches(session)) return false;
++            clearNativeSurfaceLocked(true);
++            if (endSession) mAttachmentOwner.release();
++        }
++        mNativeSurfaceReady.notify_one();
++        return true;
++    }
++
++    template <class Action>
++    bool withSession(int64_t session, Action action) {
++        std::lock_guard lk(mSurfaceMutex);
++        if (!mAttachmentOwner.matches(session)) return false;
++        action();
++        return true;
++    }
++
+     Surface* getSurface() {
+         std::unique_lock lk(mSurfaceMutex);
+         return mNativeSurface.get();
+@@ -2488,6 +2539,17 @@ public:
+     Result<void> configure(uint32_t width, uint32_t height) {
+         std::unique_lock lk(mSurfaceMutex);
+ 
++        const bool geometryChanged = !mRequestedSurfaceDimensions ||
++                mRequestedSurfaceDimensions->width != width ||
++                mRequestedSurfaceDimensions->height != height;
++        if (geometryChanged) {
++            if (mCpuBufferBorrowed) {
++                return Error() << "Cannot change geometry while a CPU buffer is borrowed";
++            }
++            mSavedFrameValid = false;
++            mLastFlipImport = 0;
++        }
++
+         LOG(INFO) << "display surface " << mName << " configure " << width << "x" << height;
+         mRequestedSurfaceDimensions = Rect{
+                 .width = width,
+@@ -2514,42 +2576,38 @@ public:
+ 
+     Result<void> lock(ANativeWindow_Buffer* out_buffer) {
+         std::unique_lock lk(mSurfaceMutex);
++        if (!mRequestedSurfaceDimensions) return Error() << "Surface dimension is not configured";
++        if (mCpuBufferBorrowed) return Error() << "CPU buffer is already borrowed";
+ 
+-        Surface* surface = mNativeSurface.get();
+-        if (surface == nullptr) {
+-            // Surface not currently available but not necessarily an error
+-            // if, for example, the VmLauncherApp is not in the foreground.
+-            *out_buffer = mSinkBuffer;
+-            return {};
+-        }
+-
+-        ANativeWindow* anw = surface->get();
+-        if (anw == nullptr) {
+-            return Error() << "Failed to get ANativeWindow";
+-        }
+-
+-        if (auto ret = prepareNativeWindowLocked(anw, false); !ret.ok()) {
+-            return ret;
+-        }
+-
+-        if (ANativeWindow_lock(anw, out_buffer, nullptr) != 0) {
+-            return Error() << "Failed to lock window";
+-        }
+-        mLastBuffer = *out_buffer;
+-        mLastBufferValid = true;
++        // crosvm borrows these owned pixels until post. Never expose a native-window mapping
++        // across the FFI borrow: a binder thread may replace that window before post arrives.
++        *out_buffer = mSinkBuffer;
++        mCpuBufferBorrowed = true;
+         return {};
+     }
+ 
+     Result<int> flip(VulkanDisplayBridge& bridge, int64_t importId) {
+-        ScopedTrace trace("crosvm_display.flip");
+         std::unique_lock lk(mSurfaceMutex);
++        return flipLocked(bridge, importId);
++    }
++
++private:
++    Result<int> acceptFlipLocked(int64_t importId, int completionFd) {
++        // An accepted GPU frame supersedes the CPU snapshot, including while no window is
++        // attached or BufferQueue is full. Keep its source import for the next attachment.
++        mSavedFrameValid = false;
+         mLastFlipImport = importId;
++        return completionFd;
++    }
++
++    Result<int> flipLocked(VulkanDisplayBridge& bridge, int64_t importId) {
++        ScopedTrace trace("crosvm_display.flip");
+ 
+         Surface* surface = mNativeSurface.get();
+         if (surface == nullptr) {
+             // The display service can temporarily lose its Surface while the launcher is
+             // backgrounded. Keep the source import alive and drop the frame in that interval.
+-            return -1;
++            return acceptFlipLocked(importId, -1);
+         }
+         if (mVulkanTargetGeneration != mNativeSurfaceGeneration) {
+             if (auto ret = bridge.resetTargetsForSurfaceChange(); !ret.ok()) {
+@@ -2589,11 +2647,13 @@ public:
+                 LOG(INFO) << "display surface " << mName << " dropped " << dropped
+                           << " flip(s) so far: no free display buffer (panel-paced)";
+             }
+-            return -1;
++            return acceptFlipLocked(importId, -1);
+         }
+         if (result != 0) {
+             if (fenceFd >= 0) close(fenceFd);
+-            if (clearIfSurfaceUnavailableLocked("dequeueBuffer", result)) return -1;
++            if (clearIfSurfaceUnavailableLocked("dequeueBuffer", result)) {
++                return acceptFlipLocked(importId, -1);
++            }
+             return Error() << "Failed to dequeue display buffer: " << result;
+         }
+         if (buffer == nullptr) {
+@@ -2672,38 +2732,30 @@ public:
+             if (!queueCalled && targetCompletionFd >= 0) close(targetCompletionFd);
+             ANativeWindow_cancelBuffer(anw, buffer, -1);
+             if (!injectQueueFailure && clearIfSurfaceUnavailableLocked("queueBuffer", result)) {
+-                return -1;
++                return acceptFlipLocked(importId, -1);
+             }
+             return Error() << (injectQueueFailure ? "Injected display queue failure: "
+                                                   : "Failed to queue display buffer: ")
+                            << result;
+         }
+-        return sourceCompletionFd;
++        return acceptFlipLocked(importId, sourceCompletionFd);
+     }
+ 
++public:
+     Result<void> unlockAndPost() {
+         std::unique_lock lk(mSurfaceMutex);
+-
+-        Surface* surface = mNativeSurface.get();
+-        if (surface == nullptr) {
+-            // Surface not currently available but not necessarily an error
+-            // if, for example, the VmLauncherApp is not in the foreground.
+-            return {};
+-        }
+-
+-        ANativeWindow* anw = surface->get();
+-        if (anw == nullptr) {
+-            return Error() << "Failed to get ANativeWindow";
+-        }
+-
+-        // The CPU edge has already copied into the RGBA layout declared by this sink, so this hash
+-        // is also exactly what SurfaceFlinger receives. See frameHashEnabled().
+-        if (frameHashEnabled()) logFrameHash(mName, mLastBuffer);
+-
+-        if (ANativeWindow_unlockAndPost(anw) != 0) {
+-            return Error() << "Failed to unlock and post window";
+-        }
+-        return {};
++        if (!mCpuBufferBorrowed) return {};
++        mCpuBufferBorrowed = false;
++
++        // End the borrow before publishing its pixels as the immutable replay source. The next
++        // CPU borrow uses the other owned allocation; neither depends on a posted gralloc pointer.
++        // post is also used to release a failed readback, so this preserves submission semantics
++        // without claiming that the caller produced a complete or successful guest frame.
++        std::swap(mSinkBuffer, mSavedFrameBuffer);
++        mSavedFrameValid = true;
++        mLastFlipImport = 0;
++        if (!mNativeSurface) return {};
++        return drawSavedFrameLocked();
+     }
+ 
+     Result<void> setBuffer(AHardwareBuffer* ahb) {
+@@ -2712,53 +2764,54 @@ public:
+         if (!sc.IsSupported()) {
+             return Error() << "SurfaceControl is not supported";
+         }
++        if (!mSurfaceControl) {
++            return Error() << "mSurfaceControl is destroyed";
++        }
+         auto transaction = sc.ASurfaceTransaction_create();
+         if (!transaction) {
+             return Error() << "Failed to create ASurfaceTransaction";
+         }
+-        if (!mSurfaceControl) {
+-            return Error() << "mSurfaceControl is destroyed";
+-        }
+         sc.ASurfaceTransaction_setBuffer(transaction, mSurfaceControl, ahb,
+                                          -1 /* acquire_fence_fd */);
+         sc.ASurfaceTransaction_setBufferTransform(transaction, mSurfaceControl, mBufferTransform);
+         sc.ASurfaceTransaction_apply(transaction);
+         sc.ASurfaceTransaction_delete(transaction);
++        // This owner retains no replayable AHB for the SurfaceControl submission. Expire older
++        // CPU/GPU sources so a later replay cannot replace it with an earlier frame.
++        mSavedFrameValid = false;
++        mLastFlipImport = 0;
+         return {};
+     }
+ 
+-    // The source of the last flip (a VulkanDisplayBridge import), for redrawing it into a Surface
+-    // the app attaches later; 0 once that import is released.
+-    int64_t lastFlipImport() {
+-        std::lock_guard lk(mSurfaceMutex);
+-        return mLastFlipImport;
+-    }
+-
+     void forgetFlipImport(int64_t importId) {
+         std::lock_guard lk(mSurfaceMutex);
+         if (mLastFlipImport == importId) mLastFlipImport = 0;
+     }
+ 
+-    bool hasSavedFrame() {
+-        std::lock_guard lk(mSurfaceMutex);
+-        return mSavedFrameValid;
++    // CPU post already retains owned pixels and GPU flip already retains its import. Keep the
++    // binder API compatible; a save request must never read a posted native-window mapping.
++    Result<void> saveFrame() {
++        return {};
+     }
+ 
+-    // Saves the last frame drawn
+-    Result<void> saveFrame() {
++    // The context holds bridge_mutex before entering here, matching the normal GPU flip's lock
++    // order. Select and present under one surface lock so a CPU/GPU transition cannot change the
++    // replay source between a separate validity check and window preparation.
++    Result<int> replayFrame(VulkanDisplayBridge* bridge, int64_t session = 0) {
+         std::unique_lock lk(mSurfaceMutex);
+-        if (!mLastBufferValid) return {};
+-        if (auto ret = copyBuffer(mLastBuffer, mSavedFrameBuffer); !ret.ok()) {
+-            return Error() << "Failed to copy frame: " << ret.error();
++        if (session > 0 && !mAttachmentOwner.matches(session)) return -1;
++        if (mSavedFrameValid) {
++            if (auto ret = drawSavedFrameLocked(); !ret.ok()) return ret.error();
++            return -1;
+         }
+-        mSavedFrameValid = true;
+-        return {};
++        if (bridge && mLastFlipImport) return flipLocked(*bridge, mLastFlipImport);
++        return -1;
+     }
+ 
+-    // Draws the saved frame
+-    Result<void> drawSavedFrame() {
+-        std::unique_lock lk(mSurfaceMutex);
+-        if (!mSavedFrameValid) return {};
++    const std::string& name() const { return mName; }
++
++private:
++    Result<void> drawSavedFrameLocked() {
+         Surface* surface = mNativeSurface.get();
+         if (surface == nullptr) {
+             return Error() << "Surface not ready";
+@@ -2775,20 +2828,27 @@ public:
+         if (ANativeWindow_lock(anw, &buf, nullptr) != 0) {
+             return Error() << "Failed to lock window";
+         }
++        auto postGuard = android::base::make_scope_guard([anw] {
++            if (ANativeWindow_unlockAndPost(anw) != 0) {
++                LOG(WARNING) << "Failed to release CPU window after frame copy failure";
++            }
++        });
+ 
+         if (auto ret = copyBuffer(mSavedFrameBuffer, buf); !ret.ok()) {
+             return Error() << "Failed to copy frame: " << ret.error();
+         }
+ 
+-        if (ANativeWindow_unlockAndPost(anw) != 0) {
++        // crosvm has already converted to this RGBA sink. Hash only visible pixels after the
++        // stride-aware copy, while the native mapping is still valid.
++        if (frameHashEnabled()) logFrameHash(mName, buf);
++        const int postResult = ANativeWindow_unlockAndPost(anw);
++        postGuard.Disable();
++        if (postResult != 0) {
+             return Error() << "Failed to unlock and post window";
+         }
+         return {};
+     }
+ 
+-    const std::string& name() const { return mName; }
+-
+-private:
+     void clearNativeSurfaceLocked(bool disconnect) {
+         const bool hadSurface = mNativeSurface != nullptr;
+         if (disconnect) {
+@@ -2808,7 +2868,6 @@ private:
+         mNativeSurfaceNeedsConfiguring = true;
+         mGpuUsageConfigured = false;
+         mAppliedBufferTransform = -1;
+-        mLastBufferValid = false;
+         if (hadSurface) ++mNativeSurfaceGeneration;
+     }
+ 
+@@ -2943,6 +3002,7 @@ private:
+     std::string mName;
+ 
+     std::mutex mSurfaceMutex;
++    android_display::SurfaceAttachmentOwner mAttachmentOwner;
+     std::unique_ptr<Surface> mNativeSurface;
+     ASurfaceControl* mSurfaceControl = nullptr;
+     std::condition_variable mNativeSurfaceReady;
+@@ -2960,19 +3020,13 @@ private:
+     uint64_t mNativeSurfaceGeneration = 0;
+     uint64_t mVulkanTargetGeneration = 0;
+ 
+-    // Buffer which crosvm uses when in background. This is just to not fail crosvm even when
+-    // Android-side Surface doesn't exist. The content drawn here is never displayed on the physical
+-    // screen.
++    // Owned CPU staging buffer borrowed by crosvm until post, whether or not a native window is
++    // attached. Its stride and format are declared by SinkANativeWindow_Buffer::configure.
+     SinkANativeWindow_Buffer mSinkBuffer;
++    bool mCpuBufferBorrowed = false;
+ 
+-    // Buffer which is currently allocated for crosvm to draw onto. This holds the last frame. This
+-    // is what gets displayed on the physical screen.
+-    ANativeWindow_Buffer mLastBuffer;
+-    bool mLastBufferValid = false;
+-
+-    // Copy of mLastBuffer made by the call saveFrameForSurface. This holds the last good (i.e.
+-    // non-blank) frame before the VM goes background. When the VM is brought up to foreground,
+-    // this is drawn to the physical screen until the VM starts to emit actual frames.
++    // Last submitted CPU pixels, swapped with the staging allocation at post. Valid until a newer
++    // accepted GPU flip or a geometry change; native-window replacement does not invalidate them.
+     SinkANativeWindow_Buffer mSavedFrameBuffer;
+     bool mSavedFrameValid = false;
+     int64_t mLastFlipImport = 0;
+@@ -3015,8 +3069,12 @@ public:
+         return ::ndk::ScopedAStatus::ok();
+     }
+ 
+-    ndk::ScopedFileDescriptor& getCursorStream() { return mCursorStream; }
++    ndk::ScopedFileDescriptor duplicateCursorStream() {
++        std::lock_guard lk(mCursorStreamMutex);
++        return ndk::ScopedFileDescriptor(mCursorStream.get() >= 0 ? dup(mCursorStream.get()) : -1);
++    }
+     ndk::ScopedAStatus setCursorStream(const ndk::ScopedFileDescriptor& in_stream) {
++        std::lock_guard lk(mCursorStreamMutex);
+         mCursorStream = ndk::ScopedFileDescriptor(dup(in_stream.get()));
+         return ::ndk::ScopedAStatus::ok();
+     }
+@@ -3031,15 +3089,7 @@ public:
+     }
+ 
+     ndk::ScopedAStatus drawSavedFrameForSurface(bool forCursor) override {
+-        // A Vulkan blit (flip) writes the window's buffers itself and leaves no CPU frame to save:
+-        // the app brought back from the background showed black until the guest drew again, which
+-        // a guest that redraws only what changes may not do for a long while. Its last source is
+-        // drawn again instead.
+-        if (!getSurface(forCursor).hasSavedFrame() && mRedrawLastFlip) {
+-            mRedrawLastFlip(forCursor);
+-            return ::ndk::ScopedAStatus::ok();
+-        }
+-        if (auto ret = getSurface(forCursor).drawSavedFrame(); !ret.ok()) {
++        if (auto ret = mRedrawFrame.invoke(forCursor, 0); !ret.ok()) {
+             std::string msg = std::format("Failed to draw saved frame: {}", ret.error().message());
+             return ::ndk::ScopedAStatus(
+                     AStatus_fromServiceSpecificErrorWithMessage(-1, msg.c_str()));
+@@ -3047,6 +3097,51 @@ public:
+         return ::ndk::ScopedAStatus::ok();
+     }
+ 
++    ndk::ScopedAStatus setSurfaceForSession(const Surface& source, int64_t session,
++                                           bool forCursor, int64_t* result) override {
++        auto accepted = getSurface(forCursor).setNativeSurfaceForSession(source, session);
++        if (!accepted.ok())
++            return ndk::ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT,
++                                                                   accepted.error().message().c_str());
++        *result = *accepted;
++        return ndk::ScopedAStatus::ok();
++    }
++
++    ndk::ScopedAStatus removeSurfaceForSession(int64_t session, bool forCursor,
++                                              bool endSession, bool* result) override {
++        *result = getSurface(forCursor).removeSurfaceForSession(session, endSession);
++        return ndk::ScopedAStatus::ok();
++    }
++
++    ndk::ScopedAStatus drawSavedFrameForSession(int64_t session, bool forCursor) override {
++        if (session <= 0) return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
++        if (auto ret = mRedrawFrame.invoke(forCursor, session); !ret.ok())
++            return ndk::ScopedAStatus(AStatus_fromServiceSpecificErrorWithMessage(
++                -1, ret.error().message().c_str()));
++        return ndk::ScopedAStatus::ok();
++    }
++
++    ndk::ScopedAStatus setCursorStreamForSession(const ndk::ScopedFileDescriptor& stream,
++                                                int64_t session, bool* result) override {
++        ndk::ScopedFileDescriptor replacement(dup(stream.get()));
++        if (replacement.get() < 0)
++            return ndk::ScopedAStatus(AStatus_fromServiceSpecificErrorWithMessage(
++                -1, "Cursor pipe could not be duplicated"));
++        *result = mScanout.withSession(session, [&] {
++            std::lock_guard lk(mCursorStreamMutex);
++            mCursorStream = std::move(replacement);
++        });
++        return ndk::ScopedAStatus::ok();
++    }
++
++    ndk::ScopedAStatus clearCursorStreamForSession(int64_t session) override {
++        mScanout.withSession(session, [&] {
++            std::lock_guard lk(mCursorStreamMutex);
++            mCursorStream = ndk::ScopedFileDescriptor();
++        });
++        return ndk::ScopedAStatus::ok();
++    }
++
+     ndk::ScopedAStatus getDisplayConfig(
+             ::aidl::android::crosvm::DisplayConfig* _aidl_return) override {
+         auto dims = mScanout.dimensions();
+@@ -3066,13 +3161,16 @@ public:
+         }
+     }
+ 
+-    void setRedrawLastFlip(std::function<void(bool)> redraw) { mRedrawLastFlip = std::move(redraw); }
++    void setRedrawFrame(std::function<Result<void>(bool, int64_t)> redraw) {
++        mRedrawFrame.set(std::move(redraw));
++    }
+ 
+ private:
+     AndroidDisplaySurface mScanout{"scanout"};
+     AndroidDisplaySurface mCursor{"cursor"};
+     ndk::ScopedFileDescriptor mCursorStream;
+-    std::function<void(bool)> mRedrawLastFlip;
++    std::mutex mCursorStreamMutex;
++    android_display::SerializedDisplayReplay<Result<void>> mRedrawFrame;
+ };
+ 
+ } // namespace
+@@ -3123,27 +3221,32 @@ struct AndroidDisplayContext {
+         }
+ 
+         this->disp_service = disp_service;
+-        disp_service->setRedrawLastFlip([this](bool forCursor) { redrawLastFlip(forCursor); });
++        disp_service->setRedrawFrame([this](bool forCursor, int64_t session) {
++            return redrawFrame(forCursor, session);
++        });
+     }
+ 
+-    // drawSavedFrameForSurface on the Vulkan path: the last flipped source into the Surface the app
+-    // has just attached. A failure is only logged: the next guest frame draws as before.
+-    void redrawLastFlip(bool forCursor) {
++    // Serialize CPU/GPU replay with import release and normal flips. The surface owns the latest
++    // replay source; the context owns the bridge and the completion fd returned by a GPU replay.
++    Result<void> redrawFrame(bool forCursor, int64_t session = 0) {
+         std::lock_guard lk(bridge_mutex);
+         AndroidDisplaySurface& surface = disp_service->getSurface(forCursor);
+-        const int64_t importId = surface.lastFlipImport();
+-        if (!importId || !vulkan_display || !vulkanDisplayActive()) return;
+-        auto ret = surface.flip(*vulkan_display, importId);
++        VulkanDisplayBridge* bridge = vulkanDisplayActive() ? vulkan_display.get() : nullptr;
++        auto ret = surface.replayFrame(bridge, session);
+         if (!ret.ok()) {
+             LOG(WARNING) << "display surface " << surface.name()
+                          << " could not redraw its last frame: " << ret.error();
+-            return;
++            return ret.error();
+         }
+         if (*ret >= 0) close(*ret);
+-        LOG(INFO) << "display surface " << surface.name() << " redrew its last frame";
++        return {};
+     }
+ 
+-    ~AndroidDisplayContext() = default;
++    ~AndroidDisplayContext() {
++        // Binder calls may remain alive while the VMM retains its memory-owner
++        // process during shutdown. Drain replay before freeing this captured ctx.
++        if (disp_service) disp_service->setRedrawFrame({});
++    }
+ 
+     VulkanDisplayBridge* getVulkanDisplay() {
+         std::lock_guard lk(bridge_mutex);
+@@ -3248,7 +3351,8 @@ extern "C" void set_android_surface_position(struct AndroidDisplayContext* ctx,
+         ctx->errorf("Display service was not created");
+         return;
+     }
+-    auto fd = ctx->disp_service->getCursorStream().get();
++    auto stream = ctx->disp_service->duplicateCursorStream();
++    auto fd = stream.get();
+     if (fd == -1) {
+         static std::atomic<bool> warned = false;
+         if (!warned.exchange(true, std::memory_order_relaxed)) {
+@@ -3323,8 +3427,8 @@ extern "C" bool android_display_is_vulkan_blit_available(struct AndroidDisplayCo
+ // Whether a frame posted now can reach a screen: the app attached a Surface to the scanout and has
+ // not taken it back. Leaving the display view destroys the SurfaceView, and the removeSurface(false)
+ // that follows drops the native window here; the same clearing happens when a producer is abandoned
+-// under us (clearIfSurfaceUnavailableLocked). While there is none, lock() hands out the sink buffer
+-// and unlockAndPost() returns without posting, so the frame is built and thrown away.
++// under us (clearIfSurfaceUnavailableLocked). While there is none, lock() still hands out the owned
++// sink buffer and post retains its pixels for replay, but does not submit to a physical screen.
+ //
+ // Only the scanout counts. The cursor surface is a separate SurfaceView on its own lifecycle and may
+ // never be attached at all (the app's display view does not always carry a cursor overlay), so it

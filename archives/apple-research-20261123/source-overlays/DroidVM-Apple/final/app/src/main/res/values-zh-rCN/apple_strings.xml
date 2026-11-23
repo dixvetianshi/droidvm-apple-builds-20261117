@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="apple_app_name">DroidVM 苹果版</string>
+    <string name="apple_usb_acm_unavailable">苹果版不提供 USB 串口，请使用应用内控制台。</string>
+    <string name="apple_shared_host_read_only">苹果版仅读取现有内核和内存能力，此处不能更改共享宿主设置。</string>
+    <string name="apple_on_demand_network">苹果版使用 gVisor NAT，网络随虚拟机启动，最后一台虚拟机停止后关闭。</string>
+    <string name="apple_vm_missing_host_capabilities">缺少所需宿主能力：%1$s\n\n苹果版不能加载共享内核模块，此虚拟机未启动。</string>
+    <string name="apple_vm_memory_unavailable">%1$s\n\n此虚拟机未启动。请在现有内存可用后重试，或减少虚拟机内存。</string>
+</resources>

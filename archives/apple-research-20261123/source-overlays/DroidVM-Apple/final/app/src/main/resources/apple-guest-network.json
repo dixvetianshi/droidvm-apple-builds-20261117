@@ -1,0 +1,43 @@
+{
+  "schema": 2,
+  "name": "br-apple-nat",
+  "bridge_name": "br-apple-nat",
+  "bridge_type": "gvisor",
+  "uplink_mode": "l3",
+  "stp": false,
+  "auto_up": false,
+  "pkg_network_ref": "apple-uplink",
+  "l2": {},
+  "l3": {
+    "vlans": [
+      {
+        "vlan_id": 0,
+        "ipv4": {
+          "cidr": "192.168.237.1/24",
+          "snat": true,
+          "dhcp": {
+            "enabled": true,
+            "offset_start": 128,
+            "offset_end": 192
+          }
+        },
+        "ipv6": {
+          "source": "static",
+          "cidr": null,
+          "snat": false,
+          "dhcp": {
+            "enabled": false,
+            "offset_start": 128,
+            "offset_end": 192
+          },
+          "slaac": {
+            "enabled": false
+          }
+        },
+        "dns_servers": [],
+        "ipv4_secondary": [],
+        "ipv6_secondary": []
+      }
+    ]
+  }
+}

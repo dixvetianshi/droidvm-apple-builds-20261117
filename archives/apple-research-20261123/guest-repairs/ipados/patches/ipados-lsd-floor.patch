@@ -1,0 +1,71 @@
+diff --git a/ipados27/patches/xnu-12377/ipados.series b/ipados27/patches/xnu-12377/ipados.series
+--- a/ipados27/patches/xnu-12377/ipados.series
++++ b/ipados27/patches/xnu-12377/ipados.series
+@@ -5,3 +5,4 @@
+ droidvm-gpu-grant-apps.patch
+ droidvm-gpu-sandbox-first.patch
+ droidvm-surface-gpu-wait.patch
++droidvm-ipados-lsd-floor.patch
+diff --git a/package/DroidVMBootArgs27.c b/package/DroidVMBootArgs27.c
+--- a/package/DroidVMBootArgs27.c
++++ b/package/DroidVMBootArgs27.c
+@@ -15,6 +15,9 @@
+     // the deletable system apps of the OS volume's staged_system_apps in /Applications (the bring-up patch's union) and lsd's
+     // first-boot semaphore that keeps them registered (DroidVMLaunchPolicy.c)
+     "owner-staged-apps=1 "
++    // The mobile LaunchServices process must survive registration on this 4GB guest.
++    // Its two positive per-process limits gain a fixed 64MB floor; other limits stay.
++    "droidvm-ipados-lsd-floor=1 "
+     // Data protection classes on a Data volume without content protection (the bring-up patch): PosterBoard's wallpaper store
+     "owner-dataprotect=1 "
+     // the App cryptex's daemons and the owner binaries (ownervisor, the debug tools) run without the launch constraints of the
+diff --git a/ipados27/patches/xnu-12377/droidvm-ipados-lsd-floor.patch b/ipados27/patches/xnu-12377/droidvm-ipados-lsd-floor.patch
+new file mode 100644
+--- /dev/null
++++ b/ipados27/patches/xnu-12377/droidvm-ipados-lsd-floor.patch
+@@ -0,0 +1,45 @@
++iPadOS-only LaunchServices budget floor, enabled by the board boot argument.
++Insert after default fatal-attribute derivation, before limits enter the proc
++fields/ledger. Preserve default sentinels, attributes and limits above 64 MB.
++Pinned public XNU: ac9718fb1af618d5ce8678d0dc6e8a58f252216f.
++
++--- a/bsd/kern/kern_memorystatus.c
+++++ b/bsd/kern/kern_memorystatus.c
++@@ -3267,10 +3267,37 @@
++ 	}
++ 
++ 	if (default_inactive_limit && inactive_limit == default_inactive_limit) {
++ 		options |= MEMLIMIT_INACTIVE_FATAL;
++ 	}
+++
+++#if XNU_TARGET_OS_IOS
+++	/* The iPadOS board needs room for LaunchServices to register its apps.
+++	 * This budget policy selects UID and registered name, not an executable
+++	 * pathname. Keep the defaults, fatal attributes and higher limits chosen
+++	 * above; only the two positive limits for mobile lsd gain a 64 MB floor.
+++	 * This function holds proc_list_mlock, including boot-argument caching.
+++	 */
+++	{
+++		static int floor_read;
+++		static int floor_enabled;
+++		if (!floor_read) {
+++			int requested = 0;
+++			floor_enabled = PE_parse_boot_argn("droidvm-ipados-lsd-floor",
+++			    &requested, sizeof(requested)) && requested == 1;
+++			floor_read = 1;
+++		}
+++		if (floor_enabled && p->p_uid == 501 && strcmp(p->p_name, "lsd") == 0) {
+++			if (active_limit > 0) {
+++				active_limit = MAX(active_limit, 64);
+++			}
+++			if (inactive_limit > 0) {
+++				inactive_limit = MAX(inactive_limit, 64);
+++			}
+++		}
+++	}
+++#endif /* XNU_TARGET_OS_IOS */
++ 
++ 	memorystatus_log_debug(
++ 		"memorystatus: setting memlimit for %s [%d], "
++ 		"Active(%dMB %s), Inactive(%dMB, %s)\n",
++ 		proc_best_name(p), proc_getpid(p),

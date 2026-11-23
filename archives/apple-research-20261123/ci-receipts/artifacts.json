@@ -1,0 +1,18 @@
+{
+  "artifacts": [
+    {
+      "id": 14765906651,
+      "name": "droidvm-crosvm-apple-8",
+      "size_in_bytes": 99875996,
+      "digest": "sha256:4f709c1f0cb7c4e906228ca9cb319cb7d23ee3a711afed206d3861c3c87c247b",
+      "expired": false,
+      "workflow_run": {
+        "id": 45047307062,
+        "repository_id": 1461443359,
+        "head_repository_id": 1461443359,
+        "head_branch": "codex/apple-host-isolation",
+        "head_sha": "a9af810fa11ce6479680e4972c7906752bdb4fc5"
+      }
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+diff --git a/rust/config/global.go b/rust/config/global.go
+--- a/rust/config/global.go
++++ b/rust/config/global.go
+@@ -86,7 +86,7 @@
+ 	}
+ 
+ 	deviceGlobalRustFlags = []string{
+-		"-C panic=abort",
++		"-C panic=unwind",
+ 		// Generate additional debug info for AutoFDO
+ 		"-Z debug-info-for-profiling",
+ 		// Android has ELF TLS on platform

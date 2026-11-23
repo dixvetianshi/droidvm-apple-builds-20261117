@@ -1,0 +1,73 @@
+{
+  "archive_status": "research_stopped_by_user",
+  "archived_at_utc": "2026-11-23T05:30:40.888571+00:00",
+  "App": {
+    "version_code": 2730,
+    "version_name": "0.0.6.r242.g3348830.apple10",
+    "application_id": "cn.classfun.droidvm.apple",
+    "bytes": 126264052,
+    "sha256": "e2059599416aa3275315c521510949c232ee570628a55d9337b74d29822ddaea",
+    "signing_certificate_sha256": "9640c926d5d842d2f51eb418707b5a864bb4171f0b414bdbbec67bfdc62727bd",
+    "actual_build_passed": true,
+    "earlier_tests": 29,
+    "latest_focused_tests": 15,
+    "test_failures": 0,
+    "test_skipped": 0,
+    "installed_on_selected_phone": true
+  },
+  "Native": {
+    "run_id": 45047307062,
+    "head": "a9af810fa11ce6479680e4972c7906752bdb4fc5",
+    "status": "completed",
+    "conclusion": "success",
+    "compiled_sha256": "94904ac5e0602704d429335d56496668a5a86a37ac6fe5992694b372dd90829f",
+    "source_profile_sha256": "b2a69119f9a4f5269a175689e5e07bdd5deb77253f7315d18684752a44601950",
+    "combined_patch_sha256": "92d101b43a5f17d620e21d607321a13d502ce460abf2f976852b888b66977186",
+    "selected_runtime_members": 71
+  },
+  "HostShare": {
+    "run": "https://github.com/dixvetianshi/droidvm-apple-builds-20261117/actions/runs/45029535267",
+    "head_sha": "bdc560600c69be57f24ab6f5624721dbc77f68f2",
+    "artifact_id": 14756578640,
+    "archive_bytes": 1756750,
+    "archive_sha256": "1f3110d714d8ad2d5576ae0c8fd905a44523be07d9d9ad0c948d25a996fbd068",
+    "module_sha256": "1a9555640c7aee58e26c21baa18780e40c31edb8ae7cdd9009ca67a84892a53f",
+    "module_bytes": 55720,
+    "scenario_invocations_completed": 22,
+    "independent_c_source_review": "pending"
+  },
+  "unmerged_node_publication_candidate": {
+    "integrated": false,
+    "APK_built": false,
+    "phone_tested": false,
+    "source_sha256": "6b90d2e986c4b85b0b542afaea5c2c144b3f7405967398dc415d9d988a3588f8",
+    "patch_sha256": "e703c6b49cd8d1b31960581829fd157ed1674bd78b90c683c7a9b9ec35e13e4f",
+    "test_source_sha256": "1aef2f35d59989580dbba7b2da151e51d4a41c1aa6711e480976652577f05f5c",
+    "java_release": 11,
+    "tests": 4,
+    "strict_compile_passed": true,
+    "read_only_observation_deadline_nanos": 2000000000
+  },
+  "iPad_fixed_package": {
+    "bytes": 11009970176,
+    "sha256": "638c1ddd4b5077f31689872c3f96f9c384eabc93e1f6207dcb67e74e31ff8533",
+    "member_count": 5,
+    "full_byte_comparison_passed": true,
+    "OS_volumes_not_uploaded": true,
+    "fresh_phone_import_verified": false,
+    "runtime_lsd_floor_verified": false
+  },
+  "phone_protection_observations": {
+    "old_Debian_registry_hashes_matched": true,
+    "original_hugepage_binary_sha256": "39fd6717d5506dde5b3e036ade97ae8443022c87041006317890223611c41aed",
+    "WiFi_automatic_restore_after_user_cold_boot": true,
+    "compared_global_system_values_unchanged_during_final_deploy": true
+  },
+  "unresolved": [
+    "First on-demand HostShare load returned before the device node was visible. One later retry started Mac; the waiting repair remains unmerged.",
+    "Mac GPU CREATE_LIST returns EINVAL with the built-in udmabuf. Its list_limit=1024 and size_limit_mb=64 differ from the prior override; exact failing count/bytes were not measured. No new native fix was made.",
+    "Mac complete desktop/input/network/media/normal shutdown and repeated memory recovery were not accepted on Apple10.",
+    "iPad floor implementation is present in the compiled guest kernel, but live effective limits and fresh package import are unverified.",
+    "HostShare independent C implementation review remains incomplete; host sanitizer/mock tests do not establish real kernel RM behavior."
+  ]
+}

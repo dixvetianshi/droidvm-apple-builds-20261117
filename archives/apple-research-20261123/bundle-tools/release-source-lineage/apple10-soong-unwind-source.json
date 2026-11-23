@@ -1,0 +1,178 @@
+{
+  "schema_version": 2,
+  "project_path": "build/soong",
+  "repository": "https://github.com/Crosvm-Android/soong",
+  "base_commit": "c2db5181e9e1b6a383f6e858fb39b3db26aba7e7",
+  "patch_sha256": "be7c43b7704ebfd969d2552528a561d8c47d5d2b116ed1c655ff7ba0461e9894",
+  "files": [
+    {
+      "file": "rust/config/global.go",
+      "pinned_sha256": "3099eb5c80da40aaf16ce7529a500971788d0f2c06320fae0bba4d82cf02ae6a",
+      "final_lf_sha256": "c5249045d602d021a60e5e380bb8bcdfd10e2fb9a0ebf6c1017dbc2fce5ccbd5"
+    }
+  ],
+  "rust_version": "1.88.0",
+  "device_panic_strategy_selected": "unwind",
+  "scope": "Dedicated CI crosvm build tree only; all Android device Rust crates built for the selected crosvm target inherit this default, including transitive Rust/stdlib dependencies",
+  "runtime_examples": [
+    "crosvm_device_only_bin",
+    "libhypervisor",
+    "libdevices",
+    "libvm_memory",
+    "libvm_control",
+    "libbase_rust",
+    "libstd",
+    "transitive Rust dependencies"
+  ],
+  "system_or_phone_changes": false,
+  "source_lock_snapshot_sha256": "fe63a6eec0ec48abd7a9551a93e1b60b976ee0171b9a18c1a52f93b9ffccb610",
+  "limits": [
+    "Source configuration is not a device panic/RM execution result",
+    "Soong device rust_test still adds -Z panic_abort_tests; portable smoke uses explicit host unwind and does not establish device behavior",
+    "Fatal C signals, direct _exit, non-unwinding FFI panic, OOM abort and SIGKILL remain outside unwind guarantees",
+    "Both device unwind default and Android source-built panic runtime dependencies are required; source graph availability is not proof of device panic/RM execution"
+  ],
+  "source_provenance": {
+    "first_stage_patch_sha256": "be7c43b7704ebfd969d2552528a561d8c47d5d2b116ed1c655ff7ba0461e9894",
+    "first_stage_source_manifest_sha256": "4c39e11c5466a9480f7f77c7fedd016d31373521b3bb29c309f57fc2246355e8",
+    "first_stage_failed_run_id": 45034596833,
+    "first_stage_failed_job_id": 137245412538,
+    "first_stage_failure": "Generated libapexsupport used panic=unwind with sysroot=/dev/null and only panic_abort dependency directories; E0463 panic_unwind was absent",
+    "repair": "Retain the reviewed device default and expose the existing source-built unwind runtime through Android libstd's supported rlibs dependency list"
+  },
+  "sysroot_companion": {
+    "project_path": "prebuilts/rust",
+    "repository": "https://android.googlesource.com/platform/prebuilts/rust",
+    "base_commit": "06a4f29f8512c6b77bdce81dd036a3e39954803b",
+    "patch": "patches/crosvm-rust-sysroot-unwind.patch",
+    "patch_sha256": "34e197a83754f41d4f288aad04f0060ac9021ade47ac0801adb11ad5d4a31f85",
+    "files": [
+      {
+        "file": "Android.bp",
+        "pinned_sha256": "b8698c67eefb1ccafb66032f417c83d8fea60566bc38105ec889bc1434e868f6",
+        "final_lf_sha256": "9cdb0bd1f24f336052e56da5a54c04c5229ac2e3d2fd64e57f6740ec05da52a5"
+      }
+    ],
+    "stdlib_module": "libstd",
+    "selected_target": "android",
+    "stdlib_target_rlibs_before": [
+      "libpanic_abort.rust_sysroot"
+    ],
+    "stdlib_target_rlibs_after": [
+      "libpanic_abort.rust_sysroot",
+      "libpanic_unwind.rust_sysroot"
+    ],
+    "runtime_module": "libpanic_unwind.rust_sysroot",
+    "runtime_dependency_modules": [
+      {
+        "module": "libpanic_unwind.rust_sysroot",
+        "crate_name": "panic_unwind",
+        "rlibs": [
+          "liballoc.rust_sysroot",
+          "libcore.rust_sysroot",
+          "liblibc.rust_sysroot",
+          "libunwind.rust_sysroot",
+          "libcompiler_builtins.rust_sysroot",
+          "libcfg_if.rust_sysroot"
+        ],
+        "source_declaration_sha256": "5be65adef4267eb97c0a57fd34b81a7a266dcccbfbcba21629e1bb1c30c2e825",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "liballoc.rust_sysroot",
+        "crate_name": "alloc",
+        "rlibs": [
+          "libcompiler_builtins.rust_sysroot",
+          "libcore.rust_sysroot"
+        ],
+        "source_declaration_sha256": "5ebf9e12c1f7089d29f3d078210ef861ad070d357932b7e1cf0af7aab1c28bf0",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "libcore.rust_sysroot",
+        "crate_name": "core",
+        "rlibs": [],
+        "source_declaration_sha256": "6a101bba43fd5444af6a790b1d0c8e8968bbe25d049e47f3b603a551ebee5e34",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "liblibc.rust_sysroot",
+        "crate_name": "libc",
+        "rlibs": [
+          "libcompiler_builtins.rust_sysroot",
+          "libcore.rust_sysroot"
+        ],
+        "source_declaration_sha256": "42edc11e91dd6314a259e1dad2b8b821ca322fb23bf940bc8b6ec19e3bfa305b",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "libunwind.rust_sysroot",
+        "crate_name": "unwind",
+        "rlibs": [
+          "libcompiler_builtins.rust_sysroot",
+          "libcore.rust_sysroot",
+          "liblibc.rust_sysroot",
+          "libcfg_if.rust_sysroot"
+        ],
+        "source_declaration_sha256": "37800b6a37eed523b9e094cf02d3b69ffb96ff851fa9d67864881ecda9ec352f",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "libcompiler_builtins.rust_sysroot",
+        "crate_name": "compiler_builtins",
+        "rlibs": [
+          "libcore.rust_sysroot"
+        ],
+        "source_declaration_sha256": "63e6ee653204faf3a6734909f03913551497727b2b178e5cda66f777d06324c4",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "libcfg_if.rust_sysroot",
+        "crate_name": "cfg_if",
+        "rlibs": [
+          "libcompiler_builtins.rust_sysroot",
+          "libcore.rust_sysroot"
+        ],
+        "source_declaration_sha256": "53c7f2bcdaa295126de0ff47e96cb2b524cdc4ff4f22632c073814c16a8662be",
+        "declaration_file": "Android.bp"
+      },
+      {
+        "module": "libpanic_abort.rust_sysroot",
+        "crate_name": "panic_abort",
+        "rlibs": [
+          "liballoc.rust_sysroot",
+          "libcompiler_builtins.rust_sysroot",
+          "libcore.rust_sysroot",
+          "libcfg_if.rust_sysroot",
+          "liblibc.rust_sysroot"
+        ],
+        "source_declaration_sha256": "22422a8faa41fcba7edefc8f7deb5934ba448f87f3179df5cb5a4bfe833a3131",
+        "declaration_file": "Android.bp"
+      }
+    ],
+    "unchanged_runtime_source_identities": [
+      {
+        "file": "linux-x86/1.88.0/lib/rustlib/src/rust/library/panic_unwind/src/lib.rs",
+        "sha256": "5e367529b8f1e54f1a7a6e58546ef9a05c3b9388aa50e7dee0d24c0e57f3daeb",
+        "change": "none"
+      },
+      {
+        "file": "linux-x86/1.88.0/lib/rustlib/src/rust/library/unwind/src/lib.rs",
+        "sha256": "faad4d571c74ca4dd8c42bf6342020b4e4a218aa77afe7e121acd2729a913fc5",
+        "change": "none"
+      },
+      {
+        "file": "linux-x86/1.88.0/lib/rustlib/src/rust/library/std/src/lib.rs",
+        "sha256": "6e2b40d37cede91bf1fcd3245cee52b3a1d3f34328978a67bf33bfdc4fcd3a42",
+        "change": "none"
+      }
+    ],
+    "native_unwind_linkage": "The pinned Android unwind crate already links unwind and dl; existing native link rules and compiler flags are preserved",
+    "panic_runtime_selection": "Pinned std needs a compiler-selected panic runtime. Exposing abort and unwind directories does not force both runtimes into a binary; rustc selects using the requested panic strategy",
+    "forbidden_new_features": [
+      "llvm-libunwind on Android"
+    ],
+    "scope": "Add only the existing panic_unwind rlib to libstd target.android in the disposable CI tree; no rlib transplant, new BP property or source-lock ref change",
+    "verification_scope": "Exact BP before/after hashes, unchanged full runtime declarations/source identities and Git replay verified locally; complete Android build and actual device panic/RM behavior require separate execution"
+  }
+}

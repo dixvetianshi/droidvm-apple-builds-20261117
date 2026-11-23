@@ -1,0 +1,18 @@
+Verifies
+Verified using v1 scheme (JAR signing): false
+Verified using v2 scheme (APK Signature Scheme v2): false
+Verified using v3 scheme (APK Signature Scheme v3): true
+Verified using v3.1 scheme (APK Signature Scheme v3.1): false
+Verified using v3.2 scheme (APK Signature Scheme v3.2): false
+Verified using v4 scheme (APK Signature Scheme v4): false
+Verified for SourceStamp: false
+Number of signers: 1
+V3.0 Signer: certificate DN: CN=DroidVM Apple Local Build, O=Personal Build, C=CN
+V3.0 Signer: certificate SHA-256 digest: 9640c926d5d842d2f51eb418707b5a864bb4171f0b414bdbbec67bfdc62727bd
+V3.0 Signer: certificate SHA-1 digest: aa66a28901b633a5a26f33342fbe2924280c1bdf
+V3.0 Signer: certificate MD5 digest: ad2ed467a037e5a4fe783dac970ec475
+V3.0 Signer: key algorithm: RSA
+V3.0 Signer: key size (bits): 4096
+V3.0 Signer: public key SHA-256 digest: c35d462be94707e06117c9b3648f42f7ce9a414deb717cb26e5ed0540b3237bf
+V3.0 Signer: public key SHA-1 digest: 530bf708814e873a43deb9bfc7b7c8aea4df784b
+V3.0 Signer: public key MD5 digest: dddd92cc537ddff856d149a74fb3543c

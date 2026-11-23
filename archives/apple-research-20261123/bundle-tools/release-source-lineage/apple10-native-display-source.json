@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "project_path": "packages/modules/Virtualization",
+  "repository": "https://github.com/Droid-VM/Virtualization",
+  "base_commit": "c8c132c55d7d5932966e8b2f262e2f86d676cbb1",
+  "patch_sha256": "f274fc8217f8d87f27647904bc78d38bd4b31f9df9510957377ed69812134c8f",
+  "files": [
+    {
+      "file": "libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl",
+      "pinned_sha256": "d325349d79871d5ca410e0c0eaac14ab5d77dc7705b72f8ca13b525e462aada7",
+      "final_lf_sha256": "c2b3bc11271d36e58b14d8591f018af33f95efc7d3ac5dcd44c8f6d027765e39",
+      "new_file": false
+    },
+    {
+      "file": "libs/android_display_backend/crosvm_android_display_client.cpp",
+      "pinned_sha256": "47d833cf2832ce6c63e4f6e28e6458dd66a3b8d7b2880ca02f7f6e15159e6e61",
+      "final_lf_sha256": "9926b7c320362a2351998bdd6629ac4fb41976e841d78fd1347446396b43874d",
+      "new_file": false
+    },
+    {
+      "file": "libs/android_display_backend/surface_attachment_owner.h",
+      "pinned_sha256": null,
+      "final_lf_sha256": "25874650909419f6034c206f22d83d13167a6f546df725f2136791649c220d00",
+      "new_file": true
+    }
+  ],
+  "source_provenance": {
+    "first_stage_patch_sha256": "508c025223e29868eb3e9b1f4638d7f41b869221cfb6802c79949e5a6452fbcc",
+    "owned_bindings_patch_sha256": "bccdc2f7e1797ececb552f9d78449dfe0a98a15311fef0c7a28d50a6b91ec414",
+    "owned_bindings_patch_original_strip": 3,
+    "candidate_manifest_sha256": "1394e9931fc4e70a86c4d5d92d5534873b6ccc5d27f66657bc9829a88a08fd73",
+    "pinned_public_aidl_url": "https://raw.githubusercontent.com/Droid-VM/Virtualization/c8c132c55d7d5932966e8b2f262e2f86d676cbb1/libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl",
+    "pinned_public_aidl_sha256": "d325349d79871d5ca410e0c0eaac14ab5d77dc7705b72f8ca13b525e462aada7",
+    "first_stage_cpp_before_sha256": "47d833cf2832ce6c63e4f6e28e6458dd66a3b8d7b2880ca02f7f6e15159e6e61",
+    "first_stage_cpp_after_sha256": "df3a45d4dede4cac0b0d944a04069fad1d374c8da7b4fd0d721d54405fab5986"
+  },
+  "stages": [
+    {
+      "name": "Existing Apple8 display owner source",
+      "patch_sha256": "508c025223e29868eb3e9b1f4638d7f41b869221cfb6802c79949e5a6452fbcc",
+      "files": [
+        {
+          "file": "libs/android_display_backend/crosvm_android_display_client.cpp",
+          "before_sha256": "47d833cf2832ce6c63e4f6e28e6458dd66a3b8d7b2880ca02f7f6e15159e6e61",
+          "after_sha256": "df3a45d4dede4cac0b0d944a04069fad1d374c8da7b4fd0d721d54405fab5986"
+        }
+      ]
+    },
+    {
+      "name": "Paired owned-display bindings",
+      "patch_sha256": "bccdc2f7e1797ececb552f9d78449dfe0a98a15311fef0c7a28d50a6b91ec414",
+      "files": [
+        {
+          "file": "libs/android_display_backend/aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl",
+          "before_sha256": "d325349d79871d5ca410e0c0eaac14ab5d77dc7705b72f8ca13b525e462aada7",
+          "after_sha256": "c2b3bc11271d36e58b14d8591f018af33f95efc7d3ac5dcd44c8f6d027765e39"
+        },
+        {
+          "file": "libs/android_display_backend/crosvm_android_display_client.cpp",
+          "before_sha256": "df3a45d4dede4cac0b0d944a04069fad1d374c8da7b4fd0d721d54405fab5986",
+          "after_sha256": "9926b7c320362a2351998bdd6629ac4fb41976e841d78fd1347446396b43874d"
+        },
+        {
+          "file": "libs/android_display_backend/surface_attachment_owner.h",
+          "before_sha256": null,
+          "after_sha256": "25874650909419f6034c206f22d83d13167a6f546df725f2136791649c220d00"
+        }
+      ]
+    }
+  ],
+  "paired_aidl_sha256": "c2b3bc11271d36e58b14d8591f018af33f95efc7d3ac5dcd44c8f6d027765e39",
+  "scope": "App/native display API must ship together; native C++/AIDL/header source only, no phone/system/module changes",
+  "verification_scope": "All three baseline/final identities and both-stage/composite Git replay checked locally. Full Soong/AIDL/C++ compilation and Android Surface/Vulkan/guest operation remain separate."
+}

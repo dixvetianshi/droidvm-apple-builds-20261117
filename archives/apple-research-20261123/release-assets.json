@@ -1,0 +1,25 @@
+{
+  "assets": [
+    {
+      "name": "DroidVM-Apple10-source.tar.gz",
+      "bytes": 1531035,
+      "sha256": "5e61c950c539e82a3c512a1822eb0e84758300ac7c70cd0ccc04e7093887bf55"
+    },
+    {
+      "name": "DroidVM-0.0.6-r242-Apple10-NX736J.apk",
+      "bytes": 126264052,
+      "sha256": "e2059599416aa3275315c521510949c232ee570628a55d9337b74d29822ddaea"
+    },
+    {
+      "name": "crosvm-native-run-45047307062-original.zip",
+      "bytes": 99875996,
+      "sha256": "4f709c1f0cb7c4e906228ca9cb319cb7d23ee3a711afed206d3861c3c87c247b"
+    },
+    {
+      "name": "hostshare-lease-run-45029535267-original.zip",
+      "bytes": 1756750,
+      "sha256": "1f3110d714d8ad2d5576ae0c8fd905a44523be07d9d9ad0c948d25a996fbd068"
+    }
+  ],
+  "Apple_disk_images_and_private_data_excluded": true
+}

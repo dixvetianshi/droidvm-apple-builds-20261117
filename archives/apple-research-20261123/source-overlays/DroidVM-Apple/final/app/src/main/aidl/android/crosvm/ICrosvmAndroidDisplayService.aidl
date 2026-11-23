@@ -1,0 +1,63 @@
+/*
+ * Copyright 2024 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package android.crosvm;
+
+import android.crosvm.DisplayConfig;
+import android.os.ParcelFileDescriptor;
+import android.view.Surface;
+
+/**
+ * Service to provide Crosvm with an Android Surface for showing a guest's
+ * display.
+ */
+interface ICrosvmAndroidDisplayService {
+    void setSurface(inout Surface surface, boolean forCursor);
+    void setCursorStream(in ParcelFileDescriptor stream);
+    void removeSurface(boolean forCursor);
+    void saveFrameForSurface(boolean forCursor);
+    void drawSavedFrameForSurface(boolean forCursor);
+
+    /**
+     * Current guest scanout configuration (single source of truth for the display size, updated on
+     * every resolution change: UEFI modeset, guest boot, and guest runtime xrandr all flow through
+     * the same configure() path). The app polls this to follow a mid-session resolution change.
+     * Methods are only ever appended, so every binder transaction code matches the app's copy.
+     */
+    DisplayConfig getDisplayConfig();
+
+    /**
+     * Rotate or flip the pictures queued to a surface: an ANATIVEWINDOW_TRANSFORM_* value, applied
+     * with ANativeWindow_setBuffersTransform (0, the default, is none). The guest's buffers keep
+     * their size and the compositor turns them, so with a 90 or 270 degree transform the picture is
+     * as wide as the buffers are tall, and the size the presenter asks of its Surface must follow.
+     * It holds across setSurface. A backend without it fails the call (unknown transaction).
+     */
+    void setSurfaceTransform(int transform, boolean forCursor);
+
+    /** session=0 claims a new foreground binding; positive sessions only update their own binding. */
+    long setSurfaceForSession(in Surface surface, long session, boolean forCursor);
+
+    /** Detach only this binding. Keep the session for surface recreation unless endSession=true. */
+    boolean removeSurfaceForSession(long session, boolean forCursor, boolean endSession);
+
+    /** Replay only if this binding still owns the destination plane. */
+    void drawSavedFrameForSession(long session, boolean forCursor);
+
+    /** Cursor pipe belongs to the current scanout binding. */
+    boolean setCursorStreamForSession(in ParcelFileDescriptor stream, long session);
+    void clearCursorStreamForSession(long session);
+}

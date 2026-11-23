@@ -1,0 +1,164 @@
+name: iPadOS 27.0.1 image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipados-image-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_KEY: ${{ secrets.ARTIFACT_KEY }}
+      UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+    steps:
+      - name: Check out the build instructions
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Check the runner and secrets
+        run: |
+          test -n "$ARTIFACT_KEY" || { echo '::error::ARTIFACT_KEY secret is required'; exit 1; }
+          [[ "$UNIXNU_UNIQUE_CHIP_ID" =~ ^[0-9a-fA-F]{16}$ ]] || { echo '::error::UNIXNU_UNIQUE_CHIP_ID must contain 16 hexadecimal digits'; exit 1; }
+          test -d "$DEVELOPER_DIR" || { echo '::error::The selected runner does not contain Xcode 27.1'; exit 1; }
+          mkdir -p verification/ipados-diagnostics
+          {
+            sw_vers
+            uname -m
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            df -h "$GITHUB_WORKSPACE"
+          } 2>&1 | tee verification/ipados-diagnostics/runner.txt
+      - name: Reclaim the unused Xcode version on this disposable runner
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          selected = Path(os.environ['DEVELOPER_DIR']).resolve(strict=True).parents[1]
+          unused = Path('/Applications/Xcode_27.2.app')
+          if unused.exists():
+              resolved = unused.resolve(strict=True)
+              if resolved == selected:
+                  print('The extra Xcode path resolves to the selected build tools; keeping it.')
+              elif resolved.is_relative_to(Path('/Applications')):
+                  print(json.dumps({'disposable_runner_cleanup': str(unused), 'selected_xcode': str(selected)}))
+                  subprocess.run(['sudo', 'rm', '-rf', '--', str(unused)], check=True)
+              else:
+                  raise SystemExit('The unused Xcode path resolves outside the named Applications directory.')
+          else:
+              print('No separate Xcode 27.2 installation is present.')
+          PY
+          df -h "$GITHUB_WORKSPACE" | tee verification/ipados-diagnostics/after-runner-cleanup.txt
+      - name: Install the required tools on this disposable runner
+        run: |
+          brew install llvm lld mtools dtc unifdef cmake ninja meson pkg-config openssl@3 glslang bison flex gnu-sed shaderc spirv-tools blacktop/tap/ipsw
+          python3 -m pip install zstandard lz4
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src --target aarch64-apple-ios
+      - name: Verify encrypted streaming with synthetic data
+        run: |
+          # This checks the real runner tools without reading either build secret.
+          check_root=$(mktemp -d "$RUNNER_TEMP/ipados-stream-check.XXXXXX")
+          mkdir -p "$check_root/input" "$check_root/restored" verification/ipados-diagnostics
+          export IPADOS_STREAM_TEST_KEY
+          IPADOS_STREAM_TEST_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+          python3 -c 'import os, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(os.urandom(64 * 1024))' "$check_root/input/sample.bin"
+          tar -czf - -C "$check_root/input" . | \
+            openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:IPADOS_STREAM_TEST_KEY | \
+            split -b 16k -d -a 3 - "$check_root/test.enc."
+          parts=("$check_root/test.enc."[0-9][0-9][0-9])
+          test "${#parts[@]}" -gt 1
+          shasum -a 256 "${parts[@]}" > "$check_root/parts.sha256"
+          shasum -a 256 -c "$check_root/parts.sha256"
+          cat "${parts[@]}" | \
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:IPADOS_STREAM_TEST_KEY | \
+            tar -xzf - -C "$check_root/restored"
+          cmp "$check_root/input/sample.bin" "$check_root/restored/sample.bin"
+          test ! -e "$check_root/test.enc"
+          unset IPADOS_STREAM_TEST_KEY
+          printf 'synthetic_streaming_roundtrip=passed\nsynthetic_input_bytes=65536\nchunk_count=%s\n' "${#parts[@]}" | tee verification/ipados-diagnostics/stream-check.txt
+      - name: Verify APFS clone staging with synthetic sparse data
+        run: |
+          python3 - "$GITHUB_WORKSPACE" <<'PY'
+          import hashlib, json, subprocess, sys, tempfile
+          from pathlib import Path
+          diagnostic = Path(sys.argv[1]) / 'verification/ipados-diagnostics'
+          diagnostic.mkdir(parents=True, exist_ok=True)
+          source = diagnostic / 'apfs-clone-source.bin'
+          logical_bytes = 128 * 1024**2
+          with source.open('xb') as stream:
+              stream.truncate(logical_bytes)
+              stream.write(b'synthetic-sparse-source')
+              stream.seek(logical_bytes - 1)
+              stream.write(b'Z')
+          scratch = Path(tempfile.mkdtemp(prefix='droidvm-apfs-check-', dir='/tmp'))
+          clone = scratch / 'clone.bin'
+          def digest(path):
+              sha = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(1024**2), b''):
+                      sha.update(chunk)
+              return sha.hexdigest()
+          expected = digest(source)
+          subprocess.run(['cp', '-c', str(source), str(clone)], check=True)
+          source_stat, clone_stat = source.stat(), clone.stat()
+          assert source_stat.st_dev == clone_stat.st_dev
+          assert source_stat.st_ino != clone_stat.st_ino
+          assert clone_stat.st_size == logical_bytes
+          allocated = clone_stat.st_blocks * 512
+          assert allocated < 1024**2, 'The clone materialized the sparse logical extent'
+          assert digest(clone) == expected
+          with clone.open('r+b') as stream:
+              stream.seek(4096)
+              stream.write(b'clone-only-write')
+          assert digest(source) == expected, 'The staging write changed the source'
+          report = {'fixture_only': True, 'logical_bytes': logical_bytes,
+                    'clone_allocated_bytes_before_write': allocated,
+                    'workspace_and_tmp_same_volume': True,
+                    'logical_content_verified': True,
+                    'source_preserved_after_clone_write': True}
+          (diagnostic / 'apfs-clone-check.txt').write_text(json.dumps(report) + '\n')
+          print(json.dumps(report))
+          PY
+      - name: Build from the pinned public sources and Apple IPSW
+        run: bash tools/build_ipados_ci.sh
+      - name: Upload encrypted build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipados-27.0.1-${{ github.run_number }}-encrypted
+          path: output/ipados-27.0.1.tar.gz.enc.*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Record final disk availability
+        if: always()
+        run: |
+          mkdir -p verification/ipados-diagnostics
+          df -h "$GITHUB_WORKSPACE" | tee verification/ipados-diagnostics/final-disk.txt
+      - name: Upload task diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipados-27.0.1-${{ github.run_number }}-diagnostics
+          # Only controlled runner output and the redacted console; private
+          # upstream logs, environment dumps and identity records stay excluded.
+          path: verification/ipados-diagnostics/*.txt
+          if-no-files-found: warn
+          retention-days: 14

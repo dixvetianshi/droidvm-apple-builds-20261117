@@ -1,0 +1,148 @@
+<?xml version='1.0' encoding='utf-8'?>
+<issues format="6" by="lint 9.2.1" type="baseline" client="gradle" dependencies="false" name="DroidVM Apple" variant="release">
+    <!--Only these observed inheritance diagnostics are baselined. All 48 compiled class hierarchies were checked against the exact runtime dependencies and Android SDK; other fatal lint rules remain enabled.-->
+    <issue id="Instantiatable" message="`SplashActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="44" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`SetupActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="55" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`MainActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="62" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMEditActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="69" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMInfoActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="76" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMConsoleActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="83" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMVncDisplayActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="90" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMVncPresentationActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="97" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMNativeDisplayActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="104" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMPkgExportActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="111" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMPkgImportActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="118" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`ImportLxcImagesActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="138" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`CreateLinuxVmActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="145" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`ImportImagesActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="152" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`ImportURLActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="159" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`DiskOperationActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="166" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`ChangePasswordActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="173" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`AgentOperationActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="180" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`DiskCreateActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="187" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`DiskInfoActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="194" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`VMNotesActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="201" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`NetworkEditActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="208" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`NetworkInfoActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="215" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`NetworkToolLogActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="222" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`LogsActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="229" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`HugePageActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="236" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`HugePageAdvancedActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="243" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`HugePageProcessActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="250" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`UsbRulesActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="257" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`UsbDevicesActivity` must extend android.app.Activity">
+        <location file="src/main/AndroidManifest.xml" line="264" column="27" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialToolbar` must extend android.view.View">
+        <location file="src/main/res/layout/activity_agent_operation.xml" line="12" column="5" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialButton` must extend android.view.View">
+        <location file="src/main/res/layout/activity_agent_operation.xml" line="74" column="9" />
+    </issue>
+    <issue id="Instantiatable" message="`TextInputEditText` must extend android.view.View">
+        <location file="src/main/res/layout/activity_change_password.xml" line="60" column="17" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialSwitch` must extend android.view.View">
+        <location file="src/main/res/layout/activity_change_password.xml" line="86" column="13" />
+    </issue>
+    <issue id="Instantiatable" message="`FloatingActionButton` must extend android.view.View">
+        <location file="src/main/res/layout/activity_change_password.xml" line="102" column="5" />
+    </issue>
+    <issue id="Instantiatable" message="`Chip` must extend android.view.View">
+        <location file="src/main/res/layout/activity_disk_create.xml" line="88" column="21" />
+    </issue>
+    <issue id="Instantiatable" message="`AdaptiveTabLayout` must extend android.view.View">
+        <location file="src/main/res/layout/activity_disk_info.xml" line="31" column="9" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialCardView` must extend android.view.View">
+        <location file="src/main/res/layout/activity_hugepage.xml" line="37" column="13" />
+    </issue>
+    <issue id="Instantiatable" message="`ExtendedFloatingActionButton` must extend android.view.View">
+        <location file="src/main/res/layout/activity_import_images.xml" line="198" column="5" />
+    </issue>
+    <issue id="Instantiatable" message="`CircularProgressIndicator` must extend android.view.View">
+        <location file="src/main/res/layout/activity_import_lxc_images.xml" line="95" column="21" />
+    </issue>
+    <issue id="Instantiatable" message="`BottomNavigationView` must extend android.view.View">
+        <location file="src/main/res/layout/activity_main.xml" line="54" column="5" />
+    </issue>
+    <issue id="Instantiatable" message="`ComposeView` must extend android.view.View">
+        <location file="src/main/res/layout/activity_vm_info.xml" line="240" column="17" />
+    </issue>
+    <issue id="Instantiatable" message="`NativeKeyboardEditText` must extend android.view.View">
+        <location file="src/main/res/layout/activity_vm_native_display.xml" line="98" column="9" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialButtonToggleGroup` must extend android.view.View">
+        <location file="src/main/res/layout/activity_vm_notes.xml" line="24" column="13" />
+    </issue>
+    <issue id="Instantiatable" message="`VncDisplayView` must extend android.view.View">
+        <location file="src/main/res/layout/activity_vm_vnc_display.xml" line="65" column="9" />
+    </issue>
+    <issue id="Instantiatable" message="`LinearProgressIndicator` must extend android.view.View">
+        <location file="src/main/res/layout/activity_vmpkg_export.xml" line="179" column="13" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialCheckBox` must extend android.view.View">
+        <location file="src/main/res/layout/dialog_disk_resize.xml" line="49" column="5" />
+    </issue>
+    <issue id="Instantiatable" message="`MaterialRadioButton` must extend android.view.View">
+        <location file="src/main/res/layout/fragment_setup_step_network.xml" line="52" column="13" />
+    </issue>
+</issues>

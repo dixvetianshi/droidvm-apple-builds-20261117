@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package cn.classfun.droidvm.daemon.vm;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.junit.Test;
+
+public final class AppleVmHostNodePublicationTest {
+    private static final long MILLISECOND = 1_000_000L;
+    private static final long DEADLINE = 2_000 * MILLISECOND;
+    private static final AppleVmHostCapabilities.Device READY = AppleVmHostCapabilities.Device.READY;
+    private static final AppleVmHostCapabilities.Device MISSING = AppleVmHostCapabilities.Device.MISSING;
+    private static final AppleVmHostCapabilities.Device UNUSABLE = AppleVmHostCapabilities.Device.UNUSABLE;
+
+    private static final class FakeHost implements AppleVmHostCapabilities.Host {
+        long now, elapsed, readyAt = Long.MAX_VALUE, unusableAt = Long.MAX_VALUE;
+        long moduleDisappearsAt = Long.MAX_VALUE, deviceThrowsAt = Long.MAX_VALUE;
+        long firstDeviceCost, secondDeviceCost, secondModuleCost, sleepOverrun, lastDeviceProbeElapsed = -1;
+        int loads, postLoadDeviceReads, postLoadModuleReads;
+        boolean presentBeforeLoad, presentAfterLoad = true, interruptSleep, interruptAfterLoad, interruptSecondProbe;
+        AppleVmHostCapabilities.Device immediate = MISSING;
+        final List<Long> sleeps = new ArrayList<>();
+
+        @Override public String profileProblem() { return null; }
+        @Override public String platformProblem() { return null; }
+        @Override public boolean privateModuleVerified(AppleVmHostCapabilities.Driver driver) {
+            assertEquals(AppleVmHostCapabilities.Driver.HOST_SHARE, driver);
+            return true;
+        }
+        @Override public int insmodWithoutParameters(AppleVmHostCapabilities.Driver driver) {
+            assertEquals(AppleVmHostCapabilities.Driver.HOST_SHARE, driver);
+            assertEquals("A second load is forbidden", 0, loads);
+            loads++;
+            if (interruptAfterLoad) Thread.currentThread().interrupt();
+            return 0;
+        }
+        @Override public AppleVmHostCapabilities.Device device(String path) throws IOException {
+            assertEquals("/dev/gunyah_share", path);
+            if (loads == 0) return MISSING;
+            postLoadDeviceReads++;
+            lastDeviceProbeElapsed = elapsed;
+            if (elapsed >= deviceThrowsAt) throw new IOException("Fake node probe failure");
+            AppleVmHostCapabilities.Device result = elapsed >= unusableAt ? UNUSABLE
+                : elapsed >= readyAt ? READY : immediate;
+            if (postLoadDeviceReads == 1) advance(firstDeviceCost);
+            if (postLoadDeviceReads == 2) {
+                advance(secondDeviceCost);
+                if (interruptSecondProbe) Thread.currentThread().interrupt();
+            }
+            return result;
+        }
+        @Override public boolean modulePresent(AppleVmHostCapabilities.Driver driver) {
+            assertEquals(AppleVmHostCapabilities.Driver.HOST_SHARE, driver);
+            if (loads == 0) return presentBeforeLoad;
+            postLoadModuleReads++;
+            boolean result = presentAfterLoad && elapsed < moduleDisappearsAt;
+            if (postLoadModuleReads == 2) advance(secondModuleCost);
+            return result;
+        }
+        @Override public long monotonicNanos() { return now; }
+        @Override public void sleepNanos(long nanos) throws InterruptedException {
+            assertTrue("Sleep must be positive", nanos > 0);
+            assertTrue("Each wait must be at most 50 ms", nanos <= 50 * MILLISECOND);
+            sleeps.add(nanos);
+            if (interruptSleep) throw new InterruptedException("Fake interruption");
+            advance(nanos + sleepOverrun);
+        }
+        private void advance(long nanos) {
+            now += nanos;
+            elapsed += nanos;
+        }
+    }
+
+    private static String start(FakeHost host) {
+        return AppleVmHostCapabilities.acquireForStart(true, false, true, host);
+    }
+
+    private static void assertLoadedOnce(FakeHost host) {
+        assertEquals("Only the first load is authorized", 1, host.loads);
+    }
+
+    private static void assertObservedProblem(String problem, String after, boolean present) {
+        assertNotNull(problem);
+        assertTrue(problem, problem.contains("after=" + after));
+        assertTrue(problem, problem.contains("present=" + present));
+    }
+
+    @Test public void delayedNodePublicationSucceedsWithOneLoadAcrossNanoTimeWrap() {
+        FakeHost host = new FakeHost();
+        host.now = Long.MAX_VALUE - 75 * MILLISECOND;
+        host.readyAt = 125 * MILLISECOND;
+        assertNull(start(host));
+        assertLoadedOnce(host);
+        assertEquals(150 * MILLISECOND, host.elapsed);
+        assertEquals(3, host.sleeps.size());
+        assertTrue("The test crosses nanoTime overflow", host.now < 0);
+        assertTrue(host.lastDeviceProbeElapsed < DEADLINE);
+    }
+
+    @Test public void deadlineClipsFinalSleepAndRejectsLatePublicationAndProbes() {
+        FakeHost exact = new FakeHost();
+        exact.firstDeviceCost = 120 * MILLISECOND;
+        exact.readyAt = DEADLINE;
+        String problem = start(exact);
+        assertObservedProblem(problem, "MISSING", true);
+        assertTrue(problem, problem.contains("deadline exceeded"));
+        assertLoadedOnce(exact);
+        assertEquals(DEADLINE, exact.elapsed);
+        assertEquals(Long.valueOf(30 * MILLISECOND), exact.sleeps.get(exact.sleeps.size() - 1));
+        assertTrue("No node probe may start at the deadline", exact.lastDeviceProbeElapsed < DEADLINE);
+
+        FakeHost overslept = new FakeHost();
+        overslept.readyAt = 50 * MILLISECOND;
+        overslept.sleepOverrun = DEADLINE;
+        problem = start(overslept);
+        assertObservedProblem(problem, "MISSING", true);
+        assertTrue(problem, problem.contains("deadline exceeded"));
+        assertLoadedOnce(overslept);
+        assertEquals(1, overslept.postLoadDeviceReads);
+        assertEquals(1, overslept.postLoadModuleReads);
+
+        FakeHost slowProbe = new FakeHost();
+        slowProbe.readyAt = 50 * MILLISECOND;
+        slowProbe.secondModuleCost = DEADLINE;
+        problem = start(slowProbe);
+        assertObservedProblem(problem, "READY", true);
+        assertTrue(problem, problem.contains("deadline exceeded"));
+        assertLoadedOnce(slowProbe);
+        assertEquals(1, slowProbe.sleeps.size());
+
+        FakeHost slowNodeProbe = new FakeHost();
+        slowNodeProbe.readyAt = 50 * MILLISECOND;
+        slowNodeProbe.secondDeviceCost = DEADLINE;
+        problem = start(slowNodeProbe);
+        assertObservedProblem(problem, "READY", true);
+        assertTrue(problem, problem.contains("deadline exceeded"));
+        assertLoadedOnce(slowNodeProbe);
+        assertEquals("An expired node probe must not start another module probe", 1, slowNodeProbe.postLoadModuleReads);
+    }
+
+    @Test public void unusableAbsentAndUnknownStatesRefuseWithoutFurtherWaiting() {
+        FakeHost unusable = new FakeHost();
+        unusable.immediate = UNUSABLE;
+        assertObservedProblem(start(unusable), "UNUSABLE", true);
+        assertLoadedOnce(unusable);
+        assertTrue(unusable.sleeps.isEmpty());
+
+        FakeHost absent = new FakeHost();
+        absent.immediate = READY;
+        absent.presentAfterLoad = false;
+        assertObservedProblem(start(absent), "READY", false);
+        assertLoadedOnce(absent);
+        assertTrue(absent.sleeps.isEmpty());
+
+        FakeHost disappeared = new FakeHost();
+        disappeared.moduleDisappearsAt = 50 * MILLISECOND;
+        assertObservedProblem(start(disappeared), "MISSING", false);
+        assertLoadedOnce(disappeared);
+        assertEquals(1, disappeared.sleeps.size());
+
+        FakeHost changedType = new FakeHost();
+        changedType.unusableAt = 50 * MILLISECOND;
+        assertObservedProblem(start(changedType), "UNUSABLE", true);
+        assertLoadedOnce(changedType);
+        assertEquals(1, changedType.sleeps.size());
+        assertEquals("An unusable node stops further probing", 1, changedType.postLoadModuleReads);
+
+        FakeHost unknown = new FakeHost();
+        unknown.deviceThrowsAt = 50 * MILLISECOND;
+        String problem = start(unknown);
+        assertNotNull(problem);
+        assertTrue(problem, problem.contains("IOException"));
+        assertLoadedOnce(unknown);
+        assertEquals(1, unknown.sleeps.size());
+
+        FakeHost existingModule = new FakeHost();
+        existingModule.presentBeforeLoad = true;
+        problem = start(existingModule);
+        assertNotNull(problem);
+        assertTrue(problem, problem.contains("no reload"));
+        assertEquals(0, existingModule.loads);
+        assertTrue(existingModule.sleeps.isEmpty());
+    }
+
+    @Test public void interruptionRestoresFlagAndStopsAdditionalProbes() {
+        assertFalse("Test thread must begin un-interrupted", Thread.currentThread().isInterrupted());
+        try {
+            FakeHost interruptedSleep = new FakeHost();
+            interruptedSleep.interruptSleep = true;
+            String problem = start(interruptedSleep);
+            assertObservedProblem(problem, "MISSING", true);
+            assertTrue(problem, problem.contains("interrupted"));
+            assertLoadedOnce(interruptedSleep);
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertEquals(1, interruptedSleep.postLoadDeviceReads);
+            assertEquals(1, interruptedSleep.postLoadModuleReads);
+            assertEquals(1, interruptedSleep.sleeps.size());
+            assertTrue(Thread.interrupted());
+
+            FakeHost alreadyInterrupted = new FakeHost();
+            alreadyInterrupted.interruptAfterLoad = true;
+            problem = start(alreadyInterrupted);
+            assertObservedProblem(problem, "MISSING", true);
+            assertTrue(problem, problem.contains("interrupted"));
+            assertLoadedOnce(alreadyInterrupted);
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertTrue(alreadyInterrupted.sleeps.isEmpty());
+            assertTrue(Thread.interrupted());
+
+            FakeHost interruptedProbe = new FakeHost();
+            interruptedProbe.readyAt = 50 * MILLISECOND;
+            interruptedProbe.interruptSecondProbe = true;
+            problem = start(interruptedProbe);
+            assertObservedProblem(problem, "READY", true);
+            assertTrue(problem, problem.contains("interrupted"));
+            assertLoadedOnce(interruptedProbe);
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertEquals(1, interruptedProbe.postLoadModuleReads);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+}

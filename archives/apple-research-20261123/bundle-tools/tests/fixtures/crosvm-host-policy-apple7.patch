@@ -1,0 +1,828 @@
+--- a/hypervisor/src/gunyah/mod.rs
++++ b/hypervisor/src/gunyah/mod.rs
+@@ -105,6 +105,7 @@
+ fn prepare_shared_framebuffer(
+     region: &MemoryRegionInformation<'_>,
+     mthp_enabled: bool,
++    host_memory_policy: HostMemoryPolicy,
+ ) -> FramebufferPrep {
+     const THP_SIZE: u64 = 2 << 20;
+     let size = region.size as u64;
+@@ -129,10 +130,15 @@
+         // of the guest memfd at `shm_offset` -- and the branch above has established that it is
+         // 2 MiB-granular and congruent. Nothing else has touched these pages yet: no vcpu is
+         // running and the bridge that will read them does not exist.
+-        match unsafe { mthp::fold_mapped_range(region.host_addr as *mut u8, size) } {
+-            Ok(coverage) => Ok(coverage),
+-            Err(e) => Err(format!("folding the region into 2 MiB folios failed: {e}")),
+-        }
++        let capacity = if host_memory_policy == HostMemoryPolicy::ReadOnly {
++            mthp::require_existing_reserve(size)
++        } else {
++            Ok(())
++        };
++        capacity.and_then(|()| {
++            unsafe { mthp::fold_mapped_range(region.host_addr as *mut u8, size) }
++                .map_err(|e| format!("folding the region into 2 MiB folios failed: {e}"))
++        })
+     };
+ 
+     let (coverage, verdict) = match prepared {
+@@ -499,7 +505,9 @@
+                     // Full preparation: drop caches, populate in batches,
+                     // MADV_COLLAPSE to 2 MiB (leave the rest at 4 KiB), mlock.
+                     // SAFETY: host_ptr is a valid mapping of region_size bytes.
+-                    let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size) };
++                    let prep = unsafe {
++                        mthp::prepare_lend_region(host_ptr, region_size, cfg.host_memory_policy)
++                    }?;
+                     if !prep.populated {
+                         error!(
+                             "GH: guest RAM region gpa={:#x} size={:#x} failed to populate \
+@@ -656,8 +664,9 @@
+                         mthp::prepare_lend_region(
+                             region.host_addr as *mut u8,
+                             boot_share_len,
++                            cfg.host_memory_policy,
+                         )
+-                    };
++                    }?;
+                     if !prep.populated {
+                         // Host-alloc must fail loudly: proceeding to SHARE an unbacked
+                         // pool means the guest eventually SIGBUSes deep inside its GPU
+@@ -703,8 +712,12 @@
+                 if region.options.purpose == MemoryRegionPurpose::SharedGuestRam {
+                     // SAFETY: host_addr is a valid mapping of region.size bytes.
+                     let prep = unsafe {
+-                        mthp::prepare_lend_region(region.host_addr as *mut u8, full_size)
+-                    };
++                        mthp::prepare_lend_region(
++                            region.host_addr as *mut u8,
++                            full_size,
++                            cfg.host_memory_policy,
++                        )
++                    }?;
+                     if !prep.populated || !prep.mlocked {
+                         error!(
+                             "GH-SHIM: window gpa={:#x} size={:#x} could not be populated and \
+@@ -749,8 +762,17 @@
+                 // one thing that reads it is the GPU transport that cannot survive being wrong.
+                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                 if region.options.purpose == MemoryRegionPurpose::SharedFramebuffer {
+-                    let prep =
+-                        prepare_shared_framebuffer(&region, cfg.prepare_lend_mthp.is_some());
++                    let prep = prepare_shared_framebuffer(
++                        &region,
++                        cfg.prepare_lend_mthp.is_some(),
++                        cfg.host_memory_policy,
++                    );
++                    if cfg.host_memory_policy == HostMemoryPolicy::ReadOnly
++                        && !matches!(&prep, FramebufferPrep::PoolBacked)
++                    {
++                        error!("GH: read-only framebuffer preparation failed: {prep:?}; refusing to start");
++                        return Err(Error::new(libc::ENOMEM));
++                    }
+                     guest_mem.set_framebuffer_prep(prep);
+                 }
+ 
+--- a/hypervisor/src/gunyah/mthp.rs
++++ b/hypervisor/src/gunyah/mthp.rs
+@@ -21,8 +21,12 @@
+ use std::fs;
+ use std::io::Write;
+ 
++use base::error;
+ use base::info;
+ use base::warn;
++use base::Error;
++
++use crate::HostMemoryPolicy;
+ 
+ // ── constants ────────────────────────────────────────────────────────────────
+ 
+@@ -65,18 +69,79 @@
+ 
+ // ── helpers ─────────────────────────────────────────────────────────────────
+ 
+-fn write_file(path: &str, value: &str) -> bool {
+-    match fs::OpenOptions::new().write(true).open(path) {
+-        Ok(mut f) => {
+-            let _ = f.write_all(value.as_bytes());
+-            true
+-        }
++fn host_memory_write(policy: HostMemoryPolicy, write: impl FnOnce() -> bool) -> bool {
++    if policy == HostMemoryPolicy::ReadOnly {
++        return false;
++    }
++    write()
++}
++
++fn write_file(policy: HostMemoryPolicy, path: &str, value: &str) -> bool {
++    host_memory_write(policy, || match fs::OpenOptions::new().write(true).open(path) {
++        Ok(mut f) => f.write_all(value.as_bytes()).is_ok(),
+         Err(_) => false,
+-    }
+-}
+-
+-fn trigger_compact() {
+-    write_file("/proc/sys/vm/compact_memory", "1\n");
++    })
++}
++
++fn trigger_compact(policy: HostMemoryPolicy) {
++    write_file(policy, "/proc/sys/vm/compact_memory", "1\n");
++}
++
++fn selected_shmem_policy(raw: &str) -> Result<&str, String> {
++    let mut selected = raw
++        .split_ascii_whitespace()
++        .filter_map(|word| word.strip_prefix('[')?.strip_suffix(']'));
++    let value = selected.next().ok_or("shmem_enabled has no selected policy")?;
++    if selected.next().is_some() {
++        return Err("shmem_enabled has more than one selected policy".to_string());
++    }
++    Ok(value)
++}
++
++fn validate_existing_reserve(
++    size: u64,
++    available: u64,
++    hook_enabled: &str,
++    shmem_enabled: &str,
++) -> Result<(), String> {
++    if size == 0 || size % THP_SIZE != 0 {
++        return Err(format!(
++            "region size {size} is not a positive multiple of 2 MiB"
++        ));
++    }
++    if !matches!(hook_enabled.trim(), "1" | "Y") {
++        return Err("the existing reserve supply hook is not enabled".to_string());
++    }
++    if !matches!(
++        selected_shmem_policy(shmem_enabled)?,
++        "always" | "within_size" | "advise" | "force"
++    ) {
++        return Err(
++            "the existing shmem THP policy does not enable reserve-backed population".to_string(),
++        );
++    }
++    let needed = size / THP_SIZE;
++    if available < needed {
++        return Err(format!(
++            "the existing reserve has {available} free 2 MiB pages, but this region needs {needed}; \
++             prepare sufficient capacity outside this VM launch"
++        ));
++    }
++    Ok(())
++}
++
++/// Check existing capacity without changing global settings or filling the reserve.
++pub(super) fn require_existing_reserve(size: u64) -> Result<(), String> {
++    let read = |path: &str| {
++        fs::read_to_string(path).map_err(|e| format!("cannot read existing host capability {path}: {e}"))
++    };
++    let available = read("/sys/module/gh_hugepage_reserve/parameters/pool_avail")?
++        .trim()
++        .parse::<u64>()
++        .map_err(|e| format!("invalid reserve pool_avail: {e}"))?;
++    let hook = read("/sys/module/gh_hugepage_reserve/parameters/hook_enable")?;
++    let shmem = read("/sys/kernel/mm/transparent_hugepage/shmem_enabled")?;
++    validate_existing_reserve(size, available, &hook, &shmem)
+ }
+ 
+ // ── public API ──────────────────────────────────────────────────────────────
+@@ -112,9 +177,16 @@
+ ///   Phase 3 – cascading MADV_COLLAPSE (2 MB → 64 KB)
+ ///   Phase 4 – mlock
+ ///
++/// `ReadOnly` skips Phase 1 and all later global compaction, requires an
++/// existing reserve, and refuses incomplete 2 MiB backing or failed locking.
++///
+ /// # Safety
+ /// `host_addr` must point to a valid memory mapping of at least `size` bytes.
+-pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResult {
++pub unsafe fn prepare_lend_region(
++    host_addr: *mut u8,
++    size: u64,
++    policy: HostMemoryPolicy,
++) -> base::Result<LendPrepResult> {
+     info!(
+         "GH: preparing LEND region: hva={:#x} size={:#x} ({} MB)",
+         host_addr as u64,
+@@ -124,20 +196,28 @@
+ 
+     // ── Phase 1: free page-cache, compact, enable mTHP ──────────────
+ 
+-    info!("GH: Phase 1: dropping caches + compacting ...");
+-    write_file("/proc/sys/vm/drop_caches", "3\n");
+-    trigger_compact();
+-    std::thread::sleep(std::time::Duration::from_millis(500));
++    if policy == HostMemoryPolicy::ReadOnly {
++        require_existing_reserve(size).map_err(|why| {
++            error!("GH: read-only host memory preflight failed: {why}; host settings remain unchanged");
++            Error::new(libc::ENOMEM)
++        })?;
++        info!("GH: read-only host memory policy: using existing reserve; no host-wide preparation");
++    } else {
++        info!("GH: Phase 1: dropping caches + compacting ...");
++        write_file(policy, "/proc/sys/vm/drop_caches", "3\n");
++        trigger_compact(policy);
++        std::thread::sleep(std::time::Duration::from_millis(500));
++    }
+ 
+     // Enable intermediate mTHP sizes
+-    {
++    if policy == HostMemoryPolicy::Prepare {
+         let mut enabled = 0u32;
+         for sz in MTHP_SIZES {
+             let path = format!(
+                 "/sys/kernel/mm/transparent_hugepage/hugepages-{}/enabled",
+                 sz
+             );
+-            if write_file(&path, "always\n") {
++            if write_file(policy, &path, "always\n") {
+                 enabled += 1;
+             }
+         }
+@@ -153,6 +233,11 @@
+ 
+     // Request THPs for the whole region
+     let ret = libc::madvise(host_addr as *mut libc::c_void, size as usize, libc::MADV_HUGEPAGE);
++    if ret != 0 && policy == HostMemoryPolicy::ReadOnly {
++        let err = Error::last();
++        error!("GH: read-only region MADV_HUGEPAGE failed: {err}");
++        return Err(err);
++    }
+     info!(
+         "GH: MADV_HUGEPAGE: {}",
+         if ret == 0 { "OK" } else { "FAILED" }
+@@ -177,6 +262,11 @@
+ 
+             let ret = libc::madvise(ptr as *mut libc::c_void, len, MADV_POPULATE_WRITE);
+             if ret != 0 {
++                if policy == HostMemoryPolicy::ReadOnly {
++                    let err = Error::last();
++                    error!("GH: read-only population failed at region offset {offset:#x}: {err}; refusing manual-touch fallback");
++                    return Err(err);
++                }
+                 // Fallback: touch each page manually
+                 let npages = len / 4096;
+                 for i in 0..npages {
+@@ -186,8 +276,11 @@
+             }
+ 
+             batch_idx += 1;
+-            if batch_idx % COMPACT_INTERVAL == 0 && offset + BATCH_SIZE < size {
+-                trigger_compact();
++            if policy == HostMemoryPolicy::Prepare
++                && batch_idx % COMPACT_INTERVAL == 0
++                && offset + BATCH_SIZE < size
++            {
++                trigger_compact(policy);
+                 std::thread::sleep(std::time::Duration::from_millis(200));
+             }
+             offset += BATCH_SIZE;
+@@ -205,6 +298,9 @@
+         info!("GH: Phase 3: cascading MADV_COLLAPSE (2MB -> 64KB) ...");
+ 
+         for level in COLLAPSE_LEVELS {
++            if policy == HostMemoryPolicy::ReadOnly && level.order != 9 {
++                continue;
++            }
+             let csize = level.size;
+             let corder = level.order;
+             let units_per_chunk = (csize / MAP_UNIT) as usize;
+@@ -278,6 +374,11 @@
+                 let ret =
+                     libc::madvise(ptr as *mut libc::c_void, MAP_UNIT as usize, MADV_POPULATE_WRITE);
+                 if ret != 0 {
++                    if policy == HostMemoryPolicy::ReadOnly {
++                        let err = Error::last();
++                        error!("GH: read-only repopulation failed at offset {off:#x}: {err}; refusing manual-touch fallback");
++                        return Err(err);
++                    }
+                     let npages = MAP_UNIT / 4096;
+                     for pg in 0..npages {
+                         let p = ptr.add((pg * 4096) as usize);
+@@ -302,11 +403,15 @@
+     if mlocked {
+         info!("GH: mlock: OK");
+     } else {
++        let err = Error::last();
+         warn!(
+             "GH: mlock FAILED: errno={} -- pages in this region can still be migrated or \
+              reclaimed while the RM's stage-2 keeps the old ones (check RLIMIT_MEMLOCK)",
+-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
++            err.errno()
+         );
++        if policy == HostMemoryPolicy::ReadOnly {
++            return Err(err);
++        }
+     }
+ 
+     // ── Build need_small bitmap from order_map ──────────────────────
+@@ -319,6 +424,10 @@
+         // Mark as THP only if ALL 64KB units are order >= 9 (2MB THP)
+         let is_thp = (0..units_per_thp).all(|u| order_map[map_base + u] >= 9);
+         need_small[ci] = !is_thp;
++    }
++    if policy == HostMemoryPolicy::ReadOnly && need_small.iter().any(|&small| small) {
++        error!("GH: read-only preparation did not obtain complete 2 MiB reserve backing; refusing smaller-page fallback");
++        return Err(Error::new(libc::ENOMEM));
+     }
+ 
+     // ── Hard verification: every page must genuinely be resolvable ──
+@@ -334,11 +443,29 @@
+     if populated {
+         info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");
+     } else {
++        let err = Error::last();
+         warn!(
+             "GH: verify (MADV_POPULATE_READ) FAILED: errno={} -- region is NOT fully backed \
+              (reserve pool likely exhausted); caller must treat this as fatal",
+-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
++            err.errno()
+         );
++        if policy == HostMemoryPolicy::ReadOnly {
++            return Err(err);
++        }
++    }
++
++    if policy == HostMemoryPolicy::ReadOnly {
++        match super::pin::probe_settled(host_addr as u64, size) {
++            super::pin::Settled::Yes => {}
++            super::pin::Settled::No(why) => {
++                error!("GH: read-only preparation did not obtain settled reserve backing: {why}");
++                return Err(Error::new(libc::ENOMEM));
++            }
++            super::pin::Settled::Unknown => {
++                error!("GH: read-only preparation requires existing /dev/gh_pinprobe verification");
++                return Err(Error::new(libc::ENODEV));
++            }
++        }
+     }
+ 
+     // ── Phase 5: clean the region out of the caches ─────────────────
+@@ -352,12 +479,12 @@
+     // WC guest writes, giving a type-0 write to register 0 and an AHB error).
+     clean_dcache_to_poc(host_addr, size as usize);
+ 
+-    LendPrepResult {
++    Ok(LendPrepResult {
+         need_small,
+         large_page_bytes,
+         populated,
+         mlocked,
+-    }
++    })
+ }
+ 
+ /// Clean+invalidate `size` bytes from `host_addr` to the point of coherency.
+@@ -642,3 +769,38 @@
+ 
+     chunks
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn read_only_does_not_invoke_host_write() {
++        let mut calls = 0;
++        assert!(!host_memory_write(HostMemoryPolicy::ReadOnly, || {
++            calls += 1;
++            true
++        }));
++        assert_eq!(calls, 0);
++        assert!(host_memory_write(HostMemoryPolicy::Prepare, || {
++            calls += 1;
++            true
++        }));
++        assert_eq!(calls, 1);
++    }
++
++    #[test]
++    fn existing_reserve_rejects_short_capacity_and_unknown_policy() {
++        let shmem = "always within_size [advise] never deny force\n";
++        assert!(validate_existing_reserve(4 * THP_SIZE, 4, "Y\n", shmem).is_ok());
++        let shortage = validate_existing_reserve(4 * THP_SIZE, 3, "Y", shmem).unwrap_err();
++        assert!(shortage.contains("3 free 2 MiB pages"));
++        assert!(shortage.contains("needs 4"));
++        assert!(validate_existing_reserve(THP_SIZE, 4, "N", shmem).is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "always advise never").is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "[advise] [always]").is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "[deny]").is_err());
++        assert!(validate_existing_reserve(0, 4, "Y", shmem).is_err());
++        assert!(validate_existing_reserve(THP_SIZE + 1, 4, "Y", shmem).is_err());
++    }
++}
+--- a/hypervisor/src/lib.rs
++++ b/hypervisor/src/lib.rs
+@@ -748,8 +748,9 @@
+ 
+ /// How an mTHP-prepared lend region is handed to Gunyah at VM start.
+ ///
+-/// Both modes first run the same mTHP preparation (drop caches, enable mTHP,
+-/// populate, cascading MADV_COLLAPSE, mlock). They differ only in how the
++/// Both modes first run the same region preparation (populate,
++/// MADV_COLLAPSE, mlock). Host-wide preparation is controlled separately by
++/// [`HostMemoryPolicy`]. They differ only in how the
+ /// prepared region is LENT to the hypervisor:
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "lowercase")]
+@@ -776,16 +777,42 @@
+     }
+ }
+ 
++/// Whether this VM may prepare shared host memory and udmabuf settings.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case")]
++pub enum HostMemoryPolicy {
++    /// Preserve the existing host-wide THP, cache-dropping and compaction behavior.
++    #[default]
++    Prepare,
++    /// Use existing reserve and udmabuf capabilities; refuse host display takeover.
++    ReadOnly,
++}
++
++impl std::str::FromStr for HostMemoryPolicy {
++    type Err = String;
++
++    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
++        match s {
++            "prepare" => Ok(Self::Prepare),
++            "read-only" => Ok(Self::ReadOnly),
++            _ => Err(format!(
++                "invalid host-memory policy '{s}', expected 'prepare' or 'read-only'"
++            )),
++        }
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub struct Config {
+     #[cfg(target_arch = "aarch64")]
+     /// enable the Memory Tagging Extension in the guest
+     pub mte: bool,
+     pub protection_type: ProtectionType,
+-    /// Run mTHP preparation (drop caches, enable mTHP, populate, MADV_COLLAPSE,
+-    /// mlock) on lend regions before VM start. The mode selects single-parcel
++    /// Run mTHP region preparation (populate, MADV_COLLAPSE, mlock) before VM
++    /// start. Host-wide setup follows `host_memory_policy`. The mode selects single-parcel
+     /// vs chunked LEND of the prepared region. `None` disables mTHP preparation.
+     pub prepare_lend_mthp: Option<LendMthpMode>,
++    pub host_memory_policy: HostMemoryPolicy,
+ }
+ 
+ impl Default for Config {
+@@ -795,6 +822,7 @@
+             mte: false,
+             protection_type: ProtectionType::Unprotected,
+             prepare_lend_mthp: None,
++            host_memory_policy: HostMemoryPolicy::Prepare,
+         }
+     }
+ }
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -59,6 +59,7 @@
+ use devices::StubPciParameters;
+ #[cfg(target_arch = "x86_64")]
+ use hypervisor::CpuHybridType;
++use hypervisor::HostMemoryPolicy;
+ use hypervisor::LendMthpMode;
+ use hypervisor::ProtectionType;
+ use merge::vec::append;
+@@ -1615,6 +1616,17 @@
+     /// IP address to assign to host tap interface
+     pub host_ip: Option<std::net::Ipv4Addr>,
+ 
++    #[argh(option, arg_name = "prepare|read-only")]
++    #[serde(skip)]
++    #[merge(strategy = overwrite_option)]
++    /// set Gunyah host memory policy: "prepare" keeps host-wide THP setup,
++    /// cache-dropping and compaction; "read-only" requires an existing reserve
++    /// and performs only VM-local population, collapse and locking. It also
++    /// requires existing udmabuf capabilities for direct media and rejects KMS
++    /// display takeover. Defaults to "prepare". Missing or insufficient host
++    /// capabilities fail VM creation without changing shared configuration
++    pub host_memory_policy: Option<HostMemoryPolicy>,
++
+     #[argh(switch)]
+     #[serde(skip)] // TODO(b/255223604)
+     #[merge(strategy = overwrite_option)]
+@@ -2110,8 +2122,8 @@
+     #[argh(switch)]
+     #[serde(skip)]
+     #[merge(strategy = overwrite_option)]
+-    /// run mTHP preparation on lend regions (drop caches, enable mTHP,
+-    /// populate, MADV_COLLAPSE, mlock, chunked LEND).
++    /// run mTHP region preparation (populate, MADV_COLLAPSE, mlock, chunked
++    /// LEND). Host-wide setup follows --host-memory-policy.
+     /// Deprecated: equivalent to `--prepare-lend-mthp-mode chunked`; use that
+     /// option to select the LEND strategy
+     pub prepare_lend_mthp: Option<bool>,
+@@ -2119,8 +2131,8 @@
+     #[argh(option, arg_name = "single|chunked")]
+     #[serde(skip)]
+     #[merge(strategy = overwrite_option)]
+-    /// run mTHP preparation on lend regions (drop caches, enable mTHP,
+-    /// populate, MADV_COLLAPSE, mlock), then LEND the prepared region as a
++    /// run mTHP region preparation (populate, MADV_COLLAPSE, mlock; host-wide
++    /// setup follows --host-memory-policy), then LEND the prepared region as a
+     /// single parcel ("single", for eager-parcel kernels such as sm8650) or
+     /// split into <=256MB parcels ("chunked", for demand-paging kernels such
+     /// as sm8750). Takes precedence over the deprecated `--prepare-lend-mthp`
+@@ -3329,6 +3341,7 @@
+                 .unwrap_or_default()
+                 .then_some(LendMthpMode::Chunked)
+         });
++        cfg.host_memory_policy = cmd.host_memory_policy.unwrap_or_default();
+ 
+         // `cfg.hypervisor` may have been set by the deprecated `--kvm-device` option above.
+         // TODO(b/274817652): remove this workaround when `--kvm-device` is removed.
+@@ -4312,6 +4325,38 @@
+     use super::*;
+ 
+     #[test]
++    fn host_memory_policy_is_explicit_and_cannot_be_repeated() {
++        let command = RunCommand::from_args(
++            &["run"],
++            &["--host-memory-policy", "read-only", "/kernel"],
++        ).unwrap();
++        assert_eq!(command.host_memory_policy, Some(HostMemoryPolicy::ReadOnly));
++        assert_eq!(HostMemoryPolicy::default(), HostMemoryPolicy::Prepare);
++        assert!(RunCommand::from_args(
++            &["run"],
++            &["--host-memory-policy", "read-only", "--host-memory-policy", "prepare", "/kernel"],
++        ).is_err());
++        assert!(RunCommand::from_args(
++            &["run"],
++            &["--host-memory-policy", "unknown", "/kernel"],
++        ).is_err());
++    }
++
++    #[test]
++    #[cfg(feature = "config-file")]
++    fn host_memory_policy_on_cli_wins_over_nested_config() {
++        let command = RunCommand {
++            host_memory_policy: Some(HostMemoryPolicy::ReadOnly),
++            cfg: vec![RunCommand {
++                host_memory_policy: Some(HostMemoryPolicy::Prepare),
++                ..Default::default()
++            }],
++            ..Default::default()
++        };
++        assert_eq!(command.squash().host_memory_policy, Some(HostMemoryPolicy::ReadOnly));
++    }
++
++    #[test]
+     #[cfg(feature = "config-file")]
+     fn merge_runcommands() {
+         let cmd2 = RunCommand {
+--- a/src/crosvm/config.rs
++++ b/src/crosvm/config.rs
+@@ -53,6 +53,7 @@
+ use devices::StubPciParameters;
+ #[cfg(target_arch = "x86_64")]
+ use hypervisor::CpuHybridType;
++use hypervisor::HostMemoryPolicy;
+ use hypervisor::LendMthpMode;
+ use hypervisor::ProtectionType;
+ use jail::JailConfig;
+@@ -1436,6 +1437,8 @@
+     pub host_cpu_topology: bool,
+     #[cfg(windows)]
+     pub host_guid: Option<String>,
++    #[serde(default)]
++    pub host_memory_policy: HostMemoryPolicy,
+     pub hugepages: bool,
+     pub hypervisor: Option<HypervisorKind>,
+     #[cfg(feature = "balloon")]
+@@ -1706,6 +1709,7 @@
+             host_cpu_topology: false,
+             #[cfg(windows)]
+             host_guid: None,
++            host_memory_policy: HostMemoryPolicy::Prepare,
+             #[cfg(windows)]
+             product_version: None,
+             #[cfg(windows)]
+@@ -1931,6 +1935,12 @@
+     let has_simplefb_screen = cfg.simplefb.is_some();
+     #[cfg(feature = "kms_display")]
+     if let Some(kms) = &cfg.kms_display {
++        if cfg.host_memory_policy == HostMemoryPolicy::ReadOnly {
++            return Err(
++                "kms-display changes shared host display and udmabuf settings; it is unavailable \
++                 with read-only host-memory-policy".into(),
++            );
++        }
+         if !cfg!(target_os = "android") {
+             return Err("kms-display takeover requires Android".into());
+         }
+@@ -4023,6 +4033,23 @@
+         assert!(from_key_values::<VncConfig>("port=5900,input=none").is_err());
+     }
+ 
++    #[test]
++    #[cfg(feature = "kms_display")]
++    fn read_only_host_policy_rejects_kms_before_takeover() {
++        let mut cfg = Config {
++            host_memory_policy: HostMemoryPolicy::ReadOnly,
++            kms_display: Some(KmsDisplayConfig {
++                card: PathBuf::from("/dev/dri/card0"),
++                screen: DisplayScreen::Gpu0,
++                takeover: KmsTakeoverMode::Display,
++                planes: KmsPlanes::default(),
++            }),
++            ..Default::default()
++        };
++        let failure = validate_display_exporters(&mut cfg).unwrap_err();
++        assert!(failure.contains("read-only host-memory-policy"));
++    }
++
+     /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command
+     /// line written so far, and it has to keep meaning the GPU's screen.
+     #[test]
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -1283,6 +1283,7 @@
+         for media_cfg in media_devices {
+             devs.push(create_virtio_media_device(
+                 cfg.protection_type,
++                cfg.host_memory_policy,
+                 media_cfg,
+                 pool.clone(),
+                 vm.get_memory(),
+@@ -2187,6 +2188,7 @@
+             mte: cfg.mte,
+             protection_type: cfg.protection_type,
+             prepare_lend_mthp: cfg.prepare_lend_mthp,
++            host_memory_policy: cfg.host_memory_policy,
+         },
+         vm_image,
+         android_fstab: cfg
+--- a/src/crosvm/sys/linux/device_helpers.rs
++++ b/src/crosvm/sys/linux/device_helpers.rs
+@@ -90,6 +90,8 @@
+ use devices::VfioPlatformDevice;
+ #[cfg(feature = "vtpm")]
+ use devices::VtpmProxy;
++#[cfg(feature = "media")]
++use hypervisor::HostMemoryPolicy;
+ use hypervisor::MemCacheType;
+ use hypervisor::ProtectionType;
+ use hypervisor::Vm;
+@@ -1460,6 +1462,7 @@
+ #[cfg(feature = "media")]
+ pub fn create_virtio_media_device(
+     protection_type: ProtectionType,
++    host_memory_policy: HostMemoryPolicy,
+     config: &MediaDeviceConfig,
+     pool: Option<MediaPool>,
+     mem: &GuestMemory,
+@@ -1479,6 +1482,7 @@
+     if config.uid.is_some() {
+         return create_unprivileged_virtio_media_device(
+             protection_type,
++            host_memory_policy,
+             config,
+             pool,
+             mem,
+@@ -1547,6 +1551,7 @@
+ #[cfg(feature = "media")]
+ fn create_unprivileged_virtio_media_device(
+     protection_type: ProtectionType,
++    host_memory_policy: HostMemoryPolicy,
+     config: &MediaDeviceConfig,
+     pool: Option<MediaPool>,
+     mem: &GuestMemory,
+@@ -1606,7 +1611,8 @@
+     // V4L2 codec nodes are `system:camera 0660` (msm_vidc's /dev/video32).
+     // That decoder hands the driver guest buffers as udmabufs, one entry per scattered guest
+     // page run: a 4K P010 frame in 16 KiB guest pages is ~1700 entries, past the module's default
+-    // `list_limit` of 1024, which only root may raise -- so it is raised here, best effort.
++    // `list_limit` of 1024, which only root may raise. Prepare mode raises it best effort;
++    // ReadOnly requires the existing limit and mem_buf capability before launching the helper.
+     // The node itself is root's (`crw------- root root` on Android): the helper, an app uid, could
+     // not open it and every guest buffer reached the driver without a dma-buf. It is opened here,
+     // before the privileges go, and handed down by number (`--udmabuf-fd`); without it (no udmabuf
+@@ -1619,8 +1625,7 @@
+     let direct_encoder =
+         config.decoder_backend().may_be_direct() && config.kind == MediaDeviceKind::Encoder;
+     let supp_gids = if direct {
+-        raise_udmabuf_list_limit(16384);
+-        enable_udmabuf_msm_prime();
++        prepare_direct_decoder_udmabuf(host_memory_policy)?;
+         vec![AID_CAMERA]
+     } else if direct_encoder {
+         vec![AID_CAMERA]
+@@ -1631,6 +1636,11 @@
+         match std::fs::OpenOptions::new().read(true).write(true).open("/dev/udmabuf") {
+             Ok(file) => Some(file),
+             Err(e) => {
++                if host_memory_policy == HostMemoryPolicy::ReadOnly {
++                    return Err(e).context(
++                        "read-only direct decoder requires existing /dev/udmabuf access",
++                    );
++                }
+                 warn!("media helper: cannot open /dev/udmabuf for it: {}", e);
+                 None
+             }
+@@ -1721,6 +1731,43 @@
+ /// Android's `camera` group (`AID_CAMERA`), which owns the video codec nodes.
+ const AID_CAMERA: u32 = 1006;
+ 
++#[cfg(feature = "media")]
++fn validate_direct_decoder_host_params(limit: u32, msm_prime: &str) -> Result<()> {
++    if limit < 16384 {
++        bail!("read-only direct decoder requires existing udmabuf list_limit >= 16384, found {limit}");
++    }
++    if !matches!(msm_prime.trim(), "Y" | "1") {
++        bail!(
++            "read-only direct decoder requires existing udmabuf msm_prime enabled, found {:?}",
++            msm_prime.trim()
++        );
++    }
++    Ok(())
++}
++
++/// Prepare mode retains the existing global setup; ReadOnly observes capabilities only.
++#[cfg(feature = "media")]
++fn prepare_direct_decoder_udmabuf(policy: HostMemoryPolicy) -> Result<()> {
++    if policy == HostMemoryPolicy::Prepare {
++        raise_udmabuf_list_limit(16384);
++        enable_udmabuf_msm_prime();
++        return Ok(());
++    }
++
++    let limit = std::fs::read_to_string("/sys/module/udmabuf/parameters/list_limit")
++        .context("read-only direct decoder cannot read existing udmabuf list_limit")?
++        .trim()
++        .parse::<u32>()
++        .context("read-only direct decoder found invalid udmabuf list_limit")?;
++    let path = udmabuf_msm_prime_path()
++        .context("read-only direct decoder requires existing udmabuf msm_prime capability")?;
++    let msm_prime = std::fs::read_to_string(&path)
++        .with_context(|| format!("read-only direct decoder cannot read {}", path.display()))?;
++    validate_direct_decoder_host_params(limit, &msm_prime)?;
++    info!("read-only direct decoder: existing udmabuf capabilities verified; no module parameters changed");
++    Ok(())
++}
++
+ /// Raise the udmabuf module's per-buffer entry limit to at least `wanted`, if it is lower and
+ /// this process may write it. A failure is logged and otherwise ignored: buffers with fewer
+ /// entries still work, and the decoder falls back to MediaCodec for one it cannot import.
+@@ -1751,14 +1798,17 @@
+ /// found, which may switch it off under a running direct decoder; its next sessions then fail as
+ /// before this switch existed. Without the switch (an older module, a host with no mem_buf) the
+ /// guest buffers stay plain and a Qualcomm direct driver refuses them.
+-fn enable_udmabuf_msm_prime() {
+-    let path = std::fs::read_dir("/sys/module").ok().and_then(|dir| {
++fn udmabuf_msm_prime_path() -> Option<PathBuf> {
++    std::fs::read_dir("/sys/module").ok().and_then(|dir| {
+         dir.flatten()
+             .filter(|e| e.file_name().to_string_lossy().starts_with("udmabuf_gki_"))
+             .map(|e| e.path().join("parameters/msm_prime"))
+             .find(|p| p.exists())
+-    });
+-    let Some(path) = path else {
++    })
++}
++
++fn enable_udmabuf_msm_prime() {
++    let Some(path) = udmabuf_msm_prime_path() else {
+         warn!("udmabuf msm_prime unavailable: a Qualcomm direct decoder will refuse guest buffers");
+         return;
+     };
+@@ -2575,3 +2625,19 @@
+         tube_pair.map(|(_request_tx, request_rx)| request_rx),
+     ))
+ }
++
++#[cfg(all(test, feature = "media"))]
++mod host_memory_policy_tests {
++    use super::*;
++
++    #[test]
++    fn direct_decoder_requires_preexisting_host_capabilities() {
++        assert!(validate_direct_decoder_host_params(16384, "Y\n").is_ok());
++        assert!(validate_direct_decoder_host_params(32768, "1\n").is_ok());
++        let short = validate_direct_decoder_host_params(1024, "Y").unwrap_err();
++        assert!(short.to_string().contains("list_limit >= 16384"));
++        let disabled = validate_direct_decoder_host_params(16384, "N").unwrap_err();
++        assert!(disabled.to_string().contains("msm_prime enabled"));
++        assert!(validate_direct_decoder_host_params(16384, "").is_err());
++    }
++}
+--- a/src/sys/windows.rs
++++ b/src/sys/windows.rs
+@@ -2086,6 +2086,7 @@
+         hv_cfg: hypervisor::Config {
+             protection_type: cfg.protection_type,
+             prepare_lend_mthp: cfg.prepare_lend_mthp,
++            host_memory_policy: cfg.host_memory_policy,
+         },
+         vm_image,
+         android_fstab: cfg

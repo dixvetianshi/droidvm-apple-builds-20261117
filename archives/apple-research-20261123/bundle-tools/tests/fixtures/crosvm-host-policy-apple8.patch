@@ -1,0 +1,1733 @@
+diff --git a/hypervisor/src/gunyah/mod.rs b/hypervisor/src/gunyah/mod.rs
+--- a/hypervisor/src/gunyah/mod.rs
++++ b/hypervisor/src/gunyah/mod.rs
+@@ -63,128 +63,86 @@
+ 
+ use crate::*;
+ 
+-/// Give the `SharedFramebuffer` region the pool-style preparation the LEND'd regions get, and say
+-/// whether what came back can be handed to something that will hold references on it.
+-///
+-/// This region is the one SHARE'd region nothing populates at boot. That is deliberate and it used
+-/// to be free: the guest ioremap_wc()s it, the host bridge reads it, and each side's first touch
+-/// faulted in an ordinary 4 KiB shmem page. Those faults are order-0, and the gh_hugepage reserve
+-/// only hooks order-9 -- so every page of this region came from the buddy allocator, `__GFP_MOVABLE`,
+-/// and under pressure landed in CMA. The CPU bridge survives that, because nothing holds a
+-/// long-lived reference and gunyah's fault-time `FOLL_LONGTERM` pin is free to migrate the page out
+-/// of CMA before mapping it. The GPU bridge does not: GKI 6.6's udmabuf takes its pages with
+-/// `shmem_read_mapping_page`, which is a reference and not a pin, and a referenced page cannot be
+-/// migrated. The guest then faults, the pin has nowhere to move the page to, and the vcpu dies of
+-/// `page fault at <gpa>, attempt: -12` about eighty milliseconds after `transport=gpu-blit`.
+-///
+-/// The ordering is the whole fix. Populate and collapse the region to 2 MiB folios HERE -- before
+-/// vcpus run, before the bridge exists, before anything can reference a page -- and the order-9
+-/// allocations go through the reserve's hook, so the pages arrive pool-served and non-movable and
+-/// stay where they are. Nothing later has to move anything, so nothing later can fail to.
+-///
+-/// What this deliberately does NOT do is the rest of `prepare_lend_region`. No mlock: this region
+-/// is not LENT, the host keeps its mapping, and the folios are already unmigratable for the reason
+-/// above. No dcache clean to PoC: that exists because the LEND path writes guest RAM through a
+-/// cacheable mapping that a non-coherent GPU then reads; here the region's only writer before boot
+-/// is this populate, and the guest maps it write-combining and owns it from GH_VM_START on. No LEND
+-/// chunking: there is no parcel to split, this stays a single whole-region SHARE.
+-///
+-/// The folding happens through the region's OWN mapping rather than a temporary one, and that is
+-/// not an optimisation. A collapse driven through a mapping that is then unmapped leaves the folios
+-/// in the page cache and this process's page tables empty, so every later reader of the region --
+-/// the pin probe first among them -- finds an absent page and cannot tell a prepared region from an
+-/// untouched one. Folding in place leaves the range populated in the mapping everything else uses.
+-///
+-/// `MADV_COLLAPSE` on a file mapping only forms a PMD where the virtual address and the file offset
+-/// are congruent mod 2 MiB, so that is checked rather than assumed -- misaligned, it would quietly
+-/// return 0% coverage instead of an explanation. The region is 2 MiB-granular by construction
+-/// (`get_simplefb_size` rounds the framebuffer up under a 2 MiB-aligned swiotlb base) and its
+-/// mapping is 2 MiB-aligned by request (`MemoryRegionOptions::align`, as the pools do it), so the
+-/// check is a guard on those two facts rather than a coin toss.
++/// Prepare the framebuffer through its original RW GuestMemory mapping, before any GPU reader
++/// can take a reference. ReadOnly shares the strict local preparation boundary with LEND/pools;
++/// its successful lock belongs to that mapping until teardown.
+ #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+ fn prepare_shared_framebuffer(
+     region: &MemoryRegionInformation<'_>,
+     mthp_enabled: bool,
++    host_memory_policy: HostMemoryPolicy,
+ ) -> FramebufferPrep {
+     const THP_SIZE: u64 = 2 << 20;
+     let size = region.size as u64;
+     let gpa = region.guest_addr.offset();
+     let hva = region.host_addr as u64;
+-
+     let prepared = if !mthp_enabled {
+-        // The reserve pool is a Qualcomm-phone thing and so is this preparation; the same gate the
+-        // LEND and pool paths use. Without it the collapse below would allocate order-9 from the
+-        // buddy allocator, which is where movable folios come from -- exactly what we are avoiding.
+-        Err("--prepare-lend-mthp-mode is not set, so there is no reserve pool to be served from"
+-            .to_string())
+-    } else if size == 0 || size % THP_SIZE != 0 || hva % THP_SIZE != region.shm_offset % THP_SIZE {
+-        Err(format!(
+-            "the region is not 2 MiB-foldable (size={size:#x} hva={hva:#x} \
+-             offset-in-memfd={:#x}): a PMD needs the address and the file offset congruent mod \
+-             2 MiB",
+-            region.shm_offset,
+-        ))
++        Err("--prepare-lend-mthp-mode is not set".to_string())
++    } else if size == 0 || size % THP_SIZE != 0
++        || hva % THP_SIZE != 0 || region.shm_offset % THP_SIZE != 0
++    {
++        Err(format!("framebuffer is not 2 MiB-aligned: size={size:#x} hva={hva:#x} offset={:#x}", region.shm_offset))
++    } else if host_memory_policy == HostMemoryPolicy::ReadOnly {
++        // SAFETY: this is the region owner's original RW mapping, before vcpus and GPU consumers.
++        unsafe { mthp::prepare_read_only_mapped_range(region.host_addr as *mut u8, size) }
++            .map(|(coverage, guard)| {
++                guard.keep_until_unmap();
++                coverage
++            })
++            .map_err(|e| format!("strict framebuffer preparation failed: {e}"))
+     } else {
+-        // SAFETY: `host_addr` is this process's live shared mapping of the region -- `size` bytes
+-        // of the guest memfd at `shm_offset` -- and the branch above has established that it is
+-        // 2 MiB-granular and congruent. Nothing else has touched these pages yet: no vcpu is
+-        // running and the bridge that will read them does not exist.
+-        match unsafe { mthp::fold_mapped_range(region.host_addr as *mut u8, size) } {
+-            Ok(coverage) => Ok(coverage),
+-            Err(e) => Err(format!("folding the region into 2 MiB folios failed: {e}")),
+-        }
++        // SAFETY: the alignment checks above establish the original live shmem mapping boundary.
++        unsafe { mthp::fold_mapped_range(region.host_addr as *mut u8, size) }
++            .map_err(|e| format!("framebuffer collapse failed: {e}"))
++            .and_then(|coverage| match pin::probe_settled(hva, size) {
++                pin::Settled::Yes => Ok(coverage),
++                pin::Settled::No(why) => Err(why),
++                pin::Settled::Unknown => Err("existing /dev/gh_pinprobe could not verify framebuffer backing".to_string()),
++            })
+     };
+-
+-    let (coverage, verdict) = match prepared {
+-        Err(why) => ("n/a".to_string(), FramebufferPrep::NotPoolBacked(why)),
+-        Ok(c) => {
+-            let coverage = format!(
+-                "{} / {} MB ({:.1}%)",
+-                c.covered_bytes() >> 20,
+-                c.total_bytes() >> 20,
+-                c.pct(),
+-            );
+-            if !c.is_complete() {
+-                // Partial coverage is the original roulette with better odds, and better odds are
+-                // not what the GPU path needs: one 4 KiB page left in CMA anywhere in the region
+-                // is one guest fault away from the same -12.
+-                let why = format!("only {coverage} of the region came back as 2 MiB folios");
+-                (coverage, FramebufferPrep::NotPoolBacked(why))
+-            } else {
+-                // Complete coverage says the folios are order-9. It does NOT say the reserve
+-                // served them: with an empty pool the buddy allocator answers the same order-9
+-                // request and can hand back a movable folio, and `MADV_COLLAPSE` returns success
+-                // either way. The probe is the orthogonal question -- where did these pages land --
+-                // and it is the one the guest's fault will really be asking.
+-                match pin::probe_settled(hva, size) {
+-                    pin::Settled::Yes => (coverage, FramebufferPrep::PoolBacked),
+-                    pin::Settled::No(why) => (coverage, FramebufferPrep::NotPoolBacked(why)),
+-                    pin::Settled::Unknown => (
+-                        coverage,
+-                        FramebufferPrep::NotPoolBacked(
+-                            "/dev/gh_pinprobe is absent (no gh_hugepage_reserve.ko providing it), \
+-                             so where the folios came from cannot be established"
+-                                .to_string(),
+-                        ),
+-                    ),
+-                }
+-            }
+-        }
+-    };
+-
+-    match &verdict {
+-        FramebufferPrep::PoolBacked => info!(
+-            "GH-FB: === framebuffer folio coverage: {coverage} at gpa={gpa:#x} hva={hva:#x} -- \
+-             pool-served, the GPU transport may window these pages ==="
+-        ),
+-        FramebufferPrep::NotPoolBacked(why) => warn!(
+-            "GH-FB: === framebuffer folio coverage: {coverage} at gpa={gpa:#x} hva={hva:#x} -- \
+-             NOT pool-served: {why}; the simplefb bridge stays on the CPU path ==="
+-        ),
+-        // Built above, never returned.
+-        FramebufferPrep::Unclaimed => (),
+-    }
+-    verdict
++    match prepared {
++        Ok(coverage) if coverage.is_complete() => {
++            info!("GH-FB: complete, settled 2 MiB framebuffer backing: {} MB at gpa={gpa:#x} hva={hva:#x}", coverage.covered_bytes() >> 20);
++            FramebufferPrep::PoolBacked
++        }
++        Ok(coverage) => {
++            let why = format!("incomplete framebuffer coverage: {} / {} bytes", coverage.covered_bytes(), size);
++            warn!("GH-FB: {why}");
++            FramebufferPrep::NotPoolBacked(why)
++        }
++        Err(why) => {
++            warn!("GH-FB: framebuffer preparation failed at gpa={gpa:#x}: {why}");
++            FramebufferPrep::NotPoolBacked(why)
++        }
++    }
++}
++
++// Resolve file offsets only within one owner mapping. File identity is checked by the caller;
++// this boundary owns range arithmetic and the VA/file-offset alignment required by COLLAPSE.
++fn owned_mapping_subrange(
++    host_addr: usize,
++    region_offset: u64,
++    region_size: u64,
++    offset: u64,
++    size: u64,
++) -> Result<Option<usize>> {
++    const THP_SIZE: u64 = 2 << 20;
++    if size == 0 || size % THP_SIZE != 0 || offset % THP_SIZE != 0 {
++        return Err(Error::new(EINVAL));
++    }
++    let end = offset.checked_add(size).ok_or(Error::new(EOVERFLOW))?;
++    let region_end = region_offset.checked_add(region_size).ok_or(Error::new(EOVERFLOW))?;
++    if offset < region_offset || end > region_end {
++        return Ok(None);
++    }
++    let delta = usize::try_from(offset - region_offset).map_err(|_| Error::new(EOVERFLOW))?;
++    let addr = host_addr.checked_add(delta).ok_or(Error::new(EOVERFLOW))?;
++    let length = usize::try_from(size).map_err(|_| Error::new(EOVERFLOW))?;
++    addr.checked_add(length).ok_or(Error::new(EOVERFLOW))?;
++    if addr == 0 || addr % THP_SIZE as usize != 0 {
++        return Err(Error::new(EINVAL));
++    }
++    Ok(Some(addr))
+ }
+ 
+ pub struct Gunyah {
+@@ -499,7 +457,9 @@
+                     // Full preparation: drop caches, populate in batches,
+                     // MADV_COLLAPSE to 2 MiB (leave the rest at 4 KiB), mlock.
+                     // SAFETY: host_ptr is a valid mapping of region_size bytes.
+-                    let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size) };
++                    let prep = unsafe {
++                        mthp::prepare_lend_region(host_ptr, region_size, cfg.host_memory_policy)
++                    }?;
+                     if !prep.populated {
+                         error!(
+                             "GH: guest RAM region gpa={:#x} size={:#x} failed to populate \
+@@ -656,8 +616,9 @@
+                         mthp::prepare_lend_region(
+                             region.host_addr as *mut u8,
+                             boot_share_len,
++                            cfg.host_memory_policy,
+                         )
+-                    };
++                    }?;
+                     if !prep.populated {
+                         // Host-alloc must fail loudly: proceeding to SHARE an unbacked
+                         // pool means the guest eventually SIGBUSes deep inside its GPU
+@@ -703,8 +664,12 @@
+                 if region.options.purpose == MemoryRegionPurpose::SharedGuestRam {
+                     // SAFETY: host_addr is a valid mapping of region.size bytes.
+                     let prep = unsafe {
+-                        mthp::prepare_lend_region(region.host_addr as *mut u8, full_size)
+-                    };
++                        mthp::prepare_lend_region(
++                            region.host_addr as *mut u8,
++                            full_size,
++                            cfg.host_memory_policy,
++                        )
++                    }?;
+                     if !prep.populated || !prep.mlocked {
+                         error!(
+                             "GH-SHIM: window gpa={:#x} size={:#x} could not be populated and \
+@@ -749,8 +714,17 @@
+                 // one thing that reads it is the GPU transport that cannot survive being wrong.
+                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                 if region.options.purpose == MemoryRegionPurpose::SharedFramebuffer {
+-                    let prep =
+-                        prepare_shared_framebuffer(&region, cfg.prepare_lend_mthp.is_some());
++                    let prep = prepare_shared_framebuffer(
++                        &region,
++                        cfg.prepare_lend_mthp.is_some(),
++                        cfg.host_memory_policy,
++                    );
++                    if cfg.host_memory_policy == HostMemoryPolicy::ReadOnly
++                        && !matches!(&prep, FramebufferPrep::PoolBacked)
++                    {
++                        error!("GH: read-only framebuffer preparation failed: {prep:?}; refusing to start");
++                        return Err(Error::new(libc::ENOMEM));
++                    }
+                     guest_mem.set_framebuffer_prep(prep);
+                 }
+ 
+@@ -1177,7 +1151,10 @@
+                         Error::new(EINVAL)
+                     })?;
+                 // exec: the payload runs from here.
+-                let handle = self.share_blob(at, Box::new(mapping), None, 0, false, true)?;
++                let handle = self.share_blob(
++                    at, Box::new(mapping), Some(file.as_raw_descriptor()),
++                    window.shm_offset + off, false, true,
++                )?;
+                 let parcel = abi::ShimParcel {
+                     handle,
+                     reserved: 0,
+@@ -1393,6 +1370,40 @@
+         }
+     }
+ 
++    /// Find a unique subrange of this VM's original shmem mappings. Dup fds retain dev/inode
++    /// identity; fd numbers, display names and guest addresses do not prove backing ownership.
++    fn owned_memfd_range(
++        &self,
++        fd: &dyn AsRawDescriptor,
++        offset: u64,
++        size: u64,
++    ) -> Result<Option<usize>> {
++        let source = base::linux::fstat(&base::Descriptor(fd.as_raw_descriptor()))?;
++        let mut owned = false;
++        let mut found = None;
++        for region in self.guest_mem.regions() {
++            if !matches!(region.shm, vm_memory::BackingObject::Shm(_)) {
++                continue;
++            }
++            let backing = base::linux::fstat(region.shm)?;
++            if source.st_dev != backing.st_dev || source.st_ino != backing.st_ino {
++                continue;
++            }
++            owned = true;
++            if let Some(addr) = owned_mapping_subrange(
++                region.host_addr, region.shm_offset, region.size as u64, offset, size,
++            )? {
++                if found.replace(addr).is_some() {
++                    return Err(Error::new(EEXIST));
++                }
++            }
++        }
++        if owned && found.is_none() {
++            return Err(Error::new(EINVAL));
++        }
++        Ok(found)
++    }
++
+     /// Runtime-SHARE a host blob to the running guest and return the resource-manager memparcel
+     /// handle. Unlike `add_memory_region` (which SHARE's but never reaches a protected guest's
+     /// stage-2 -> SIGBUS), this exposes the handle so the guest can `gh_rm_mem_accept` it itself
+@@ -1452,52 +1463,92 @@
+         let share_dev = File::open("/dev/gunyah_share")
+             .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+ 
++        let owned_range = match source_descriptor {
++            Some(fd) => self.owned_memfd_range(&base::Descriptor(fd), source_offset, size)?,
++            None => None,
++        };
++
++        // A proven VMM memfd goes directly to VA/GUP, including the shim's second mapping.
++        // Ordinary memfds are not DMA-BUFs; their import error is not a compatibility gate.
+         // Driver-exported DMA-BUFs may mmap as VM_PFNMAP/VM_MIXEDMAP. GUP is required to reject
+         // those VMAs, so let gunyah_share hold a DMA-BUF attachment and build the memparcel from
+         // the exporter's sg-table. ENOTTY means either an older module or an ordinary descriptor
+         // such as a pool memfd; those retain the existing VA/GUP behavior below.
+-        if let Some(dmabuf_fd) = source_descriptor {
+-            let mut dmabuf = ghsm_share_dmabuf {
+-                vm_fd: self.vm.as_raw_descriptor(),
+-                dmabuf_fd,
+-                label,
+-                flags,
+-                mem_handle: 0,
+-                reserved: 0,
+-                guest_phys_addr: guest_addr.offset(),
+-                memory_size: size,
+-                dmabuf_offset: source_offset,
+-            };
+-            // SAFETY: the ioctl synchronously imports descriptors owned by this process and
+-            // writes mem_handle into `dmabuf`. Both fds remain valid for the whole call.
+-            let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_DMABUF, &mut dmabuf) };
+-            if ret == 0 {
+-                self.blob_regions.lock().insert(label, mem_region);
++        if owned_range.is_none() {
++            if let Some(dmabuf_fd) = source_descriptor {
++                let mut dmabuf = ghsm_share_dmabuf {
++                    vm_fd: self.vm.as_raw_descriptor(),
++                    dmabuf_fd,
++                    label,
++                    flags,
++                    mem_handle: 0,
++                    reserved: 0,
++                    guest_phys_addr: guest_addr.offset(),
++                    memory_size: size,
++                    dmabuf_offset: source_offset,
++                };
++                // SAFETY: the ioctl synchronously imports descriptors owned by this process and
++                // writes mem_handle into `dmabuf`. Both fds remain valid for the whole call.
++                let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_DMABUF, &mut dmabuf) };
++                if ret == 0 {
++                    self.blob_regions.lock().insert(label, mem_region);
++                    debug!(
++                        "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} label={} handle={:#x}",
++                        guest_addr.offset(),
++                        size,
++                        source_offset,
++                        label,
++                        dmabuf.mem_handle,
++                    );
++                    return Ok(dmabuf.mem_handle);
++                }
++                let err = Error::last();
++                if err.errno() != libc::ENOTTY {
++                    error!(
++                        "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} FAILED: {}",
++                        guest_addr.offset(),
++                        size,
++                        source_offset,
++                        err,
++                    );
++                    return Err(err);
++                }
+                 debug!(
+-                    "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} label={} handle={:#x}",
+-                    guest_addr.offset(),
+-                    size,
+-                    source_offset,
+-                    label,
+-                    dmabuf.mem_handle,
++                    "GUNYAH-SHARE-DMABUF: descriptor is not a DMA-BUF (or module is old); falling back to VA/GUP"
+                 );
+-                return Ok(dmabuf.mem_handle);
+             }
+-            let err = Error::last();
+-            if err.errno() != libc::ENOTTY {
+-                error!(
+-                    "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} FAILED: {}",
+-                    guest_addr.offset(),
+-                    size,
+-                    source_offset,
+-                    err,
+-                );
+-                return Err(err);
++        }
++
++        // Only the confirmed shmem owner is folded through its original RW mapping. Real
++        // DMA-BUFs returned above, and foreign/ExternalMapping blobs retain their existing path.
++        // The actual SHARE alias may be read-only or only page-aligned: populate it for reading,
++        // verify and lock it here, without writing through it or unlocking the boot owner's VMA.
++        let _preparation_lock = if self.hv_cfg.host_memory_policy == HostMemoryPolicy::ReadOnly {
++            if let Some(owner_addr) = owned_range {
++                mthp::require_existing_reserve_settings().map_err(|why| {
++                    error!("GH: existing reserve settings reject runtime SHARE: {why}");
++                    Error::new(libc::ENOMEM)
++                })?;
++                // SAFETY: identity/range resolution proved this is our original live RW
++                // shmem mapping. Re-folding does not require free capacity equal to folios
++                // this range has already consumed, and every local syscall must succeed.
++                let coverage = unsafe { mthp::fold_mapped_range(owner_addr as *mut u8, size) }?;
++                if !coverage.is_complete() {
++                    return Err(Error::new(libc::ENOMEM));
++                }
++                if mem_region.as_ptr() as usize == owner_addr {
++                    // Never temporarily lock/unlock the boot owner's already locked VMA.
++                    return Err(Error::new(EINVAL));
++                }
++                // SAFETY: the descriptor-map producer (or shim's explicit second mapping)
++                // owns this fresh alias. mem_region outlives this local guard on every path.
++                Some(unsafe { mthp::lock_and_verify_mapped_range(mem_region.as_ptr(), size) }?)
++            } else {
++                None
+             }
+-            debug!(
+-                "GUNYAH-SHARE-DMABUF: descriptor is not a DMA-BUF (or module is old); falling back to VA/GUP"
+-            );
+-        }
++        } else {
++            None
++        };
+ 
+         let mut blob = ghsm_share_blob {
+             vm_fd: self.vm.as_raw_descriptor(),
+@@ -1730,16 +1781,45 @@
+         offset: u64,
+         size: u64,
+     ) -> Result<()> {
+-        // A grant that ends up 4 KiB-backed still works, but its parcel carries 512x the
+-        // mem_entries and the host share module builds that array with a high-order kcalloc --
+-        // which starts failing as uptime fragments memory. Report the failure rather than
+-        // silently degrading, and let the caller decide.
+-        //
+-        // SAFETY: fd is the pool region's shmem descriptor, alive for the VM's lifetime, and
+-        // folio_back_range only fallocates and collapses within [offset, offset+size).
+-        unsafe { mthp::folio_back_range(fd.as_raw_descriptor(), offset, size) }
+-            .map(|_coverage| ())
+-            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))
++        let addr = self.owned_memfd_range(fd, offset, size)?.ok_or(Error::new(EINVAL))?;
++        if self.hv_cfg.host_memory_policy == HostMemoryPolicy::ReadOnly {
++            // A retry may retain prepared folios from a failed registration. Recheck the existing
++            // settings and let strict local syscalls verify backing rather than counting those
++            // already consumed folios again as free capacity.
++            mthp::require_existing_reserve_settings().map_err(|why| {
++                error!("GH: existing reserve settings reject runtime preparation: {why}");
++                Error::new(libc::ENOMEM)
++            })?;
++        }
++        // SAFETY: FD identity, single-region bounds and 2 MiB alignment were resolved against
++        // GuestMemory, which owns this original RW mapping for the VM's lifetime.
++        let coverage = unsafe { mthp::fold_mapped_range(addr as *mut u8, size) }?;
++        if !coverage.is_complete() {
++            error!("GH: runtime pool preparation has incomplete 2 MiB coverage");
++            return Err(Error::new(libc::ENOMEM));
++        }
++        if self.hv_cfg.host_memory_policy == HostMemoryPolicy::ReadOnly {
++            // Verify through a fresh readonly alias bound to this exact FD and offset. The
++            // original owner can already be boot-locked; never temporarily lock/unlock its VMA.
++            let dup = base::clone_descriptor(&base::Descriptor(fd.as_raw_descriptor()))?;
++            // SAFETY: the descriptor was just duplicated and is now owned by this File.
++            let file = unsafe { File::from_raw_descriptor(dup.into_raw_descriptor()) };
++            let length = usize::try_from(size).map_err(|_| Error::new(EOVERFLOW))?;
++            let alias = MemoryMappingBuilder::new(length)
++                .from_file(&file)
++                .offset(offset)
++                .protection(Protection::read())
++                .build()
++                .map_err(|e| {
++                    error!("GH: cannot map runtime preparation alias: {e:?}");
++                    Error::new(EINVAL)
++                })?;
++            // SAFETY: alias owns a new live VMA; this local guard drops before that VMA, and
++            // only its new lock is released. SHARE performs its own final alias validation.
++            let guard = unsafe { mthp::lock_and_verify_mapped_range(alias.as_ptr(), size) }?;
++            drop(guard);
++        }
++        Ok(())
+     }
+ 
+     fn add_memory_region(
+@@ -2223,3 +2303,24 @@
+         unimplemented!()
+     }
+ }
++
++
++#[cfg(test)]
++mod local_memory_range_tests {
++    use super::*;
++
++    #[test]
++    fn owned_range_preserves_file_offset_and_rejects_cross_region() {
++        const THP: u64 = 2 << 20;
++        let hva = (4 * THP) as usize;
++        assert_eq!(owned_mapping_subrange(hva, 2 * THP, 4 * THP, 3 * THP, THP).unwrap(), Some(hva + THP as usize));
++        assert_eq!(owned_mapping_subrange(hva, 2 * THP, 4 * THP, THP, THP).unwrap(), None);
++        assert_eq!(owned_mapping_subrange(hva, 2 * THP, 4 * THP, 5 * THP, 2 * THP).unwrap(), None);
++        assert!(owned_mapping_subrange(hva, 2 * THP, 4 * THP, 2 * THP, 0).is_err());
++        assert!(owned_mapping_subrange(hva, 2 * THP, 4 * THP, 2 * THP + 1, THP).is_err());
++        assert!(owned_mapping_subrange(hva + 1, 2 * THP, 4 * THP, 2 * THP, THP).is_err());
++        assert!(owned_mapping_subrange(hva, 0, 4 * THP, u64::MAX - THP + 1, THP).is_err());
++        let last_aligned = usize::MAX & !(THP as usize - 1);
++        assert!(owned_mapping_subrange(last_aligned, 0, THP, 0, THP).is_err());
++    }
++}
+diff --git a/hypervisor/src/gunyah/mthp.rs b/hypervisor/src/gunyah/mthp.rs
+--- a/hypervisor/src/gunyah/mthp.rs
++++ b/hypervisor/src/gunyah/mthp.rs
+@@ -21,8 +21,12 @@
+ use std::fs;
+ use std::io::Write;
+ 
++use base::error;
+ use base::info;
+ use base::warn;
++use base::Error;
++
++use crate::HostMemoryPolicy;
+ 
+ // ── constants ────────────────────────────────────────────────────────────────
+ 
+@@ -65,18 +69,96 @@
+ 
+ // ── helpers ─────────────────────────────────────────────────────────────────
+ 
+-fn write_file(path: &str, value: &str) -> bool {
+-    match fs::OpenOptions::new().write(true).open(path) {
+-        Ok(mut f) => {
+-            let _ = f.write_all(value.as_bytes());
+-            true
+-        }
++fn host_memory_write(policy: HostMemoryPolicy, write: impl FnOnce() -> bool) -> bool {
++    if policy == HostMemoryPolicy::ReadOnly {
++        return false;
++    }
++    write()
++}
++
++fn write_file(policy: HostMemoryPolicy, path: &str, value: &str) -> bool {
++    host_memory_write(policy, || match fs::OpenOptions::new().write(true).open(path) {
++        Ok(mut f) => f.write_all(value.as_bytes()).is_ok(),
+         Err(_) => false,
+-    }
+-}
+-
+-fn trigger_compact() {
+-    write_file("/proc/sys/vm/compact_memory", "1\n");
++    })
++}
++
++fn trigger_compact(policy: HostMemoryPolicy) {
++    write_file(policy, "/proc/sys/vm/compact_memory", "1\n");
++}
++
++fn selected_shmem_policy(raw: &str) -> Result<&str, String> {
++    let mut selected = raw
++        .split_ascii_whitespace()
++        .filter_map(|word| word.strip_prefix('[')?.strip_suffix(']'));
++    let value = selected.next().ok_or("shmem_enabled has no selected policy")?;
++    if selected.next().is_some() {
++        return Err("shmem_enabled has more than one selected policy".to_string());
++    }
++    Ok(value)
++}
++
++fn validate_reserve_settings(hook_enabled: &str, shmem_enabled: &str) -> Result<(), String> {
++    if !matches!(hook_enabled.trim(), "1" | "Y") {
++        return Err("the existing reserve supply hook is not enabled".to_string());
++    }
++    if !matches!(
++        selected_shmem_policy(shmem_enabled)?,
++        "always" | "within_size" | "advise" | "never" | "force"
++    ) {
++        return Err(
++            "the existing shmem THP policy rejects local collapse".to_string(),
++        );
++    }
++    Ok(())
++}
++
++/// Recheck the existing hook and policy when re-folding an already prepared owner mapping. Its
++/// current folios have consumed reserve capacity already; free capacity is not that backing's size.
++pub(super) fn require_existing_reserve_settings() -> Result<(), String> {
++    let hook_path = "/sys/module/gh_hugepage_reserve/parameters/hook_enable";
++    let shmem_path = "/sys/kernel/mm/transparent_hugepage/shmem_enabled";
++    let hook = fs::read_to_string(hook_path)
++        .map_err(|e| format!("cannot read existing host capability {hook_path}: {e}"))?;
++    let shmem = fs::read_to_string(shmem_path)
++        .map_err(|e| format!("cannot read existing host capability {shmem_path}: {e}"))?;
++    validate_reserve_settings(&hook, &shmem)
++}
++
++fn validate_existing_reserve(
++    size: u64,
++    available: u64,
++    hook_enabled: &str,
++    shmem_enabled: &str,
++) -> Result<(), String> {
++    if size == 0 || size % THP_SIZE != 0 {
++        return Err(format!(
++            "region size {size} is not a positive multiple of 2 MiB"
++        ));
++    }
++    validate_reserve_settings(hook_enabled, shmem_enabled)?;
++    let needed = size / THP_SIZE;
++    if available < needed {
++        return Err(format!(
++            "the existing reserve has {available} free 2 MiB pages, but this region needs {needed}; \
++             prepare sufficient capacity outside this VM launch"
++        ));
++    }
++    Ok(())
++}
++
++/// Check existing capacity without changing global settings or filling the reserve.
++pub(super) fn require_existing_reserve(size: u64) -> Result<(), String> {
++    let read = |path: &str| {
++        fs::read_to_string(path).map_err(|e| format!("cannot read existing host capability {path}: {e}"))
++    };
++    let available = read("/sys/module/gh_hugepage_reserve/parameters/pool_avail")?
++        .trim()
++        .parse::<u64>()
++        .map_err(|e| format!("invalid reserve pool_avail: {e}"))?;
++    let hook = read("/sys/module/gh_hugepage_reserve/parameters/hook_enable")?;
++    let shmem = read("/sys/kernel/mm/transparent_hugepage/shmem_enabled")?;
++    validate_existing_reserve(size, available, &hook, &shmem)
+ }
+ 
+ // ── public API ──────────────────────────────────────────────────────────────
+@@ -112,9 +194,16 @@
+ ///   Phase 3 – cascading MADV_COLLAPSE (2 MB → 64 KB)
+ ///   Phase 4 – mlock
+ ///
++/// `ReadOnly` uses the separate local 2 MiB populate/collapse boundary, requires an
++/// existing reserve, and refuses incomplete backing, unsettled pages or failed locking.
++///
+ /// # Safety
+ /// `host_addr` must point to a valid memory mapping of at least `size` bytes.
+-pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResult {
++pub unsafe fn prepare_lend_region(
++    host_addr: *mut u8,
++    size: u64,
++    policy: HostMemoryPolicy,
++) -> base::Result<LendPrepResult> {
+     info!(
+         "GH: preparing LEND region: hva={:#x} size={:#x} ({} MB)",
+         host_addr as u64,
+@@ -122,22 +211,34 @@
+         size >> 20
+     );
+ 
+-    // ── Phase 1: free page-cache, compact, enable mTHP ──────────────
+-
++    if policy == HostMemoryPolicy::ReadOnly {
++        let (coverage, guard) = prepare_read_only_mapped_range(host_addr, size)?;
++        clean_dcache_to_poc(host_addr, size as usize);
++        // The GuestMemory VMA owns the boot lock; munmap releases it on VM teardown or failure.
++        guard.keep_until_unmap();
++        return Ok(LendPrepResult {
++            need_small: vec![false; coverage.windows as usize],
++            large_page_bytes: coverage.covered_bytes(),
++            populated: true,
++            mlocked: true,
++        });
++    }
++
++    // ── Phase 1: legacy host-wide preparation, explicitly selected by Prepare ──
+     info!("GH: Phase 1: dropping caches + compacting ...");
+-    write_file("/proc/sys/vm/drop_caches", "3\n");
+-    trigger_compact();
++    write_file(policy, "/proc/sys/vm/drop_caches", "3\n");
++    trigger_compact(policy);
+     std::thread::sleep(std::time::Duration::from_millis(500));
+ 
+     // Enable intermediate mTHP sizes
+-    {
++    if policy == HostMemoryPolicy::Prepare {
+         let mut enabled = 0u32;
+         for sz in MTHP_SIZES {
+             let path = format!(
+                 "/sys/kernel/mm/transparent_hugepage/hugepages-{}/enabled",
+                 sz
+             );
+-            if write_file(&path, "always\n") {
++            if write_file(policy, &path, "always\n") {
+                 enabled += 1;
+             }
+         }
+@@ -186,8 +287,11 @@
+             }
+ 
+             batch_idx += 1;
+-            if batch_idx % COMPACT_INTERVAL == 0 && offset + BATCH_SIZE < size {
+-                trigger_compact();
++            if policy == HostMemoryPolicy::Prepare
++                && batch_idx % COMPACT_INTERVAL == 0
++                && offset + BATCH_SIZE < size
++            {
++                trigger_compact(policy);
+                 std::thread::sleep(std::time::Duration::from_millis(200));
+             }
+             offset += BATCH_SIZE;
+@@ -302,10 +406,11 @@
+     if mlocked {
+         info!("GH: mlock: OK");
+     } else {
++        let err = Error::last();
+         warn!(
+             "GH: mlock FAILED: errno={} -- pages in this region can still be migrated or \
+              reclaimed while the RM's stage-2 keeps the old ones (check RLIMIT_MEMLOCK)",
+-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
++            err.errno()
+         );
+     }
+ 
+@@ -320,7 +425,6 @@
+         let is_thp = (0..units_per_thp).all(|u| order_map[map_base + u] >= 9);
+         need_small[ci] = !is_thp;
+     }
+-
+     // ── Hard verification: every page must genuinely be resolvable ──
+     //
+     // MADV_POPULATE_READ forces the kernel to resolve (not just request) every page
+@@ -334,10 +438,11 @@
+     if populated {
+         info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");
+     } else {
++        let err = Error::last();
+         warn!(
+             "GH: verify (MADV_POPULATE_READ) FAILED: errno={} -- region is NOT fully backed \
+              (reserve pool likely exhausted); caller must treat this as fatal",
+-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
++            err.errno()
+         );
+     }
+ 
+@@ -352,12 +457,12 @@
+     // WC guest writes, giving a type-0 write to register 0 and an AHB error).
+     clean_dcache_to_poc(host_addr, size as usize);
+ 
+-    LendPrepResult {
++    Ok(LendPrepResult {
+         need_small,
+         large_page_bytes,
+         populated,
+         mlocked,
+-    }
++    })
+ }
+ 
+ /// Clean+invalidate `size` bytes from `host_addr` to the point of coherency.
+@@ -388,171 +493,166 @@
+ #[cfg(not(target_arch = "aarch64"))]
+ fn clean_dcache_to_poc(_host_addr: *mut u8, _size: usize) {}
+ 
+-/// Fold `[offset, offset+len)` of an already-sized fd into 2 MiB folios, leaving the rest of the
+-/// file untouched.
++/// Complete 2 MiB backing produced by the local collapse boundary.
++pub struct FolioCoverage {
++    pub windows: u64,
++    pub collapsed: u64,
++}
++
++impl FolioCoverage {
++    pub fn is_complete(&self) -> bool {
++        self.windows > 0 && self.collapsed == self.windows
++    }
++
++    pub fn covered_bytes(&self) -> u64 {
++        self.collapsed * THP_SIZE
++    }
++
++}
++
++fn validate_fold_range(addr: usize, len: u64) -> base::Result<usize> {
++    let len = usize::try_from(len).map_err(|_| Error::new(libc::EOVERFLOW))?;
++    if addr == 0 || len == 0 || addr % THP_SIZE as usize != 0 || len % THP_SIZE as usize != 0 {
++        return Err(Error::new(libc::EINVAL));
++    }
++    addr.checked_add(len).ok_or(Error::new(libc::EOVERFLOW))?;
++    Ok(len)
++}
++
++// One boundary owns the operation order and coverage. A failed window never becomes a partial
++// success; callers cannot lose its coverage by mapping an incomplete result to ().
++fn fold_windows(
++    len: u64,
++    mut advise: impl FnMut(u64, i32) -> base::Result<()>,
++) -> base::Result<FolioCoverage> {
++    if len == 0 || len % THP_SIZE != 0 {
++        return Err(Error::new(libc::EINVAL));
++    }
++    let windows = len / THP_SIZE;
++    for w in 0..windows {
++        let offset = w * THP_SIZE;
++        // An empty shmem window cannot be collapsed. Populate only this window, then immediately
++        // collapse it: even under shmem_enabled=never the order-0 staging is bounded to 2 MiB.
++        advise(offset, MADV_POPULATE_WRITE)?;
++        advise(offset, MADV_COLLAPSE)?;
++    }
++    Ok(FolioCoverage { windows, collapsed: windows })
++}
++
++/// Fold the owner's existing RW shmem mapping, preserving its FD and payload.
+ ///
+-/// The alignment dance is the same and for the same reason: MADV_COLLAPSE on a file mapping only
+-/// forms a PMD when the virtual address and the file offset are congruent mod 2 MiB, so the fd is
+-/// mapped at a 2 MiB-aligned VA with the window's own offset, rather than wherever mmap happens to
+-/// land it. `offset` and `len` must both be 2 MiB multiples; anything else is rejected rather than
+-/// silently degraded, because a degraded grant is a parcel with 512x the mem_entries and that
+-/// failure shows up much later as an order-5 kcalloc failing under fragmentation.
+-///
+-/// Returns Ok even when individual collapses fail -- the caller gets 4 KiB backing, which works
+-/// but is expensive. How much of the range really came back as 2 MiB folios is in the returned
+-/// [`FolioCoverage`], which a caller who cannot live with a degraded range checks and a caller who
+-/// only wanted the cheap shape ignores.
++/// Local MADV_COLLAPSE permits shmem_enabled=never, whereas deny must still be rejected. No global
++/// policy is changed, no manual fault fallback runs, and no smaller-page coverage is accepted.
+ ///
+ /// # Safety
+-/// `fd` must be a live shmem descriptor at least `offset + len` bytes long.
+-pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Result<FolioCoverage> {
+-    let err = || std::io::Error::last_os_error();
+-    if offset % THP_SIZE != 0 || len % THP_SIZE != 0 || len == 0 {
+-        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+-    }
+-    // NO fallocate here, deliberately. Punching the range in first allocates it as ordinary 4 KiB
+-    // shmem, and on these phones the free memory a 4 KiB allocation can reach is whatever the
+-    // gh_hugepage reserve pool did not park (measured on 8gen3: MemAvailable ~1 GiB against a
+-    // 5.5 GiB reservoir). So a 1 GiB grant failed with ENOMEM inside fallocate while 5.5 GiB of
+-    // 2 MiB folios sat unused, and the collapse below would then have had to allocate the folio
+-    // *and* migrate into it -- twice the peak for a worse result.
+-    //
+-    // MADV_POPULATE_WRITE through the mapping, with MADV_HUGEPAGE already set, faults the file
+-    // pages in as order-9 folios straight from the reserve pool's supply hook: the same path the
+-    // multi-GiB LEND of guest RAM has always taken (prepare_lend_region).
+-    let l = len as usize;
+-    let thp = THP_SIZE as usize;
+-    let base = libc::mmap(
+-        std::ptr::null_mut(),
+-        l + thp,
+-        libc::PROT_NONE,
+-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+-        -1,
+-        0,
+-    );
+-    if base == libc::MAP_FAILED {
+-        return Err(err());
+-    }
+-    let base_u = base as usize;
+-    let aligned = (base_u + thp - 1) & !(thp - 1);
+-    // The file offset is a 2 MiB multiple and the VA is 2 MiB-aligned, so they are congruent.
+-    let mapped = libc::mmap(
+-        aligned as *mut libc::c_void,
+-        l,
+-        libc::PROT_READ | libc::PROT_WRITE,
+-        libc::MAP_SHARED | libc::MAP_FIXED,
+-        fd,
+-        offset as libc::off_t,
+-    );
+-    if mapped == libc::MAP_FAILED {
+-        let e = err();
+-        libc::munmap(base, l + thp);
+-        return Err(e);
+-    }
+-    if aligned > base_u {
+-        libc::munmap(base, aligned - base_u);
+-    }
+-    let tail_start = aligned + l;
+-    let tail_end = base_u + l + thp;
+-    if tail_end > tail_start {
+-        libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
+-    }
+-
+-    let coverage = fold_mapped_range(mapped as *mut u8, len);
+-    libc::munmap(mapped, l);
+-    coverage
+-}
+-
+-/// Fold an already-mapped shmem range into 2 MiB folios, one window at a time.
+-///
+-/// This is the actual work [`folio_back_range`] does; it is separate because the mapping does not
+-/// always have to be made. A caller that already holds a mapping whose virtual address is congruent
+-/// with its file offset mod 2 MiB -- guest RAM's own region mapping, and the framebuffer's -- can
+-/// fold it in place, and gets something the fd-window version cannot give: the range is left
+-/// POPULATED IN THAT MAPPING. Through a temporary mapping the folios end up in the page cache and
+-/// the caller's own page tables stay empty, so anything that reads the caller's address space
+-/// afterwards -- the pin probe, most of all -- sees an absent page and says so.
+-///
+-/// `MADV_HUGEPAGE` first, because `shmem_enabled` is `advise` on these phones: without it the fault
+-/// below allocates 4 KiB pages and there is nothing for the reserve's order-9 hook to intercept.
++/// The caller must own a live writable mapping covering len bytes. Its VA and file offset must
++/// both be 2 MiB-aligned, and it must remain mapped throughout this call.
++pub unsafe fn fold_mapped_range(base: *mut u8, len: u64) -> base::Result<FolioCoverage> {
++    let length = validate_fold_range(base as usize, len)?;
++    if libc::madvise(base.cast(), length, libc::MADV_HUGEPAGE) != 0 {
++        return Err(Error::last());
++    }
++    fold_windows(len, |offset, advice| {
++        let ptr = base.add(offset as usize).cast();
++        if libc::madvise(ptr, THP_SIZE as usize, advice) != 0 {
++            let err = Error::last();
++            error!("GH: local hugepage preparation failed at offset {offset:#x}, advice={advice}: {err}");
++            return Err(err);
++        }
++        Ok(())
++    })
++}
++
++/// A lock over a mapping held by the caller. Drop releases only the lock acquired by this call;
++/// boot callers may explicitly transfer cleanup to their mapping's eventual munmap.
++pub(super) struct MappedRegionLock {
++    addr: *mut u8,
++    len: usize,
++    locked: bool,
++}
++
++impl MappedRegionLock {
++    pub(super) fn keep_until_unmap(mut self) {
++        self.locked = false;
++    }
++}
++
++impl Drop for MappedRegionLock {
++    fn drop(&mut self) {
++        if self.locked && unsafe { libc::munlock(self.addr.cast(), self.len) } != 0 {
++            // The caller still owns the VMA; its munmap is the final lock cleanup boundary.
++            warn!("GH: local preparation munlock failed: {}; mapping owner retains cleanup", Error::last());
++        }
++    }
++}
++
++/// Populate the actual handoff mapping, lock it and verify its present, settled pages. This uses
++/// POPULATE_READ so a read-only SHARE alias is supported. The caller must retain the mapping
++/// before this guard, ensuring the guard drops before the mapping on every failure path.
+ ///
+ /// # Safety
+-/// `base` must point at a live shared shmem mapping of at least `len` bytes, 2 MiB-aligned and
+-/// congruent with its file offset mod 2 MiB.
+-pub unsafe fn fold_mapped_range(base: *mut u8, len: u64) -> std::io::Result<FolioCoverage> {
+-    let err = || std::io::Error::last_os_error();
+-    let _ = libc::madvise(base as *mut libc::c_void, len as usize, libc::MADV_HUGEPAGE);
+-    let windows = len / THP_SIZE;
+-    let mut collapsed = 0u64;
+-    for w in 0..windows {
+-        let ptr = base.add((w * THP_SIZE) as usize) as *mut libc::c_void;
+-        if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
+-            let e = err();
+-            match e.raw_os_error() {
+-                // Older kernels lack MADV_POPULATE_WRITE; fault each page in by hand so the
+-                // collapse has something to work with.
+-                Some(libc::EINVAL) | Some(libc::ENOSYS) => {
+-                    let npages = THP_SIZE / 4096;
+-                    for pg in 0..npages {
+-                        let p = (ptr as *mut u8).add((pg * 4096) as usize);
+-                        std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+-                    }
+-                }
+-                // Out of memory is the caller's business, and it must not be answered by the
+-                // hand-fault loop: a write fault that cannot allocate raises SIGBUS, which kills
+-                // the VMM instead of failing one grant.
+-                _ => return Err(e),
+-            }
+-        }
+-        if libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE) == 0 {
+-            collapsed += 1;
+-        }
+-    }
+-    Ok(FolioCoverage { windows, collapsed })
+-}
+-
+-/// How much of a range [`folio_back_range`] was asked about came back as 2 MiB folios.
++/// addr..addr+len must be a live mapping, page-aligned, owned by the caller and not already locked
++/// by another preparation guard. Boot callers transfer successful locks to their VMA owner.
++pub(super) unsafe fn lock_and_verify_mapped_range(
++    addr: *mut u8,
++    len: u64,
++) -> base::Result<MappedRegionLock> {
++    lock_and_verify_with(addr, len, || {
++        match super::pin::probe_settled(addr as u64, len) {
++            super::pin::Settled::Yes => Ok(()),
++            super::pin::Settled::No(why) => {
++                error!("GH: local preparation requires settled backing: {why}");
++                Err(Error::new(libc::ENOMEM))
++            }
++            super::pin::Settled::Unknown => {
++                error!("GH: local preparation requires existing /dev/gh_pinprobe verification");
++                Err(Error::new(libc::ENODEV))
++            }
++        }
++    })
++}
++
++unsafe fn lock_and_verify_with(
++    addr: *mut u8,
++    len: u64,
++    verify: impl FnOnce() -> base::Result<()>,
++) -> base::Result<MappedRegionLock> {
++    let length = usize::try_from(len).map_err(|_| Error::new(libc::EOVERFLOW))?;
++    let page = base::pagesize();
++    if addr.is_null() || length == 0 || addr as usize % page != 0 || length % page != 0 {
++        return Err(Error::new(libc::EINVAL));
++    }
++    (addr as usize).checked_add(length).ok_or(Error::new(libc::EOVERFLOW))?;
++    if libc::madvise(addr.cast(), length, MADV_POPULATE_READ) != 0 {
++        return Err(Error::last());
++    }
++    let guard = MappedRegionLock { addr, len: length, locked: true };
++    if libc::mlock(addr.cast(), length) != 0 {
++        // mlock can fail after locking a prefix. This new mapping/range was unlocked on entry;
++        // the guard also clears that partial attempt before the caller rolls allocation back.
++        return Err(Error::last());
++    }
++    verify()?;
++    Ok(guard)
++}
++
++/// Strict local preparation for boot LEND, boot pools and framebuffer owner mappings.
++/// The returned guard retains the successful lock until the caller completes the handoff.
+ ///
+-/// `collapsed` counts the windows whose `MADV_COLLAPSE` returned success, which includes the ones
+-/// the populate above had already faulted in as a huge folio -- collapsing an already-huge range
+-/// succeeds trivially, and on a healthy reserve that is what every window does.
+-///
+-/// This says nothing about WHERE those folios came from. `MADV_COLLAPSE` asks for an order-9
+-/// allocation; the gh_hugepage reserve hook intercepts order-9 and serves it from the pool, but
+-/// when the pool is empty the buddy allocator answers instead and the folio can be movable or in
+-/// CMA. So complete coverage is necessary and not sufficient for "the host can leave these pages
+-/// alone", and a caller who needs that has to ask the pin probe as well.
+-pub struct FolioCoverage {
+-    /// 2 MiB windows in the range.
+-    pub windows: u64,
+-    /// How many of them are 2 MiB folios.
+-    pub collapsed: u64,
+-}
+-
+-impl FolioCoverage {
+-    /// Whether every 2 MiB of the range is a 2 MiB folio. An empty range is not complete: there is
+-    /// nothing there to have succeeded.
+-    pub fn is_complete(&self) -> bool {
+-        self.windows > 0 && self.collapsed == self.windows
+-    }
+-
+-    /// Bytes that came back as 2 MiB folios.
+-    pub fn covered_bytes(&self) -> u64 {
+-        self.collapsed * THP_SIZE
+-    }
+-
+-    /// Bytes asked about.
+-    pub fn total_bytes(&self) -> u64 {
+-        self.windows * THP_SIZE
+-    }
+-
+-    /// Coverage as the percentage the mTHP phases print.
+-    pub fn pct(&self) -> f64 {
+-        if self.windows == 0 {
+-            return 0.0;
+-        }
+-        self.collapsed as f64 * 100.0 / self.windows as f64
+-    }
++/// # Safety
++/// The same mapping and ownership requirements as fold_mapped_range and lock_and_verify_mapped_range.
++pub(super) unsafe fn prepare_read_only_mapped_range(
++    addr: *mut u8,
++    len: u64,
++) -> base::Result<(FolioCoverage, MappedRegionLock)> {
++    validate_fold_range(addr as usize, len)?;
++    require_existing_reserve(len).map_err(|why| {
++        error!("GH: read-only host memory preflight failed: {why}");
++        Error::new(libc::ENOMEM)
++    })?;
++    let coverage = fold_mapped_range(addr, len)?;
++    let guard = lock_and_verify_mapped_range(addr, len)?;
++    Ok((coverage, guard))
+ }
+ 
+ /// An individual chunk to LEND, produced by [`compute_lend_chunks`].
+@@ -642,3 +742,155 @@
+ 
+     chunks
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use base::MappedRegion;
++
++    #[test]
++    fn read_only_does_not_invoke_host_write() {
++        let mut calls = 0;
++        assert!(!host_memory_write(HostMemoryPolicy::ReadOnly, || {
++            calls += 1;
++            true
++        }));
++        assert_eq!(calls, 0);
++        assert!(host_memory_write(HostMemoryPolicy::Prepare, || {
++            calls += 1;
++            true
++        }));
++        assert_eq!(calls, 1);
++    }
++
++    #[test]
++    fn existing_reserve_rejects_short_capacity_and_unknown_policy() {
++        let shmem = "always within_size [advise] never deny force\n";
++        assert!(validate_existing_reserve(4 * THP_SIZE, 4, "Y\n", shmem).is_ok());
++        let shortage = validate_existing_reserve(4 * THP_SIZE, 3, "Y", shmem).unwrap_err();
++        assert!(shortage.contains("3 free 2 MiB pages"));
++        assert!(shortage.contains("needs 4"));
++        assert!(validate_existing_reserve(THP_SIZE, 4, "N", shmem).is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "always advise never").is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "[advise] [always]").is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "[never]").is_ok());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "[deny]").is_err());
++        assert!(validate_existing_reserve(THP_SIZE, 4, "Y", "[future-policy]").is_err());
++        assert!(validate_existing_reserve(0, 4, "Y", shmem).is_err());
++        assert!(validate_existing_reserve(THP_SIZE + 1, 4, "Y", shmem).is_err());
++    }
++
++    #[test]
++    fn local_folding_orders_each_window_before_the_next_population() {
++        let mut calls = Vec::new();
++        let coverage = fold_windows(2 * THP_SIZE, |offset, advice| {
++            calls.push((offset, advice));
++            Ok(())
++        }).unwrap();
++        assert_eq!(calls, vec![
++            (0, MADV_POPULATE_WRITE), (0, MADV_COLLAPSE),
++            (THP_SIZE, MADV_POPULATE_WRITE), (THP_SIZE, MADV_COLLAPSE),
++        ]);
++        assert!(coverage.is_complete());
++        assert_eq!(coverage.covered_bytes(), 2 * THP_SIZE);
++    }
++
++    #[test]
++    fn failed_window_never_reports_partial_success_or_continues() {
++        for fail_at in 0..4 {
++            let mut calls = 0;
++            let result = fold_windows(2 * THP_SIZE, |_, _| {
++                let this_call = calls;
++                calls += 1;
++                if this_call == fail_at { Err(Error::new(libc::ENOMEM)) } else { Ok(()) }
++            });
++            assert!(result.is_err());
++            assert_eq!(calls, fail_at + 1);
++        }
++    }
++
++    #[test]
++    fn local_folding_rejects_invalid_ranges_before_operations() {
++        let aligned = THP_SIZE as usize;
++        assert!(validate_fold_range(aligned, THP_SIZE).is_ok());
++        assert!(validate_fold_range(0, THP_SIZE).is_err());
++        assert!(validate_fold_range(aligned + 1, THP_SIZE).is_err());
++        assert!(validate_fold_range(aligned, 0).is_err());
++        assert!(validate_fold_range(aligned, THP_SIZE + 1).is_err());
++        let last_aligned = usize::MAX & !(THP_SIZE as usize - 1);
++        assert!(validate_fold_range(last_aligned, THP_SIZE).is_err());
++        let mut calls = 0;
++        assert!(fold_windows(THP_SIZE + 1, |_, _| { calls += 1; Ok(()) }).is_err());
++        assert_eq!(calls, 0);
++    }
++
++    fn mapping_has_lock_flag(addr: usize) -> bool {
++        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
++        let mut in_mapping = false;
++        for line in smaps.lines() {
++            if let Some(range) = line.split_ascii_whitespace().next() {
++                if let Some((start, end)) = range.split_once('-') {
++                    if let (Ok(start), Ok(end)) = (
++                        usize::from_str_radix(start, 16), usize::from_str_radix(end, 16),
++                    ) {
++                        in_mapping = addr >= start && addr < end;
++                    }
++                }
++            }
++            if in_mapping && line.starts_with("VmFlags:") {
++                return line.split_ascii_whitespace().any(|flag| flag == "lo");
++            }
++        }
++        panic!("test mapping was not present in smaps");
++    }
++
++    #[test]
++    fn local_lock_guard_releases_after_verification_failure_and_handoff() {
++        let mapping = base::MemoryMapping::new(base::pagesize()).unwrap();
++        let addr = mapping.as_ptr();
++        let size = mapping.size() as u64;
++        assert!(!mapping_has_lock_flag(addr as usize));
++        // This uses a real 4 KiB local VMA and mlock/munlock. Only the page-classification verdict
++        // is injected, so failure proves cleanup of the actual VMA lock acquired by production.
++        let failure = unsafe {
++            lock_and_verify_with(addr, size, || Err(Error::new(libc::ENODEV)))
++        };
++        assert!(failure.is_err());
++        assert!(!mapping_has_lock_flag(addr as usize));
++        let guard = unsafe { lock_and_verify_with(addr, size, || Ok(())) }.unwrap();
++        assert!(mapping_has_lock_flag(addr as usize));
++        drop(guard);
++        assert!(!mapping_has_lock_flag(addr as usize));
++    }
++
++    #[test]
++    fn readonly_alias_cleanup_preserves_the_same_memfd_owner_lock() {
++        let size = base::pagesize();
++        let shm = base::SharedMemory::new("gunyah-owner-lock-test", size as u64).unwrap();
++        let owner = base::MemoryMapping::from_fd(&shm, size).unwrap();
++        let alias = base::MemoryMapping::from_fd_offset_protection(
++            &shm, size, 0, base::Protection::read(),
++        ).unwrap();
++        let owner_addr = owner.as_ptr();
++        let alias_addr = alias.as_ptr();
++        assert_ne!(owner_addr, alias_addr);
++        let owner_guard = unsafe { lock_and_verify_with(owner_addr, size as u64, || Ok(())) }.unwrap();
++        assert!(mapping_has_lock_flag(owner_addr as usize));
++        // Both mappings reference the same memfd pages; only the alias's new VMA lock is owned
++        // by the preparation attempt. Verification failure cannot unlock the original owner.
++        let failure = unsafe {
++            lock_and_verify_with(alias_addr, size as u64, || Err(Error::new(libc::ENODEV)))
++        };
++        assert!(failure.is_err());
++        assert!(!mapping_has_lock_flag(alias_addr as usize));
++        assert!(mapping_has_lock_flag(owner_addr as usize));
++        let alias_guard = unsafe { lock_and_verify_with(alias_addr, size as u64, || Ok(())) }.unwrap();
++        assert!(mapping_has_lock_flag(alias_addr as usize));
++        drop(alias_guard);
++        assert!(!mapping_has_lock_flag(alias_addr as usize));
++        assert!(mapping_has_lock_flag(owner_addr as usize));
++        drop(owner_guard);
++        assert!(!mapping_has_lock_flag(owner_addr as usize));
++    }
++
++}
+diff --git a/hypervisor/src/lib.rs b/hypervisor/src/lib.rs
+--- a/hypervisor/src/lib.rs
++++ b/hypervisor/src/lib.rs
+@@ -748,8 +748,9 @@
+ 
+ /// How an mTHP-prepared lend region is handed to Gunyah at VM start.
+ ///
+-/// Both modes first run the same mTHP preparation (drop caches, enable mTHP,
+-/// populate, cascading MADV_COLLAPSE, mlock). They differ only in how the
++/// Both modes first run the same region preparation (populate,
++/// MADV_COLLAPSE, mlock). Host-wide preparation is controlled separately by
++/// [`HostMemoryPolicy`]. They differ only in how the
+ /// prepared region is LENT to the hypervisor:
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "lowercase")]
+@@ -776,16 +777,42 @@
+     }
+ }
+ 
++/// Whether this VM may prepare shared host memory and udmabuf settings.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case")]
++pub enum HostMemoryPolicy {
++    /// Preserve the existing host-wide THP, cache-dropping and compaction behavior.
++    #[default]
++    Prepare,
++    /// Use existing reserve and udmabuf capabilities; refuse host display takeover.
++    ReadOnly,
++}
++
++impl std::str::FromStr for HostMemoryPolicy {
++    type Err = String;
++
++    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
++        match s {
++            "prepare" => Ok(Self::Prepare),
++            "read-only" => Ok(Self::ReadOnly),
++            _ => Err(format!(
++                "invalid host-memory policy '{s}', expected 'prepare' or 'read-only'"
++            )),
++        }
++    }
++}
++
+ #[derive(Clone, Copy)]
+ pub struct Config {
+     #[cfg(target_arch = "aarch64")]
+     /// enable the Memory Tagging Extension in the guest
+     pub mte: bool,
+     pub protection_type: ProtectionType,
+-    /// Run mTHP preparation (drop caches, enable mTHP, populate, MADV_COLLAPSE,
+-    /// mlock) on lend regions before VM start. The mode selects single-parcel
++    /// Run mTHP region preparation (populate, MADV_COLLAPSE, mlock) before VM
++    /// start. Host-wide setup follows `host_memory_policy`. The mode selects single-parcel
+     /// vs chunked LEND of the prepared region. `None` disables mTHP preparation.
+     pub prepare_lend_mthp: Option<LendMthpMode>,
++    pub host_memory_policy: HostMemoryPolicy,
+ }
+ 
+ impl Default for Config {
+@@ -795,6 +822,7 @@
+             mte: false,
+             protection_type: ProtectionType::Unprotected,
+             prepare_lend_mthp: None,
++            host_memory_policy: HostMemoryPolicy::Prepare,
+         }
+     }
+ }
+diff --git a/src/crosvm/cmdline.rs b/src/crosvm/cmdline.rs
+--- a/src/crosvm/cmdline.rs
++++ b/src/crosvm/cmdline.rs
+@@ -59,6 +59,7 @@
+ use devices::StubPciParameters;
+ #[cfg(target_arch = "x86_64")]
+ use hypervisor::CpuHybridType;
++use hypervisor::HostMemoryPolicy;
+ use hypervisor::LendMthpMode;
+ use hypervisor::ProtectionType;
+ use merge::vec::append;
+@@ -1615,6 +1616,17 @@
+     /// IP address to assign to host tap interface
+     pub host_ip: Option<std::net::Ipv4Addr>,
+ 
++    #[argh(option, arg_name = "prepare|read-only")]
++    #[serde(skip)]
++    #[merge(strategy = overwrite_option)]
++    /// set Gunyah host memory policy: "prepare" keeps host-wide THP setup,
++    /// cache-dropping and compaction; "read-only" requires an existing reserve
++    /// and performs only VM-local population, collapse and locking. It also
++    /// requires existing udmabuf capabilities for direct media and rejects KMS
++    /// display takeover. Defaults to "prepare". Missing or insufficient host
++    /// capabilities fail VM creation without changing shared configuration
++    pub host_memory_policy: Option<HostMemoryPolicy>,
++
+     #[argh(switch)]
+     #[serde(skip)] // TODO(b/255223604)
+     #[merge(strategy = overwrite_option)]
+@@ -2110,8 +2122,8 @@
+     #[argh(switch)]
+     #[serde(skip)]
+     #[merge(strategy = overwrite_option)]
+-    /// run mTHP preparation on lend regions (drop caches, enable mTHP,
+-    /// populate, MADV_COLLAPSE, mlock, chunked LEND).
++    /// run mTHP region preparation (populate, MADV_COLLAPSE, mlock, chunked
++    /// LEND). Host-wide setup follows --host-memory-policy.
+     /// Deprecated: equivalent to `--prepare-lend-mthp-mode chunked`; use that
+     /// option to select the LEND strategy
+     pub prepare_lend_mthp: Option<bool>,
+@@ -2119,8 +2131,8 @@
+     #[argh(option, arg_name = "single|chunked")]
+     #[serde(skip)]
+     #[merge(strategy = overwrite_option)]
+-    /// run mTHP preparation on lend regions (drop caches, enable mTHP,
+-    /// populate, MADV_COLLAPSE, mlock), then LEND the prepared region as a
++    /// run mTHP region preparation (populate, MADV_COLLAPSE, mlock; host-wide
++    /// setup follows --host-memory-policy), then LEND the prepared region as a
+     /// single parcel ("single", for eager-parcel kernels such as sm8650) or
+     /// split into <=256MB parcels ("chunked", for demand-paging kernels such
+     /// as sm8750). Takes precedence over the deprecated `--prepare-lend-mthp`
+@@ -3329,6 +3341,7 @@
+                 .unwrap_or_default()
+                 .then_some(LendMthpMode::Chunked)
+         });
++        cfg.host_memory_policy = cmd.host_memory_policy.unwrap_or_default();
+ 
+         // `cfg.hypervisor` may have been set by the deprecated `--kvm-device` option above.
+         // TODO(b/274817652): remove this workaround when `--kvm-device` is removed.
+@@ -4312,6 +4325,38 @@
+     use super::*;
+ 
+     #[test]
++    fn host_memory_policy_is_explicit_and_cannot_be_repeated() {
++        let command = RunCommand::from_args(
++            &["run"],
++            &["--host-memory-policy", "read-only", "/kernel"],
++        ).unwrap();
++        assert_eq!(command.host_memory_policy, Some(HostMemoryPolicy::ReadOnly));
++        assert_eq!(HostMemoryPolicy::default(), HostMemoryPolicy::Prepare);
++        assert!(RunCommand::from_args(
++            &["run"],
++            &["--host-memory-policy", "read-only", "--host-memory-policy", "prepare", "/kernel"],
++        ).is_err());
++        assert!(RunCommand::from_args(
++            &["run"],
++            &["--host-memory-policy", "unknown", "/kernel"],
++        ).is_err());
++    }
++
++    #[test]
++    #[cfg(feature = "config-file")]
++    fn host_memory_policy_on_cli_wins_over_nested_config() {
++        let command = RunCommand {
++            host_memory_policy: Some(HostMemoryPolicy::ReadOnly),
++            cfg: vec![RunCommand {
++                host_memory_policy: Some(HostMemoryPolicy::Prepare),
++                ..Default::default()
++            }],
++            ..Default::default()
++        };
++        assert_eq!(command.squash().host_memory_policy, Some(HostMemoryPolicy::ReadOnly));
++    }
++
++    #[test]
+     #[cfg(feature = "config-file")]
+     fn merge_runcommands() {
+         let cmd2 = RunCommand {
+diff --git a/src/crosvm/config.rs b/src/crosvm/config.rs
+--- a/src/crosvm/config.rs
++++ b/src/crosvm/config.rs
+@@ -53,6 +53,7 @@
+ use devices::StubPciParameters;
+ #[cfg(target_arch = "x86_64")]
+ use hypervisor::CpuHybridType;
++use hypervisor::HostMemoryPolicy;
+ use hypervisor::LendMthpMode;
+ use hypervisor::ProtectionType;
+ use jail::JailConfig;
+@@ -1436,6 +1437,8 @@
+     pub host_cpu_topology: bool,
+     #[cfg(windows)]
+     pub host_guid: Option<String>,
++    #[serde(default)]
++    pub host_memory_policy: HostMemoryPolicy,
+     pub hugepages: bool,
+     pub hypervisor: Option<HypervisorKind>,
+     #[cfg(feature = "balloon")]
+@@ -1706,6 +1709,7 @@
+             host_cpu_topology: false,
+             #[cfg(windows)]
+             host_guid: None,
++            host_memory_policy: HostMemoryPolicy::Prepare,
+             #[cfg(windows)]
+             product_version: None,
+             #[cfg(windows)]
+@@ -1931,6 +1935,12 @@
+     let has_simplefb_screen = cfg.simplefb.is_some();
+     #[cfg(feature = "kms_display")]
+     if let Some(kms) = &cfg.kms_display {
++        if cfg.host_memory_policy == HostMemoryPolicy::ReadOnly {
++            return Err(
++                "kms-display changes shared host display and udmabuf settings; it is unavailable \
++                 with read-only host-memory-policy".into(),
++            );
++        }
+         if !cfg!(target_os = "android") {
+             return Err("kms-display takeover requires Android".into());
+         }
+@@ -4023,6 +4033,23 @@
+         assert!(from_key_values::<VncConfig>("port=5900,input=none").is_err());
+     }
+ 
++    #[test]
++    #[cfg(feature = "kms_display")]
++    fn read_only_host_policy_rejects_kms_before_takeover() {
++        let mut cfg = Config {
++            host_memory_policy: HostMemoryPolicy::ReadOnly,
++            kms_display: Some(KmsDisplayConfig {
++                card: PathBuf::from("/dev/dri/card0"),
++                screen: DisplayScreen::Gpu0,
++                takeover: KmsTakeoverMode::Display,
++                planes: KmsPlanes::default(),
++            }),
++            ..Default::default()
++        };
++        let failure = validate_display_exporters(&mut cfg).unwrap_err();
++        assert!(failure.contains("read-only host-memory-policy"));
++    }
++
+     /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command
+     /// line written so far, and it has to keep meaning the GPU's screen.
+     #[test]
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -1283,6 +1283,7 @@
+         for media_cfg in media_devices {
+             devs.push(create_virtio_media_device(
+                 cfg.protection_type,
++                cfg.host_memory_policy,
+                 media_cfg,
+                 pool.clone(),
+                 vm.get_memory(),
+@@ -2187,6 +2188,7 @@
+             mte: cfg.mte,
+             protection_type: cfg.protection_type,
+             prepare_lend_mthp: cfg.prepare_lend_mthp,
++            host_memory_policy: cfg.host_memory_policy,
+         },
+         vm_image,
+         android_fstab: cfg
+diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
+--- a/src/crosvm/sys/linux/device_helpers.rs
++++ b/src/crosvm/sys/linux/device_helpers.rs
+@@ -90,6 +90,8 @@
+ use devices::VfioPlatformDevice;
+ #[cfg(feature = "vtpm")]
+ use devices::VtpmProxy;
++#[cfg(feature = "media")]
++use hypervisor::HostMemoryPolicy;
+ use hypervisor::MemCacheType;
+ use hypervisor::ProtectionType;
+ use hypervisor::Vm;
+@@ -1460,6 +1462,7 @@
+ #[cfg(feature = "media")]
+ pub fn create_virtio_media_device(
+     protection_type: ProtectionType,
++    host_memory_policy: HostMemoryPolicy,
+     config: &MediaDeviceConfig,
+     pool: Option<MediaPool>,
+     mem: &GuestMemory,
+@@ -1479,6 +1482,7 @@
+     if config.uid.is_some() {
+         return create_unprivileged_virtio_media_device(
+             protection_type,
++            host_memory_policy,
+             config,
+             pool,
+             mem,
+@@ -1547,6 +1551,7 @@
+ #[cfg(feature = "media")]
+ fn create_unprivileged_virtio_media_device(
+     protection_type: ProtectionType,
++    host_memory_policy: HostMemoryPolicy,
+     config: &MediaDeviceConfig,
+     pool: Option<MediaPool>,
+     mem: &GuestMemory,
+@@ -1606,7 +1611,8 @@
+     // V4L2 codec nodes are `system:camera 0660` (msm_vidc's /dev/video32).
+     // That decoder hands the driver guest buffers as udmabufs, one entry per scattered guest
+     // page run: a 4K P010 frame in 16 KiB guest pages is ~1700 entries, past the module's default
+-    // `list_limit` of 1024, which only root may raise -- so it is raised here, best effort.
++    // `list_limit` of 1024, which only root may raise. Prepare mode raises it best effort;
++    // ReadOnly requires the existing limit and mem_buf capability before launching the helper.
+     // The node itself is root's (`crw------- root root` on Android): the helper, an app uid, could
+     // not open it and every guest buffer reached the driver without a dma-buf. It is opened here,
+     // before the privileges go, and handed down by number (`--udmabuf-fd`); without it (no udmabuf
+@@ -1619,8 +1625,7 @@
+     let direct_encoder =
+         config.decoder_backend().may_be_direct() && config.kind == MediaDeviceKind::Encoder;
+     let supp_gids = if direct {
+-        raise_udmabuf_list_limit(16384);
+-        enable_udmabuf_msm_prime();
++        prepare_direct_decoder_udmabuf(host_memory_policy)?;
+         vec![AID_CAMERA]
+     } else if direct_encoder {
+         vec![AID_CAMERA]
+@@ -1631,6 +1636,11 @@
+         match std::fs::OpenOptions::new().read(true).write(true).open("/dev/udmabuf") {
+             Ok(file) => Some(file),
+             Err(e) => {
++                if host_memory_policy == HostMemoryPolicy::ReadOnly {
++                    return Err(e).context(
++                        "read-only direct decoder requires existing /dev/udmabuf access",
++                    );
++                }
+                 warn!("media helper: cannot open /dev/udmabuf for it: {}", e);
+                 None
+             }
+@@ -1721,6 +1731,43 @@
+ /// Android's `camera` group (`AID_CAMERA`), which owns the video codec nodes.
+ const AID_CAMERA: u32 = 1006;
+ 
++#[cfg(feature = "media")]
++fn validate_direct_decoder_host_params(limit: u32, msm_prime: &str) -> Result<()> {
++    if limit < 16384 {
++        bail!("read-only direct decoder requires existing udmabuf list_limit >= 16384, found {limit}");
++    }
++    if !matches!(msm_prime.trim(), "Y" | "1") {
++        bail!(
++            "read-only direct decoder requires existing udmabuf msm_prime enabled, found {:?}",
++            msm_prime.trim()
++        );
++    }
++    Ok(())
++}
++
++/// Prepare mode retains the existing global setup; ReadOnly observes capabilities only.
++#[cfg(feature = "media")]
++fn prepare_direct_decoder_udmabuf(policy: HostMemoryPolicy) -> Result<()> {
++    if policy == HostMemoryPolicy::Prepare {
++        raise_udmabuf_list_limit(16384);
++        enable_udmabuf_msm_prime();
++        return Ok(());
++    }
++
++    let limit = std::fs::read_to_string("/sys/module/udmabuf/parameters/list_limit")
++        .context("read-only direct decoder cannot read existing udmabuf list_limit")?
++        .trim()
++        .parse::<u32>()
++        .context("read-only direct decoder found invalid udmabuf list_limit")?;
++    let path = udmabuf_msm_prime_path()
++        .context("read-only direct decoder requires existing udmabuf msm_prime capability")?;
++    let msm_prime = std::fs::read_to_string(&path)
++        .with_context(|| format!("read-only direct decoder cannot read {}", path.display()))?;
++    validate_direct_decoder_host_params(limit, &msm_prime)?;
++    info!("read-only direct decoder: existing udmabuf capabilities verified; no module parameters changed");
++    Ok(())
++}
++
+ /// Raise the udmabuf module's per-buffer entry limit to at least `wanted`, if it is lower and
+ /// this process may write it. A failure is logged and otherwise ignored: buffers with fewer
+ /// entries still work, and the decoder falls back to MediaCodec for one it cannot import.
+@@ -1751,14 +1798,17 @@
+ /// found, which may switch it off under a running direct decoder; its next sessions then fail as
+ /// before this switch existed. Without the switch (an older module, a host with no mem_buf) the
+ /// guest buffers stay plain and a Qualcomm direct driver refuses them.
+-fn enable_udmabuf_msm_prime() {
+-    let path = std::fs::read_dir("/sys/module").ok().and_then(|dir| {
++fn udmabuf_msm_prime_path() -> Option<PathBuf> {
++    std::fs::read_dir("/sys/module").ok().and_then(|dir| {
+         dir.flatten()
+             .filter(|e| e.file_name().to_string_lossy().starts_with("udmabuf_gki_"))
+             .map(|e| e.path().join("parameters/msm_prime"))
+             .find(|p| p.exists())
+-    });
+-    let Some(path) = path else {
++    })
++}
++
++fn enable_udmabuf_msm_prime() {
++    let Some(path) = udmabuf_msm_prime_path() else {
+         warn!("udmabuf msm_prime unavailable: a Qualcomm direct decoder will refuse guest buffers");
+         return;
+     };
+@@ -2575,3 +2625,19 @@
+         tube_pair.map(|(_request_tx, request_rx)| request_rx),
+     ))
+ }
++
++#[cfg(all(test, feature = "media"))]
++mod host_memory_policy_tests {
++    use super::*;
++
++    #[test]
++    fn direct_decoder_requires_preexisting_host_capabilities() {
++        assert!(validate_direct_decoder_host_params(16384, "Y\n").is_ok());
++        assert!(validate_direct_decoder_host_params(32768, "1\n").is_ok());
++        let short = validate_direct_decoder_host_params(1024, "Y").unwrap_err();
++        assert!(short.to_string().contains("list_limit >= 16384"));
++        let disabled = validate_direct_decoder_host_params(16384, "N").unwrap_err();
++        assert!(disabled.to_string().contains("msm_prime enabled"));
++        assert!(validate_direct_decoder_host_params(16384, "").is_err());
++    }
++}
+diff --git a/src/sys/windows.rs b/src/sys/windows.rs
+--- a/src/sys/windows.rs
++++ b/src/sys/windows.rs
+@@ -2086,6 +2086,7 @@
+         hv_cfg: hypervisor::Config {
+             protection_type: cfg.protection_type,
+             prepare_lend_mthp: cfg.prepare_lend_mthp,
++            host_memory_policy: cfg.host_memory_policy,
+         },
+         vm_image,
+         android_fstab: cfg
+diff --git a/hypervisor/src/gunyah/pin.rs b/hypervisor/src/gunyah/pin.rs
+--- a/hypervisor/src/gunyah/pin.rs
++++ b/hypervisor/src/gunyah/pin.rs
+@@ -210,6 +210,10 @@
+         );
+         return None;
+     }
++    if let Err(why) = validate_sample_coverage(size, req.samples, req.sample_bytes) {
++        warn!("GH-PIN: {why}; probe could not verify the requested range");
++        return None;
++    }
+     Some(ProbeVerdict {
+         bad: req.samples_cma + req.samples_isolate + req.samples_movable,
+         samples: req.samples,
+@@ -242,15 +246,13 @@
+ 
+ /// Ask the probe whether `size` bytes at `host_addr` are settled where the host can leave them.
+ ///
+-/// Reads one page per 2 MB through the module's own walk: it takes no reference and migrates
+-/// nothing, so asking is free and cannot itself disturb what it is measuring.
++/// Samples one page per 2 MiB. The module may fault an absent page in while obtaining its
++/// temporary reference, so callers must populate the complete mapping before asking. The
++/// returned stride and sample count must cover the requested range; no migration is requested.
+ pub(crate) fn probe_settled(host_addr: u64, size: u64) -> Settled {
+     let Some(v) = probe_range(host_addr, size) else {
+         return Settled::Unknown;
+     };
+-    if v.samples == 0 {
+-        return Settled::No("the probe sampled nothing".to_string());
+-    }
+     if v.bad == 0 && v.absent == 0 {
+         return Settled::Yes;
+     }
+@@ -259,6 +261,34 @@
+          present, first at +{:#x}; CmaFree {} kB",
+         v.bad, v.samples, v.cma, v.isolate, v.movable, v.absent, v.first_bad_offset, cma_free_kb(),
+     ))
++}
++
++fn validate_sample_coverage(size: u64, samples: u64, sample_bytes: u32) -> std::result::Result<(), String> {
++    const SAMPLE_BYTES: u64 = 2 << 20;
++    let expected = if size == 0 { 0 } else { (size - 1) / SAMPLE_BYTES + 1 };
++    if expected == 0 || sample_bytes as u64 != SAMPLE_BYTES || samples != expected {
++        return Err(format!(
++            "incomplete pin probe coverage: {samples} samples at {sample_bytes} bytes, expected {expected} at {SAMPLE_BYTES} bytes",
++        ));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod sample_coverage_tests {
++    use super::validate_sample_coverage;
++
++    #[test]
++    fn pin_probe_requires_the_entire_requested_sample_grid() {
++        const SAMPLE: u32 = 2 << 20;
++        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 2, SAMPLE).is_ok());
++        assert!(validate_sample_coverage(SAMPLE as u64 + 1, 2, SAMPLE).is_ok());
++        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 1, SAMPLE).is_err());
++        assert!(validate_sample_coverage(SAMPLE as u64 * 2, 3, SAMPLE).is_err());
++        assert!(validate_sample_coverage(SAMPLE as u64, 1, 0).is_err());
++        assert!(validate_sample_coverage(SAMPLE as u64, 1, SAMPLE / 2).is_err());
++        assert!(validate_sample_coverage(0, 0, SAMPLE).is_err());
++    }
+ }
+ 
+ /// Share of sampled 2 MB folios that may be off-pool before migration stops being the cheap

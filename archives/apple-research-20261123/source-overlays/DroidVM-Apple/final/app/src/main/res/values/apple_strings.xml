@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="apple_app_name">DroidVM Apple</string>
+    <string name="apple_usb_acm_unavailable">USB serial is unavailable in Apple. Use the app console.</string>
+    <string name="apple_shared_host_read_only">Apple reads existing kernel and memory capabilities. Shared host settings cannot be changed here.</string>
+    <string name="apple_on_demand_network">Apple uses gVisor NAT. Its network starts with a VM and stops when its last VM stops.</string>
+    <string name="apple_vm_missing_host_capabilities">Required host capabilities are unavailable:%1$s\n\nApple cannot load shared kernel modules. This VM was not started.</string>
+    <string name="apple_vm_memory_unavailable">%1$s\n\nThis VM was not started. Retry after existing memory becomes available or reduce the VM memory.</string>
+</resources>
